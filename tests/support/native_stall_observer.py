@@ -41,8 +41,11 @@ for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
 rc = 1
 try:
     # Popen's exec-error handshake returns only after the native exec succeeds.
+    # No new session/group is requested: the native child inherits this group.
+    # Querying its PID after exec races commands that have already completed.
+    native_group = os.getpgrp()
     child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    event('native-exec', native_pid=child.pid, native_pgid=os.getpgid(child.pid),
+    event('native-exec', native_pid=child.pid, native_pgid=native_group,
           stdout_fd=child.stdout.fileno(), stderr_fd=child.stderr.fileno())
     if paused and kind == 'find':
         # The large fixture exceeds pipe capacity: after a real native prefix
