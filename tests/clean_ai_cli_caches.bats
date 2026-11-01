@@ -1,25 +1,13 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-ai-cli-caches.XXXXXX")"
-    export HOME
-
-    mkdir -p "$HOME"
+    mole_test_setup_home ai-cli-caches
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 setup() {
@@ -294,8 +282,9 @@ for component in Library Caches; do
     touch "$target"
     CASE_HOME="$case_home" TARGET="$target" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'INNER'
 set -euo pipefail
-HOME="$CASE_HOME"
 source "$PROJECT_ROOT/bin/clean.sh"
+# Bind logging to a canonical private HOME before testing a cleanup ancestor.
+HOME="$CASE_HOME"
 pgrep() { return 1; }
 clean_codex_desktop_caches
 [[ -f "$TARGET" ]] || exit 1
@@ -304,6 +293,24 @@ done
 EOF
 
     assert_run_success
+}
+
+@test "cleanup source refuses logging through a symlinked Library ancestor" {
+    local fixture_home="$HOME/logging-linked-library"
+    mkdir -p "$fixture_home/outside"
+    ln -s "$fixture_home/outside" "$fixture_home/Library"
+    run env HOME="$fixture_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+echo "UNEXPECTED_SOURCE_SUCCESS"
+EOF
+    [[ "$status" == 16 ]] || {
+        echo "$output"
+        return 1
+    }
+    assert_output_contains "mole test boundary refused (symlink-ancestor)"
+    assert_output_not_contains "UNEXPECTED_SOURCE_SUCCESS"
+    [[ ! -e "$fixture_home/outside/Logs/mole/mole.log" ]]
 }
 
 @test "clean_codex_desktop_caches rejects a symlinked Codex root" {
@@ -374,13 +381,19 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+pgrep() {
+    printf '%s\n' "$*" >> "$HOME/process-trace"
+    return 1
+}
 safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
 clean_service_worker_cache() { echo "SWC:$1"; }
 note_activity() { :; }
 clean_antigravity_caches
+grep -qE -- '^-x (.*[|])?Antigravity([|].*)?$' "$HOME/process-trace" || exit 1
+grep -qE -- '^-x (.*[|])?gemini([|].*)?$' "$HOME/process-trace" || exit 1
 EOF
 
-    assert_run_success
+    assert_run_success || return 1
     assert_output_contains "SAFE_CLEAN:Antigravity browser cache|"
     assert_output_contains "SAFE_CLEAN:Antigravity code cache|"
     assert_output_contains "SAFE_CLEAN:Antigravity GPU cache|"
@@ -392,6 +405,26 @@ EOF
     assert_output_contains "SWC:Antigravity"
     assert_output_not_contains "Default/Extensions"
     assert_output_not_contains "Default/Storage"
+}
+
+@test "clean_antigravity_caches preserves eligible browser cache on unknown owner state" {
+    local fixture_home="$HOME/antigravity-unknown"
+    local target="$fixture_home/.gemini/antigravity-browser-profile/Default/Cache/owned.bin"
+    mkdir -p "$(dirname "$target")"
+    touch "$target"
+    run env HOME="$fixture_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+pgrep() { return 2; }
+safe_clean() { echo "UNEXPECTED_SINK:$*"; }
+note_activity() { :; }
+clean_antigravity_caches
+EOF
+    assert_run_success
+    assert_output_contains "Antigravity/Gemini caches · skipped (process state unknown)"
+    assert_output_not_contains "UNEXPECTED_SINK:"
+    [[ -f "$target" ]]
 }
 
 @test "clean_antigravity_caches is a no-op when the profile is absent" {
@@ -486,7 +519,7 @@ safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
 clean_service_worker_cache() { echo "SWC:$1"; }
 note_activity() { echo "NOTE_ACTIVITY"; }
 pgrep() {
-    [[ "$1" == "-x" && "$2" == "gemini" ]]
+    [[ "$1" == "-x" && "|$2|" == *"|gemini|"* ]]
 }
 clean_antigravity_caches
 EOF
@@ -607,6 +640,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+debug_log() { echo "DEBUG:$*"; }
 note_activity() { :; }
 safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
 pgrep() { return 1; }
@@ -614,7 +648,10 @@ clean_dev_ai_agents
 EOF
 
     assert_run_success
-    assert_output_contains "· skipped (active version unknown)"
+    # The keep reason is debug-only; the default summary stays silent.
+    assert_output_contains "DEBUG:Claude Desktop bundled Claude Code"
+    assert_output_contains "kept: active version"
+    assert_output_not_contains "skipped ("
     assert_output_not_contains "SAFE_CLEAN:"
 }
 
@@ -628,6 +665,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+debug_log() { echo "DEBUG:$*"; }
 note_activity() { :; }
 pgrep() { return 0; }
 defer_cleanup_family() { echo "UNEXPECTED_DEFER:$1"; }
@@ -636,7 +674,8 @@ clean_claude_desktop_bundled_versions 1
 EOF
 
     assert_run_success
-    assert_output_contains "skipped (active version unknown)"
+    assert_output_contains "kept: active version unknown"
+    assert_output_not_contains "skipped ("
     assert_output_not_contains "UNEXPECTED_DEFER"
     assert_output_not_contains "UNEXPECTED_CLEAN"
 }
@@ -732,11 +771,36 @@ clean_versioned_agent_root "$HOME/versions" "Agent old version" 1
 rc=$?
 set -e
 printf 'SCAN_RC:%s\n' "$rc"
-[[ $rc -eq 73 ]]
+[[ $rc -eq 0 ]]
 EOF
 
     assert_run_success
-    assert_output_contains "SCAN_RC:73"
+    # The family is kept and reported; the status stays local so later
+    # developer cleanup still runs.
+    assert_output_contains "SCAN_RC:0"
+    assert_output_not_contains "UNEXPECTED_DELETE"
+}
+
+@test "an unknown agent inventory keeps that family and lets later agent cleanup run" {
+    local isolated_home="$HOME/agent-unknown-continues"
+    mkdir -p "$isolated_home/.local/share/claude/versions/1.0" "$isolated_home/.local/share/claude/versions/2.0"
+
+    run env HOME="$isolated_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "UNEXPECTED_DELETE:$1"; }
+_plan_versioned_agent_cleanup_targets() { return 1; }
+clean_claude_desktop_bundled_versions() { echo "LATER_STEP_RAN"; }
+rc=0
+clean_dev_ai_agents || rc=$?
+echo "AI_AGENTS_RC:$rc"
+EOF
+
+    assert_run_success
+    assert_output_contains "AI_AGENTS_RC:0"
+    assert_output_contains "LATER_STEP_RAN"
     assert_output_not_contains "UNEXPECTED_DELETE"
 }
 
@@ -835,6 +899,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+STAT_BSD="$HOME/fake-bin/stat"  # Mole calls stat through STAT_BSD
 set +e
 _plan_versioned_agent_cleanup_targets "$HOME/versions" 1
 rc=$?
@@ -902,7 +967,7 @@ _versioned_agent_entry_mtime() {
         rm -f "$HOME/.local/bin/claude"
         ln -s "$HOME/.local/share/claude/versions/1.0/claude" "$HOME/.local/bin/claude"
     fi
-    command stat -f%m "$1"
+    /usr/bin/stat -f%m "$1"
 }
 safe_remove() { echo "UNEXPECTED_DELETE:$1"; return 0; }
 clean_dev_ai_agents
@@ -1003,7 +1068,7 @@ _versioned_agent_entry_mtime() {
         : > "$HOME/flipped-sdk-plan-race"
         echo "2.1.140" > "$HOME/Library/Application Support/Claude/claude-code-vm/.sdk-version"
     fi
-    command stat -f%m "$1"
+    /usr/bin/stat -f%m "$1"
 }
 safe_remove() { echo "UNEXPECTED_DELETE:$1"; return 0; }
 clean_claude_desktop_bundled_versions 1
@@ -1054,6 +1119,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+debug_log() { echo "DEBUG:$*"; }
 note_activity() { :; }
 safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
 pgrep() { return 1; }
@@ -1061,7 +1127,10 @@ clean_dev_ai_agents
 EOF
 
     assert_run_success
-    assert_output_contains "· skipped (active version unknown)"
+    # The keep reason is debug-only; the default summary stays silent.
+    assert_output_contains "DEBUG:Claude Desktop bundled Claude Code"
+    assert_output_contains "kept: active version"
+    assert_output_not_contains "skipped ("
     assert_output_not_contains "SAFE_CLEAN:"
 }
 
@@ -1075,6 +1144,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+debug_log() { echo "DEBUG:$*"; }
 note_activity() { :; }
 safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
 pgrep() { return 1; }
@@ -1082,7 +1152,10 @@ clean_dev_ai_agents
 EOF
 
     assert_run_success
-    assert_output_contains "· skipped (active version unknown)"
+    # The keep reason is debug-only; the default summary stays silent.
+    assert_output_contains "DEBUG:Claude Desktop bundled Claude Code"
+    assert_output_contains "kept: active version"
+    assert_output_not_contains "skipped ("
     assert_output_not_contains "SAFE_CLEAN:"
 }
 
@@ -1094,6 +1167,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+debug_log() { echo "DEBUG:$*"; }
 note_activity() { :; }
 safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
 pgrep() { return 1; }
@@ -1101,7 +1175,10 @@ clean_dev_ai_agents
 EOF
 
     assert_run_success
-    assert_output_contains "· skipped (active version unknown)"
+    # The keep reason is debug-only; the default summary stays silent.
+    assert_output_contains "DEBUG:Claude Desktop bundled Claude Code"
+    assert_output_contains "kept: active version"
+    assert_output_not_contains "skipped ("
     assert_output_not_contains "SAFE_CLEAN:"
 }
 
@@ -1165,14 +1242,21 @@ pgrep() { return 1; }
 lsof() { return 1; }
 run_with_timeout() { shift; "$@"; }
 is_path_whitelisted() { return 1; }
-safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
 # The staging cleanup has no engine-absent fallback (see the audited-count
-# gate in clean_core.bats), so a standalone case supplies the guard itself.
+# gate in clean_core.bats), so a standalone case supplies the guard itself,
+# called per target with its path like the engine.
 safe_clean_guarded() {
     local guard="$1"
     shift
-    "$guard" || return 75
-    safe_clean "$@"
+    local label="${*: -1}" path
+    for path in "${@:1:$#-1}"; do
+        _MOLE_SAFE_CLEAN_SKIP_PATH=""
+        if ! "$guard" "$path"; then
+            [[ "$_MOLE_SAFE_CLEAN_SKIP_PATH" == "$path" ]] && continue
+            return 75
+        fi
+        echo "SAFE_CLEAN:$label|$path"
+    done
 }
 note_activity() { :; }
 clean_codex_marketplace_staging
@@ -1186,6 +1270,61 @@ INNER
     [[ "$output" != *"openai-bundled.staging-fresh"* ]] || return 1
     [[ "$output" != *"my-marketplace"* ]] || return 1
     [[ "$output" != *"marketplace-backup-old"* ]] || return 1
+}
+
+@test "clean_codex_marketplace_staging cleans a large backlog as one row with one root probe (#1742)" {
+    # 94 abandoned upgrade folders used to print 94 rows and probe the whole
+    # root twice per folder, which read as a hang. One row per root now; the
+    # per-entry guard probes only the folder it removes, and a folder that
+    # changed before removal is skipped alone.
+    local staging="$HOME/.codex/.tmp/marketplaces/.staging"
+    local i
+    for ((i = 1; i <= 94; i++)); do
+        mkdir -p "$staging/marketplace-upgrade-$i"
+    done
+    touch -t 202001010000 "$staging"/marketplace-upgrade-*
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+staging="$HOME/.codex/.tmp/marketplaces/.staging"
+_MOLE_COMPLETE_LSOF_MODE=direct
+pgrep() { return 1; }
+lsof() { echo "${*: -1}" >> "$HOME/lsof-targets"; return 1; }
+_mole_run_complete_lsof() { shift; lsof "$@"; }
+run_with_timeout() { shift; "$@"; }
+is_path_whitelisted() { return 1; }
+note_activity() { :; }
+calls=0
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    calls=$((calls + 1))
+    local label="${*: -1}" path cleaned=0
+    for path in "${@:1:$#-1}"; do
+        # Entry 7 is touched by a new Codex run between sizing and removal.
+        [[ "$path" == "$staging/marketplace-upgrade-7" ]] && touch "$path"
+        _MOLE_SAFE_CLEAN_SKIP_PATH=""
+        if ! "$guard" "$path"; then
+            [[ "$_MOLE_SAFE_CLEAN_SKIP_PATH" == "$path" ]] && continue
+            return 75
+        fi
+        cleaned=$((cleaned + 1))
+    done
+    echo "ROW:$label|$cleaned"
+}
+clean_codex_marketplace_staging
+echo "CALLS:$calls"
+echo "ROOT_PROBES:$(grep -cx "$staging" "$HOME/lsof-targets")"
+echo "ENTRY_PROBES:$(grep -c "$staging/marketplace-upgrade-" "$HOME/lsof-targets")"
+INNER
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CALLS:1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"ROW:Codex marketplace staging|93"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"ROOT_PROBES:1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"ENTRY_PROBES:93"* ]] || { echo "$output"; return 1; }
 }
 
 @test "clean_codex_marketplace_staging defers while Codex runtime is active" {
@@ -1215,4 +1354,403 @@ INNER
     [[ "$output" == *"DEFER:Codex"* ]] || return 1
     [[ "$output" != *"UNEXPECTED:"* ]] || return 1
     [[ -f "$staging/marketplace-upgrade-old/payload" ]]
+}
+
+# Codex app-server daemon releases (#1704). The stub reports each removal the
+# real guard approves, and SKIP for a release the guard refused on its own.
+codex_daemon_fixture() {
+    local root="$HOME/.codex/packages/app-server-daemon"
+    mkdir -p "$root/releases" "$root/standalone/0.150.0"
+    local name
+    for name in 0.157.0-aarch64-apple-darwin 0.158.0-aarch64-apple-darwin \
+        0.159.0-aarch64-apple-darwin 0.160.1-aarch64-apple-darwin \
+        0.161.0-aarch64-apple-darwin local-0a1b2c3d4e5f-aarch64-apple-darwin; do
+        mkdir -p "$root/releases/$name/bin"
+        # A real binary has bytes; an empty one would measure 0B and hide the row.
+        printf 'codex' > "$root/releases/$name/bin/codex"
+    done
+    mkdir -p "$root/releases/.unpack-tmp"
+    ln -s "$root/releases/0.161.0-aarch64-apple-darwin" "$root/current"
+    printf '%s' "0.160.1-aarch64-apple-darwin" > "$root/auto-update-version"
+    : > "$root/install.lock"
+}
+
+codex_daemon_run() {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN="${1:-false}" \
+        BUSY_RELEASE="${2:-}" REPOINT="${3:-}" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+_MOLE_COMPLETE_LSOF_MODE=direct
+run_with_timeout() { shift; "$@"; }
+lsof() {
+    if [[ -n "$BUSY_RELEASE" && "$*" == *"/releases/$BUSY_RELEASE"* ]]; then
+        printf 'p1\nn%s/bin/codex\n' "$HOME/.codex/packages/app-server-daemon/releases/$BUSY_RELEASE"
+        return 0
+    fi
+    return 1
+}
+is_path_whitelisted() { return 1; }
+note_activity() { :; }
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    local label="${*: -1}" path rc
+    for path in "${@:1:$#-1}"; do
+        rc=0
+        # A release becomes `current` after the scan listed it as a candidate.
+        if [[ -n "$REPOINT" ]]; then
+            ln -sfn "$HOME/.codex/packages/app-server-daemon/releases/$REPOINT" "$HOME/.codex/packages/app-server-daemon/current"
+        fi
+        "$guard" "$path" || rc=$?
+        if [[ $rc -eq 0 ]]; then
+            echo "REMOVE:$label|${path##*/}"
+            [[ "$DRY_RUN" == "true" ]] || rm -rf "$path" # SAFE: test fixture under the temp HOME.
+        elif [[ "$_MOLE_SAFE_CLEAN_SKIP_PATH" == "$path" ]]; then
+            echo "SKIP:${path##*/}"
+        else
+            return 75
+        fi
+    done
+}
+clean_codex_daemon_releases
+if /usr/bin/python3 -c 'import fcntl, sys
+f = open(sys.argv[1], "r+")
+fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)' "$HOME/.codex/packages/app-server-daemon/install.lock" 2> /dev/null; then
+    echo "LOCK_RELEASED"
+fi
+INNER
+}
+
+@test "clean_codex_daemon_releases keeps a release that becomes current after the scan (#1704)" {
+    codex_daemon_fixture
+    local releases="$HOME/.codex/packages/app-server-daemon/releases"
+
+    codex_daemon_run false "" 0.159.0-aarch64-apple-darwin
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"SKIP:0.159.0-aarch64-apple-darwin"* ]] || return 1
+    [[ "$output" != *"REMOVE:Codex daemon old releases|0.159.0-aarch64-apple-darwin"* ]] || return 1
+    [[ -d "$releases/0.159.0-aarch64-apple-darwin" ]] || return 1
+}
+
+@test "clean_codex_daemon_releases removes only superseded releases (#1704)" {
+    codex_daemon_fixture
+    local releases="$HOME/.codex/packages/app-server-daemon/releases"
+
+    codex_daemon_run false 0.158.0-aarch64-apple-darwin
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"REMOVE:Codex daemon old releases|0.157.0-aarch64-apple-darwin"* ]] || return 1
+    [[ "$output" == *"REMOVE:Codex daemon old releases|0.159.0-aarch64-apple-darwin"* ]] || return 1
+    [[ "$output" == *"REMOVE:Codex daemon old releases|local-0a1b2c3d4e5f-aarch64-apple-darwin"* ]] || return 1
+    [[ "$output" == *"LOCK_RELEASED"* ]] || return 1
+    [[ ! -d "$releases/0.157.0-aarch64-apple-darwin" ]] || return 1
+    [[ ! -d "$releases/0.159.0-aarch64-apple-darwin" ]] || return 1
+    # current, the auto-update-version release, an open release, a name that
+    # is not a release, and the legacy standalone layout all stay.
+    [[ -f "$releases/0.161.0-aarch64-apple-darwin/bin/codex" ]] || return 1
+    [[ -f "$releases/0.160.1-aarch64-apple-darwin/bin/codex" ]] || return 1
+    [[ -f "$releases/0.158.0-aarch64-apple-darwin/bin/codex" ]] || return 1
+    [[ -d "$releases/.unpack-tmp" ]] || return 1
+    [[ -d "$HOME/.codex/packages/app-server-daemon/standalone/0.150.0" ]]
+}
+
+@test "clean_codex_daemon_releases skips while an install holds the lockf lock (#1704)" {
+    codex_daemon_fixture
+    local lock="$HOME/.codex/packages/app-server-daemon/install.lock"
+    local ready="$HOME/lock-ready"
+    rm -f "$ready"
+    /usr/bin/python3 -c 'import fcntl, sys, time
+f = open(sys.argv[1], "r+")
+fcntl.lockf(f, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(20)' "$lock" "$ready" &
+    local holder=$!
+    local waited=0
+    while [[ ! -f "$ready" && $waited -lt 50 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [[ -f "$ready" ]] || {
+        kill "$holder" 2> /dev/null || true
+        return 1
+    }
+
+    codex_daemon_run false
+
+    kill "$holder" 2> /dev/null || true
+    wait "$holder" 2> /dev/null || true
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"REMOVE:"* ]] || return 1
+    [[ -d "$HOME/.codex/packages/app-server-daemon/releases/0.157.0-aarch64-apple-darwin" ]]
+}
+
+@test "clean_codex_daemon_releases fails closed on a dangling current or unreadable marker (#1704)" {
+    codex_daemon_fixture
+    local root="$HOME/.codex/packages/app-server-daemon"
+    rm "$root/current"
+    ln -s "$root/releases/0.999.0-aarch64-apple-darwin" "$root/current"
+
+    codex_daemon_run false
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"REMOVE:"* ]] || return 1
+
+    rm "$root/current"
+    ln -s "$root/releases/0.161.0-aarch64-apple-darwin" "$root/current"
+    printf 'not a release\n' > "$root/auto-update-version"
+
+    codex_daemon_run false
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"REMOVE:"* ]] || return 1
+    [[ -d "$root/releases/0.157.0-aarch64-apple-darwin" ]]
+}
+
+@test "clean_codex_daemon_releases dry run lists the same plan and deletes nothing (#1704)" {
+    codex_daemon_fixture
+    local releases="$HOME/.codex/packages/app-server-daemon/releases"
+
+    codex_daemon_run true
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"REMOVE:Codex daemon old releases|0.157.0-aarch64-apple-darwin"* ]] || return 1
+    [[ "$output" == *"REMOVE:Codex daemon old releases|0.158.0-aarch64-apple-darwin"* ]] || return 1
+    [[ "$output" == *"REMOVE:Codex daemon old releases|0.159.0-aarch64-apple-darwin"* ]] || return 1
+    [[ "$output" != *"0.160.1-aarch64-apple-darwin"* ]] || return 1
+    [[ "$output" != *"REMOVE:Codex daemon old releases|0.161.0"* ]] || return 1
+    [[ -d "$releases/0.157.0-aarch64-apple-darwin" ]]
+}
+
+@test "clean_codex_daemon_releases skips an install.lock.d protocol and a symlinked releases root (#1704)" {
+    codex_daemon_fixture
+    local root="$HOME/.codex/packages/app-server-daemon"
+    mkdir "$root/install.lock.d"
+
+    codex_daemon_run false
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"REMOVE:"* ]] || return 1
+
+    rmdir "$root/install.lock.d"
+    mv "$root/releases" "$HOME/elsewhere-releases"
+    ln -s "$HOME/elsewhere-releases" "$root/releases"
+
+    codex_daemon_run false
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"REMOVE:"* ]] || return 1
+    [[ -d "$HOME/elsewhere-releases/0.157.0-aarch64-apple-darwin" ]] || return 1
+    rm "$root/releases"
+    rm -rf "$HOME/elsewhere-releases"
+}
+
+@test "clean_codex_daemon_releases says so when open files cannot be checked (#1704)" {
+    codex_daemon_fixture
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+_MOLE_COMPLETE_LSOF_MODE=unknown
+_mole_complete_lsof_mode() { return 2; }
+is_path_whitelisted() { return 1; }
+note_activity() { :; }
+safe_clean_guarded() { echo "UNEXPECTED:$*"; }
+clean_codex_daemon_releases
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"Codex daemon old releases · skipped (open-file check unavailable)"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED:"* ]]
+}
+
+@test "clean_codex_daemon_releases removes through the real safe_clean_guarded sink (#1704)" {
+    codex_daemon_fixture
+    local releases="$HOME/.codex/packages/app-server-daemon/releases"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/clean.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { :; }
+is_path_whitelisted() { return 1; }
+_MOLE_COMPLETE_LSOF_MODE=direct
+run_with_timeout() { shift; "$@"; }
+lsof() { return 1; }
+clean_codex_daemon_releases
+INNER
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Codex daemon old releases"* ]] || return 1
+    [[ ! -d "$releases/0.157.0-aarch64-apple-darwin" ]] || return 1
+    [[ ! -d "$releases/local-0a1b2c3d4e5f-aarch64-apple-darwin" ]] || return 1
+    [[ -d "$releases/0.161.0-aarch64-apple-darwin" ]] || return 1
+    [[ -d "$releases/0.160.1-aarch64-apple-darwin" ]] || return 1
+    [[ -d "$releases/.unpack-tmp" ]]
+}
+
+@test "clean_agent_browser_old_chrome removes superseded builds and keeps the one agent-browser launches (#1748)" {
+    run env HOME="$HOME/agent-browser-positive" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+root="$HOME/.agent-browser/browsers"
+app="Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+build() {
+    mkdir -p "$root/$1/chrome-mac-arm64"
+    if [[ "$2" == binary ]]; then
+        mkdir -p "$root/$1/chrome-mac-arm64/${app%/*}"
+        touch "$root/$1/chrome-mac-arm64/$app"
+    fi
+    [[ "$3" == today ]] || touch -t 202601010000 "$root/$1"
+}
+# agent-browser walks names in byte order, so it launches 99, not 152.
+build chrome-99.0.4844.51 binary old
+build chrome-152.0.7977.64 binary old
+build chrome-151.0.7922.47 binary old
+build chrome-149.0.7827.54 binary old
+build chrome-146.0.7680.165 none old
+build chrome-146.0.7680.153 binary today
+mkdir -p "$HOME/.agent-browser/sessions"
+touch "$HOME/.agent-browser/sessions/state.json"
+printf '{"executablePath": "%s"}\n' "$root/chrome-149.0.7827.54/chrome-mac-arm64/$app" > "$HOME/.agent-browser/config.json"
+
+source "$PROJECT_ROOT/bin/clean.sh"
+pgrep() { return 1; }
+DRY_RUN=false
+MOLE_DRY_RUN=0
+clean_agent_browser_old_chrome
+
+for gone in chrome-152.0.7977.64 chrome-151.0.7922.47; do
+    [[ ! -e "$root/$gone" ]] || { echo "STILL_PRESENT:$gone"; exit 1; }
+done
+for kept in chrome-99.0.4844.51 chrome-149.0.7827.54 chrome-146.0.7680.165 chrome-146.0.7680.153; do
+    [[ -d "$root/$kept" ]] || { echo "REMOVED:$kept"; exit 1; }
+done
+[[ -f "$HOME/.agent-browser/sessions/state.json" && -f "$HOME/.agent-browser/config.json" ]] || exit 1
+echo "AGENT_BROWSER_PLAN_HELD"
+EOF
+
+    assert_run_success
+    assert_output_contains "AGENT_BROWSER_PLAN_HELD"
+    assert_output_not_contains "STILL_PRESENT:"
+    assert_output_not_contains "REMOVED:"
+}
+
+@test "clean_agent_browser_old_chrome keeps builds pinned through a symlink" {
+    run env HOME="$HOME/agent-browser-symlink-pin" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+root="$HOME/.agent-browser/browsers"
+app="Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+for name in chrome-99.0.4844.51 chrome-152.0.7977.64 chrome-151.0.7922.47 chrome-150.0.7900.10; do
+    mkdir -p "$root/$name/chrome-mac-arm64/${app%/*}"
+    touch "$root/$name/chrome-mac-arm64/$app"
+    touch -t 202601010000 "$root/$name"
+done
+# Neither pin names its build in text: one is an env var symlink, the other a
+# config path through a symlinked folder.
+mkdir -p "$HOME/bin"
+ln -s "$root/chrome-152.0.7977.64/chrome-mac-arm64/$app" "$HOME/bin/chrome"
+ln -s "$root/chrome-150.0.7900.10" "$HOME/pinned-build"
+printf '{"executablePath": "%s"}\n' "$HOME/pinned-build/chrome-mac-arm64/$app" > "$HOME/.agent-browser/config.json"
+export AGENT_BROWSER_EXECUTABLE_PATH="$HOME/bin/chrome"
+
+source "$PROJECT_ROOT/bin/clean.sh"
+pgrep() { return 1; }
+DRY_RUN=false
+MOLE_DRY_RUN=0
+clean_agent_browser_old_chrome
+
+[[ ! -e "$root/chrome-151.0.7922.47" ]] || { echo "STILL_PRESENT:chrome-151.0.7922.47"; exit 1; }
+for kept in chrome-99.0.4844.51 chrome-152.0.7977.64 chrome-150.0.7900.10; do
+    [[ -d "$root/$kept" ]] || { echo "REMOVED:$kept"; exit 1; }
+done
+echo "SYMLINK_PINS_HELD"
+EOF
+
+    assert_run_success
+    assert_output_contains "SYMLINK_PINS_HELD"
+    assert_output_not_contains "STILL_PRESENT:"
+    assert_output_not_contains "REMOVED:"
+}
+
+@test "clean_agent_browser_old_chrome names a changed plan instead of deferring as active" {
+    run env HOME="$HOME/agent-browser-plan-changed" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+root="$HOME/.agent-browser/browsers"
+mkdir -p "$root/chrome-151.0.7922.47"
+source "$PROJECT_ROOT/bin/clean.sh"
+pgrep() { return 1; }
+DRY_RUN=false
+MOLE_DRY_RUN=0
+plan_calls=0
+# The recheck at the delete boundary sees a different retention set.
+_plan_agent_browser_chrome_targets() {
+    plan_calls=$((plan_calls + 1))
+    _MOLE_AGENT_BROWSER_TARGETS=()
+    [[ $plan_calls -gt 1 ]] || _MOLE_AGENT_BROWSER_TARGETS=("$root/chrome-151.0.7922.47")
+    return 0
+}
+mole_defer_cleanup_family() { echo "DEFERRED_AS_ACTIVE:$1"; }
+clean_agent_browser_old_chrome
+[[ -d "$root/chrome-151.0.7922.47" ]] || { echo "REMOVED"; exit 1; }
+EOF
+
+    assert_run_success
+    assert_output_contains "agent-browser old Chrome · stopped (retention changed)"
+    assert_output_not_contains "DEFERRED_AS_ACTIVE"
+    assert_output_not_contains "REMOVED"
+}
+
+@test "clean_agent_browser_old_chrome keeps every build while its Chrome runs" {
+    run env HOME="$HOME/agent-browser-running" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+root="$HOME/.agent-browser/browsers"
+app="Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+for name in chrome-152.0.7977.64 chrome-151.0.7922.47; do
+    mkdir -p "$root/$name/chrome-mac-arm64/${app%/*}"
+    touch "$root/$name/chrome-mac-arm64/$app"
+    touch -t 202601010000 "$root/$name"
+done
+source "$PROJECT_ROOT/bin/clean.sh"
+pgrep() { [[ "$1" == "-f" && "$2" == "/.agent-browser/browsers/" ]]; }
+DRY_RUN=false
+MOLE_DRY_RUN=0
+clean_agent_browser_old_chrome
+[[ -d "$root/chrome-151.0.7922.47" ]] || { echo "REMOVED_WHILE_RUNNING"; exit 1; }
+echo "AGENT_BROWSER_RUNNING_KEPT"
+EOF
+
+    assert_run_success
+    assert_output_contains "AGENT_BROWSER_RUNNING_KEPT"
+    assert_output_not_contains "agent-browser old Chrome · stopped"
+}
+
+@test "clean_agent_browser_old_chrome keeps every build when its process probe fails" {
+    run env HOME="$HOME/agent-browser-unknown" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+root="$HOME/.agent-browser/browsers"
+app="Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+for name in chrome-152.0.7977.64 chrome-151.0.7922.47; do
+    mkdir -p "$root/$name/chrome-mac-arm64/${app%/*}"
+    touch "$root/$name/chrome-mac-arm64/$app"
+    touch -t 202601010000 "$root/$name"
+done
+source "$PROJECT_ROOT/bin/clean.sh"
+pgrep() { return 2; }
+DRY_RUN=false
+MOLE_DRY_RUN=0
+clean_agent_browser_old_chrome
+[[ -d "$root/chrome-151.0.7922.47" ]] || { echo "REMOVED_WITH_UNKNOWN_STATE"; exit 1; }
+echo "AGENT_BROWSER_UNKNOWN_KEPT"
+EOF
+
+    assert_run_success
+    assert_output_contains "AGENT_BROWSER_UNKNOWN_KEPT"
+    assert_output_contains "agent-browser old Chrome · stopped (process state unknown)"
 }

@@ -1,25 +1,13 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-	export PROJECT_ROOT
-
-	ORIGINAL_HOME="${HOME:-}"
-	export ORIGINAL_HOME
-
-	HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-installers-home.XXXXXX")"
-	export HOME
-
-	mkdir -p "$HOME"
+	mole_test_setup_home installers-home
 }
 
 teardown_file() {
-	if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-		rm -rf "$HOME"
-	fi
-	if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-		export HOME="$ORIGINAL_HOME"
-	fi
+	mole_test_teardown_home
 }
 
 setup() {
@@ -56,7 +44,7 @@ setup() {
 @test "installer.sh accepts --dry-run option" {
 	run env HOME="$HOME" TERM="xterm-256color" "$PROJECT_ROOT/bin/installer.sh" --dry-run
 
-	[[ "$status" -eq 0 || "$status" -eq 2 ]]
+	[[ "$status" -eq 0 || "$status" -eq 2 ]] || return 1
 	[[ "$output" == *"DRY RUN MODE"* ]]
 }
 
@@ -252,6 +240,41 @@ setup() {
 	[[ "$output" == *"real.dmg"* ]] || return 1
 	[[ "$output" != *"symlink.dmg"* ]] || return 1
 	[[ "$output" != *"dangling.lnk"* ]]
+}
+
+@test "installer selection EOF never confirms the menu or deletion" {
+	printf fixture > "$HOME/Downloads/Fixture.dmg"
+	# shellcheck disable=SC2016
+	run env HOME="$HOME" TERM="$TERM" MOLE_TEST_MODE=1 /bin/bash -c '
+		source "$1"
+		INSTALLER_PATHS=("$HOME/Downloads/Fixture.dmg")
+		INSTALLER_SIZES=(7)
+		DISPLAY_NAMES=(Fixture.dmg)
+		execute_installer_delete_plan() { echo SINK_REACHED; }
+		if show_installer_menu; then
+			delete_selected_installers
+		else
+			echo MENU_CANCELLED
+		fi
+	' bash "$PROJECT_ROOT/bin/installer.sh" < <(printf a)
+	[ "$status" -eq 0 ]
+	[[ "$output" == *MENU_CANCELLED* ]] || return 1
+	[[ "$output" != *SINK_REACHED* ]]
+}
+
+@test "installer final confirmation refuses EOF after a valid selection" {
+	printf fixture > "$HOME/Downloads/Fixture.dmg"
+	# shellcheck disable=SC2016
+	run env HOME="$HOME" TERM="$TERM" MOLE_TEST_MODE=1 /bin/bash -c '
+		source "$1"
+		INSTALLER_PATHS=("$HOME/Downloads/Fixture.dmg")
+		INSTALLER_SIZES=(7)
+		MOLE_SELECTION_RESULT=0
+		execute_installer_delete_plan() { echo SINK_REACHED; }
+		delete_selected_installers </dev/null
+	' bash "$PROJECT_ROOT/bin/installer.sh"
+	[ "$status" -ne 0 ]
+	[[ "$output" != *SINK_REACHED* ]]
 }
 
 @test "delete_selected_installers removes selected files and records successes" {
@@ -475,4 +498,88 @@ setup() {
 	[[ "$output" == *"Installer cleanup incomplete"* ]] || return 1
 	[[ "$output" == *"Failed to remove"* ]] || return 1
 	[[ ! -e "$removable" ]]
+}
+
+@test "main reports a delete-phase timeout instead of ending silently" {
+	local first="$HOME/Downloads/TimeoutFirst.dmg"
+	local second="$HOME/Downloads/TimeoutSecond.dmg"
+	printf 'first' > "$first"
+	printf 'second' > "$second"
+
+	# shellcheck disable=SC2016
+	run env HOME="$HOME" TERM="$TERM" /bin/bash -euo pipefail -c '
+        export MOLE_TEST_MODE=1
+        export MOLE_TEST_NO_AUTH=1
+        export MOLE_DELETE_LOG="$HOME/deletions.log"
+        source "$1"
+        test_first="$2"
+        test_second="$3"
+
+        collect_installers() {
+            INSTALLER_PATHS=("$test_first" "$test_second")
+            INSTALLER_SIZES=(5 6)
+            DISPLAY_NAMES=("TimeoutFirst.dmg" "TimeoutSecond.dmg")
+            return 0
+        }
+
+        show_installer_menu() {
+            MOLE_SELECTION_RESULT="0,1"
+            return 0
+        }
+
+        mole_delete() {
+            [[ "$1" == "$test_second" ]] && return 124
+            /bin/rm -f -- "$1"
+        }
+
+        set +e
+        main < <(printf "\n")
+        rc=$?
+        set -e
+        printf "rc=%s\n" "$rc"
+    ' bash "$PROJECT_ROOT/bin/installer.sh" "$first" "$second"
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"rc=124"* ]] || return 1
+	[[ "$output" == *"Installer cleanup incomplete"* ]] || return 1
+	[[ "$output" == *"Removed "* ]] || return 1
+	[[ "$output" == *"TimeoutSecond.dmg (delete failed)"* ]] || return 1
+	[[ "$output" == *"A file check timed out"* ]] || return 1
+	[[ ! -e "$first" ]] || return 1
+	[[ -e "$second" ]]
+}
+
+@test "installer deletion binds the confirmed identity at the final sink" {
+    local mode
+    for mode in real dry; do
+        local fixture_root="$BATS_TEST_TMPDIR/identity-$mode"
+        mkdir -p "$fixture_root"
+        printf 'old' > "$fixture_root/selected.dmg"
+        printf 'new' > "$fixture_root/replacement.dmg"
+        # shellcheck disable=SC2016 # The child shell evaluates this script.
+        run /bin/bash --noprofile --norc -c '
+            export MOLE_TEST_MODE=1 MOLE_TEST_NO_AUTH=1 MOLE_DELETE_MODE=permanent
+            source "$1"
+            target="$2/selected.dmg"
+            export MOLE_DELETE_LOG="$2/deletions.log"
+            INSTALLER_PATHS=("$target")
+            INSTALLER_SIZES=(3)
+            build_installer_delete_plan 0
+            [[ "$3" != dry ]] || export MOLE_DRY_RUN=1
+            installer_file_size_bytes() {
+                /bin/mv "$target" "${target}.original"
+                /bin/mv "${target%/*}/replacement.dmg" "$target"
+                printf "3\n"
+            }
+            rc=0
+            execute_installer_delete_plan || rc=$?
+            [[ $rc -eq $INSTALLER_EXIT_INCOMPLETE ]] || exit 1
+            [[ $total_deleted -eq 0 && $total_size_freed_kb -eq 0 && $total_delete_failed -eq 1 ]] || exit 1
+            [[ -f "$target" && -f "${target}.original" ]] || exit 1
+            [[ "$(cat "$target")" == new ]] || exit 1
+            [[ "$(cat "${target}.original")" == old ]] || exit 1
+            grep -F "identity-changed" "$MOLE_DELETE_LOG" >/dev/null
+        ' bash "$PROJECT_ROOT/bin/installer.sh" "$fixture_root" "$mode"
+        [ "$status" -eq 0 ] || return 1
+    done
 }

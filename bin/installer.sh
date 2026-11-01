@@ -4,6 +4,13 @@
 
 set -euo pipefail
 
+# User state and installed tools must never run with inherited root privileges.
+# Individual maintenance operations request administrator access themselves.
+if [[ "$EUID" -eq 0 ]]; then
+    printf '%s\n' 'Run Mole without sudo; it requests administrator access when needed.' >&2
+    exit 1
+fi
+
 # shellcheck disable=SC2154
 # External variables set by menu_paginated.sh and environment
 declare MOLE_SELECTION_RESULT
@@ -46,6 +53,8 @@ readonly INSTALLER_SCAN_PATHS=(
 )
 readonly MAX_ZIP_ENTRIES=50
 readonly INSTALLER_EXIT_INCOMPLETE=3
+readonly INSTALLER_EXIT_SCAN_FAILED=4
+INSTALLER_SCAN_FAILURE_PATH=""
 ZIP_LIST_CMD=()
 IN_ALT_SCREEN=0
 
@@ -57,23 +66,31 @@ fi
 
 TERMINAL_WIDTH=0
 
-# Check for installer payloads inside ZIP - check first N entries for installer patterns
+# Inspect the first N entries only after a complete ZIP listing.
+# Return 0 for an installer, 1 for an ordinary/unreadable/corrupt ZIP;
+# resource failures and timeout/signal statuses abort discovery.
 is_installer_zip() {
     local zip="$1"
-    local cap="$MAX_ZIP_ENTRIES"
+    local deadline="${2:-$((SECONDS + 10#${MOLE_TIMEOUT_DISK_VERIFY_SEC%%.*}))}"
+    local listing duration rc=0
 
     [[ ${#ZIP_LIST_CMD[@]} -gt 0 ]] || return 1
-
-    if ! "${ZIP_LIST_CMD[@]}" "$zip" 2> /dev/null |
-        head -n "$cap" |
-        awk '
-            /\.(app|pkg|dmg|xip)(\/|$)/ { found=1; exit 0 }
-            END { exit found ? 0 : 1 }
-        '; then
-        return 1
+    duration=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_SHORT_QUERY_SEC" "$deadline") || return $?
+    listing=$(create_temp_file) || return "$INSTALLER_EXIT_SCAN_FAILED"
+    run_with_timeout "$duration" "${ZIP_LIST_CMD[@]}" "$zip" > "$listing" 2> /dev/null || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        duration=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_SHORT_QUERY_SEC" "$deadline") || rc=$?
+        if [[ $rc -eq 0 ]]; then
+            run_with_timeout "$duration" awk -v cap="$MAX_ZIP_ENTRIES" '
+                NR <= cap && /\.(app|pkg|dmg|xip)(\/|$)/ { found=1 }
+                END { exit found ? 0 : 1 }
+            ' "$listing" || rc=$?
+        fi
+    elif ! mole_rc_timeout_or_signal "$rc"; then
+        rc=1 # Corrupt or unreadable archives remain ordinary non-candidates.
     fi
-
-    return 0
+    rm -f "$listing" # SAFE: tracked mktemp file created by this archive inspection
+    return "$rc"
 }
 
 handle_candidate_file() {
@@ -82,48 +99,113 @@ handle_candidate_file() {
     [[ -L "$file" ]] && return 0 # Skip symlinks explicitly
     case "$file" in
         *.dmg | *.pkg | *.mpkg | *.iso | *.xip)
-            echo "$file"
+            printf '%s\0' "$file"
             ;;
         *.zip)
             [[ -r "$file" ]] || return 0
-            if is_installer_zip "$file" 2> /dev/null; then
-                echo "$file"
-            fi
+            local zip_rc=0
+            is_installer_zip "$file" "${2:-}" 2> /dev/null || zip_rc=$?
+            case "$zip_rc" in
+                0) printf '%s\0' "$file" ;;
+                1) return 0 ;;
+                *)
+                    # One slow archive (an iCloud file that has to download
+                    # first, or a huge listing) is skipped like an unreadable
+                    # one. Only the shared deadline or a signal stops the scan.
+                    if mole_rc_timeout "$zip_rc" &&
+                        _mole_timeout_with_deadline 1 "${2:-}" > /dev/null; then
+                        return 0
+                    fi
+                    return "$zip_rc"
+                    ;;
+            esac
             ;;
     esac
 }
 
+# True when every diagnostic line is a permission refusal: find's
+# "Permission denied" / "Operation not permitted" and fd's same text with an
+# "(os error N)" suffix. Anything else fails the scan.
+installer_scan_errors_are_permission_only() {
+    ! grep -E -v -e '(Permission denied|Operation not permitted)( \(os error [0-9]+\))?\.?$' -e '^$' "$1" > /dev/null
+}
+
+# Publish NUL-delimited candidates only on success; preserve producer failures.
 scan_installers_in_path() {
     local path="$1"
     local max_depth="${MOLE_INSTALLER_SCAN_MAX_DEPTH:-$INSTALLER_SCAN_MAX_DEPTH_DEFAULT}"
+    local deadline="${2:-$((SECONDS + 10#${MOLE_TIMEOUT_DISK_VERIFY_SEC%%.*}))}"
 
     [[ -d "$path" ]] || return 0
 
-    local file
-
-    if command -v fd > /dev/null 2>&1; then
-        while IFS= read -r file; do
-            handle_candidate_file "$file"
-        done < <(
-            fd --no-ignore --hidden --type f --max-depth "$max_depth" \
-                -e dmg -e pkg -e mpkg -e iso -e xip -e zip \
-                . "$path" 2> /dev/null || true
-        )
-    else
-        while IFS= read -r file; do
-            handle_candidate_file "$file"
-        done < <(
-            find "$path" -maxdepth "$max_depth" -type f \
-                \( -name '*.dmg' -o -name '*.pkg' -o -name '*.mpkg' \
-                -o -name '*.iso' -o -name '*.xip' -o -name '*.zip' \) \
-                2> /dev/null || true
-        )
+    # A failed producer must never publish its partial candidate prefix.
+    local scan_file filtered_file errors_file file scan_timeout scan_rc=0
+    scan_file=$(create_temp_file) || return 1
+    filtered_file=$(create_temp_file) || return 1
+    errors_file=$(create_temp_file) || return 1
+    scan_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" "$deadline") || scan_rc=$?
+    if [[ $scan_rc -eq 0 ]]; then
+        local -a scan_command=()
+        if command -v fd > /dev/null 2>&1; then
+            scan_command=(fd --show-errors --print0 --no-ignore --hidden --type f --max-depth "$max_depth"
+                -e dmg -e pkg -e mpkg -e iso -e xip -e zip . "$path")
+        else
+            scan_command=(find -H "$path" -maxdepth "$max_depth" -type f
+                \( -name '*.dmg' -o -name '*.pkg' -o -name '*.mpkg'
+                -o -name '*.iso' -o -name '*.xip' -o -name '*.zip' \) -print0)
+        fi
+        # Redirect only the producer's diagnostics; the timeout supervisor owns
+        # its stderr, including debug traces. exec preserves the producer status.
+        # shellcheck disable=SC2016 # This script is evaluated by the child shell.
+        run_with_timeout "$scan_timeout" /bin/bash -c '
+            errors_file="$1"
+            shift
+            exec "$@" 2> "$errors_file"
+        ' bash "$errors_file" "${scan_command[@]}" > "$scan_file" || scan_rc=$?
     fi
+    # A folder the user cannot read (chmod 000, or privacy-protected without
+    # Full Disk Access) is out of reach, not a failed scan: its readable
+    # siblings still publish, and every removal is bound to its confirmed
+    # identity anyway. find exits 1 on it while fd still exits 0, so read the
+    # diagnostics; any other diagnostic, or any other status, keeps the whole
+    # inventory unpublished.
+    if [[ -s "$errors_file" ]] && [[ $scan_rc -eq 0 || $scan_rc -eq 1 ]]; then
+        if installer_scan_errors_are_permission_only "$errors_file"; then
+            scan_rc=0
+        else
+            scan_rc=$INSTALLER_EXIT_SCAN_FAILED
+        fi
+    fi
+    if [[ $scan_rc -eq 0 ]]; then
+        while IFS= read -r -d '' file; do
+            _mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" "$deadline" > /dev/null || {
+                scan_rc=$?
+                break
+            }
+            handle_candidate_file "$file" "$deadline" >> "$filtered_file" || {
+                scan_rc=$?
+                break
+            }
+        done < "$scan_file"
+    fi
+    if [[ $scan_rc -eq 0 ]]; then
+        _mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" "$deadline" > /dev/null || scan_rc=$?
+    fi
+    if [[ $scan_rc -eq 0 ]]; then
+        cat "$filtered_file" || scan_rc=$?
+    fi
+    rm -f "$scan_file" "$filtered_file" "$errors_file" # SAFE: tracked mktemp files created by this scan
+    if [[ $scan_rc -ne 0 ]]; then
+        INSTALLER_SCAN_FAILURE_PATH="$path"
+    fi
+    return "$scan_rc"
 }
 
 scan_all_installers() {
+    local deadline="${1:-$((SECONDS + 10#${MOLE_TIMEOUT_DISK_VERIFY_SEC%%.*}))}"
+    local path
     for path in "${INSTALLER_SCAN_PATHS[@]}"; do
-        scan_installers_in_path "$path"
+        scan_installers_in_path "$path" "$deadline" || return $?
     done
 }
 
@@ -170,11 +252,23 @@ get_terminal_width() {
     echo "$TERMINAL_WIDTH"
 }
 
+# Escape terminal controls without changing the filesystem path.
+installer_display_text() {
+    local text="$1"
+    if [[ "$text" =~ [[:cntrl:]] ]]; then
+        printf -v text '%q' "$text"
+    fi
+    printf '%s' "$text"
+}
+
 # Format installer display with alignment - similar to purge command
 format_installer_display() {
     local filename="$1"
     local size_str="$2"
     local source="$3"
+
+    filename=$(installer_display_text "$filename")
+    source=$(installer_display_text "$source")
 
     # Terminal width for alignment
     local terminal_width
@@ -209,13 +303,23 @@ format_installer_display() {
     printf "%-*s %8s | %-10s" "$printf_width" "$truncated_name" "$size_str" "$source"
 }
 
-# Collect all installers with their metadata
+# Publish complete installer metadata: 0 success, 1 empty, 4 scan failure,
+# or the original timeout/signal status. No failure publishes partial arrays.
 collect_installers() {
     # Clear previous results
     INSTALLER_PATHS=()
     INSTALLER_SIZES=()
     INSTALLER_SOURCES=()
     DISPLAY_NAMES=()
+    INSTALLER_SCAN_FAILURE_PATH=""
+
+    # Scan all paths, deduplicate, and sort results
+    local -a all_files=() sizes=() sources=() displays=()
+
+    local deadline=$((SECONDS + 10#${MOLE_TIMEOUT_DISK_VERIFY_SEC%%.*}))
+    local scan_file sorted_file file scan_timeout scan_rc=0
+    scan_file=$(create_temp_file) || return "$INSTALLER_EXIT_SCAN_FAILED"
+    sorted_file=$(create_temp_file) || return "$INSTALLER_EXIT_SCAN_FAILED"
 
     # Start scanning with spinner
     if [[ -t 1 ]]; then
@@ -225,14 +329,27 @@ collect_installers() {
     # Start debug session
     debug_operation_start "Collect Installers" "Scanning for redundant installer files"
 
-    # Scan all paths, deduplicate, and sort results
-    local -a all_files=()
-
-    while IFS= read -r file; do
+    scan_all_installers "$deadline" > "$scan_file" || scan_rc=$?
+    if [[ $scan_rc -eq 0 ]]; then
+        scan_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" "$deadline") || scan_rc=$?
+        if [[ $scan_rc -eq 0 ]]; then
+            run_with_timeout "$scan_timeout" sort -zu "$scan_file" > "$sorted_file" || scan_rc=$?
+        fi
+    fi
+    if [[ $scan_rc -ne 0 ]]; then
+        rm -f "$scan_file" "$sorted_file" # SAFE: tracked mktemp files created by this collection
+        [[ ! -t 1 ]] || stop_inline_spinner
+        if mole_rc_timeout_or_signal "$scan_rc"; then
+            return "$scan_rc"
+        fi
+        return "$INSTALLER_EXIT_SCAN_FAILED"
+    fi
+    while IFS= read -r -d '' file; do
         [[ -z "$file" ]] && continue
         all_files+=("$file")
         debug_file_action "Found installer" "$file"
-    done < <(scan_all_installers | sort -u)
+    done < "$sorted_file"
+    rm -f "$scan_file" "$sorted_file" # SAFE: tracked mktemp files created by this collection
 
     if [[ -t 1 ]]; then
         stop_inline_spinner
@@ -253,10 +370,12 @@ collect_installers() {
     # Process each installer
     for file in "${all_files[@]}"; do
         # Calculate file size
-        local file_size=0
-        if [[ -f "$file" ]]; then
-            file_size=$(get_file_size "$file")
-        fi
+        local file_size
+        file_size=$(installer_file_size_bytes "$file" "$deadline") || {
+            scan_rc=$?
+            INSTALLER_SCAN_FAILURE_PATH="$file"
+            break
+        }
 
         # Get source directory
         local source
@@ -268,7 +387,7 @@ collect_installers() {
 
         # Get display filename - strip Homebrew hash prefix if present
         local display_name
-        display_name=$(basename "$file")
+        display_name="${file##*/}"
         if [[ "$source" == "Homebrew" ]]; then
             # Homebrew names often look like: sha256--name--version
             # Strip the leading hash if it matches [0-9a-f]{64}--
@@ -282,15 +401,26 @@ collect_installers() {
         display=$(format_installer_display "$display_name" "$size_human" "$source")
 
         # Store installer data in parallel arrays
-        INSTALLER_PATHS+=("$file")
-        INSTALLER_SIZES+=("$file_size")
-        INSTALLER_SOURCES+=("$source")
-        DISPLAY_NAMES+=("$display")
+        sizes+=("$file_size")
+        sources+=("$source")
+        displays+=("$display")
     done
 
     if [[ -t 1 ]]; then
         stop_inline_spinner
     fi
+    if [[ $scan_rc -eq 0 ]]; then
+        _mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" "$deadline" > /dev/null || scan_rc=$?
+    fi
+    if [[ $scan_rc -ne 0 ]]; then
+        mole_rc_timeout_or_signal "$scan_rc" && return "$scan_rc"
+        return "$INSTALLER_EXIT_SCAN_FAILED"
+    fi
+    # Publish the parallel arrays together only after every metadata probe finishes.
+    INSTALLER_PATHS=("${all_files[@]}")
+    INSTALLER_SIZES=("${sizes[@]}")
+    INSTALLER_SOURCES=("${sources[@]}")
+    DISPLAY_NAMES=("${displays[@]}")
     return 0
 }
 
@@ -444,7 +574,10 @@ select_installers() {
     while true; do
         draw_menu
 
-        IFS= read -r -s -n1 key || key=""
+        if ! IFS= read -r -s -n1 key; then
+            restore_terminal
+            return 1
+        fi
         case "$key" in
             $'\x1b')
                 IFS= read -r -s -n1 -t 1 key2 || key2=""
@@ -558,9 +691,10 @@ record_installer_delete_failure() {
 
 installer_file_size_bytes() {
     local file_path="$1"
-    local file_size
+    local file_size duration
 
-    file_size=$(get_file_size "$file_path" 2> /dev/null || echo "")
+    duration=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" "${2:-}") || return $?
+    file_size=$(run_with_timeout "$duration" "$STAT_BSD" -f%z "$file_path" < /dev/null 2> /dev/null) || return $?
     [[ "$file_size" =~ ^[0-9]+$ ]] || return 1
     printf '%s\n' "$file_size"
 }
@@ -568,6 +702,7 @@ installer_file_size_bytes() {
 build_installer_delete_plan() {
     reset_installer_delete_plan
 
+    local deadline=$((SECONDS + 10#${MOLE_TIMEOUT_DISK_VERIFY_SEC%%.*}))
     local idx
     for idx in "$@"; do
         if [[ ! "$idx" =~ ^[0-9]+$ ]] || [[ $idx -ge ${#INSTALLER_PATHS[@]} ]]; then
@@ -581,9 +716,19 @@ build_installer_delete_plan() {
             file_size=0
         fi
 
+        local identity identity_rc=0
+        identity=$(mole_deletion_identity "$file_path" "$deadline") || identity_rc=$?
+        if [[ $identity_rc -ne 0 ]]; then
+            record_installer_delete_failure "$file_path" "identity unavailable"
+            if mole_rc_timeout_or_signal "$identity_rc"; then
+                reset_installer_delete_plan
+                return "$identity_rc"
+            fi
+            continue
+        fi
         INSTALLER_DELETE_PATHS+=("$file_path")
         INSTALLER_DELETE_SIZES+=("$file_size")
-        INSTALLER_DELETE_IDENTITIES+=("$(mole_path_identity "$file_path")")
+        INSTALLER_DELETE_IDENTITIES+=("$identity")
     done
 
     [[ ${#INSTALLER_DELETE_PATHS[@]} -gt 0 ]]
@@ -601,16 +746,25 @@ execute_installer_delete_plan() {
             continue
         fi
 
-        local current_identity
-        current_identity=$(mole_path_identity "$file_path")
+        local current_identity identity_rc=0
+        current_identity=$(mole_deletion_identity "$file_path") || identity_rc=$?
+        if [[ $identity_rc -ne 0 ]]; then
+            record_installer_delete_failure "$file_path" "identity unavailable"
+            mole_rc_timeout_or_signal "$identity_rc" && return "$identity_rc"
+            continue
+        fi
         if [[ "$current_identity" != "$planned_identity" ]]; then
             record_installer_delete_failure "$file_path" "changed since scan"
             continue
         fi
 
-        local current_size
-        if ! current_size=$(installer_file_size_bytes "$file_path"); then
+        local current_size size_rc=0
+        current_size=$(installer_file_size_bytes "$file_path") || size_rc=$?
+        if [[ $size_rc -ne 0 ]]; then
             record_installer_delete_failure "$file_path" "size unavailable"
+            if mole_rc_timeout_or_signal "$size_rc" && ! mole_rc_timeout "$size_rc"; then
+                return "$size_rc"
+            fi
             continue
         fi
         if [[ "$current_size" != "$planned_size" ]]; then
@@ -618,7 +772,7 @@ execute_installer_delete_plan() {
             continue
         fi
 
-        if mole_delete "$file_path" false; then
+        if mole_delete "$file_path" false "$planned_identity"; then
             if [[ "${MOLE_DRY_RUN:-0}" == "1" ]] || [[ ! -e "$file_path" && ! -L "$file_path" ]]; then
                 total_size_freed_kb=$((total_size_freed_kb + ((current_size + 1023) / 1024)))
                 total_deleted=$((total_deleted + 1))
@@ -626,7 +780,11 @@ execute_installer_delete_plan() {
                 record_installer_delete_failure "$file_path" "still exists"
             fi
         else
+            local delete_rc=$?
             record_installer_delete_failure "$file_path" "delete failed"
+            if mole_rc_timeout_or_signal "$delete_rc"; then
+                return "$delete_rc"
+            fi
         fi
     done
 
@@ -650,7 +808,10 @@ delete_selected_installers() {
         return 1
     fi
 
-    if ! build_installer_delete_plan "${selected_indices[@]}"; then
+    local plan_status=0
+    build_installer_delete_plan "${selected_indices[@]}" || plan_status=$?
+    if [[ $plan_status -ne 0 ]]; then
+        mole_rc_timeout_or_signal "$plan_status" && return "$plan_status"
         if [[ $total_delete_failed -gt 0 ]]; then
             return "$INSTALLER_EXIT_INCOMPLETE"
         fi
@@ -673,14 +834,18 @@ delete_selected_installers() {
         local file_size="${INSTALLER_DELETE_SIZES[$plan_index]}"
         local size_human
         size_human=$(bytes_to_human "$file_size")
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} $(basename "$file_path") ${GRAY}, ${size_human}${NC}"
+        printf '  %s%s%s %s %s, %s%s\n' "$GREEN" "$ICON_SUCCESS" "$NC" \
+            "$(installer_display_text "${file_path##*/}")" "$GRAY" "$size_human" "$NC"
     done
 
     # Confirm deletion
     echo ""
     echo -ne "${PURPLE}${ICON_ARROW}${NC} Delete ${#INSTALLER_DELETE_PATHS[@]} installers, ${confirm_human}  ${GREEN}Enter${NC} confirm, ${GRAY}ESC${NC} cancel: "
 
-    IFS= read -r -s -n1 confirm || confirm=""
+    if ! IFS= read -r -s -n1 confirm; then
+        printf '\n'
+        return 1
+    fi
     case "$confirm" in
         $'\e' | q | Q)
             return 1
@@ -719,12 +884,28 @@ perform_installers() {
     fi
 
     # Collect installers
-    if ! collect_installers; then
+    local collect_status=0
+    collect_installers || collect_status=$?
+    if [[ $collect_status -ne 0 ]]; then
         if [[ -t 1 ]]; then
             leave_alt_screen
             IN_ALT_SCREEN=0
         fi
         printf '\n'
+        if [[ $collect_status -ne 1 ]]; then
+            local scan_reason="incomplete"
+            if mole_rc_timeout "$collect_status"; then
+                scan_reason="timed out"
+            elif mole_rc_timeout_or_signal "$collect_status"; then
+                scan_reason="interrupted"
+            fi
+            printf '%sInstaller scan %s%s; no files selected' "$YELLOW" "$scan_reason" "$NC" >&2
+            if [[ -n "$INSTALLER_SCAN_FAILURE_PATH" ]]; then
+                printf ' (%s)' "$(installer_display_text "$INSTALLER_SCAN_FAILURE_PATH")" >&2
+            fi
+            printf '\nCheck that the scan locations are readable and responsive, then retry mo installer.\n' >&2
+            return "$collect_status"
+        fi
         echo -e "${GREEN}${ICON_SUCCESS}${NC} Great! No installer files to clean"
         printf '\n'
         return 2 # Nothing to clean
@@ -795,7 +976,10 @@ show_summary() {
 
         local failure_index
         for ((failure_index = 0; failure_index < failure_limit; failure_index++)); do
-            local failure_detail="${INSTALLER_DELETE_FAILURES[$failure_index]}"
+            local failure_detail
+            failure_detail=$(installer_display_text "${INSTALLER_DELETE_FAILURES[$failure_index]}")
+            # The shared summary renderer interprets escapes for colors.
+            failure_detail=${failure_detail//\\/\\\\}
             summary_details+=("${ICON_WARNING} $failure_detail")
         done
 
@@ -849,11 +1033,26 @@ main() {
             show_summary
             return 1
             ;;
+        "$INSTALLER_EXIT_SCAN_FAILED")
+            return 1
+            ;;
         1)
             printf '\n'
             ;;
         2)
             # Already handled by collect_installers
+            ;;
+        *)
+            # A timeout or signal in the delete phase stops before later
+            # selections, but it has already recorded which file it hit.
+            # Report that and what was removed instead of ending silently.
+            if [[ $total_delete_failed -gt 0 ]]; then
+                show_summary
+                if mole_rc_timeout "$exit_code"; then
+                    echo -e "${YELLOW}${ICON_WARNING}${NC} A file check timed out, so later selections were left in place. Retry mo installer."
+                fi
+            fi
+            return "$exit_code"
             ;;
     esac
 

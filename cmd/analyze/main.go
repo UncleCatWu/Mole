@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -78,7 +79,10 @@ func main() {
 	if *jsonMode {
 		runJSONMode(abs, isOverview)
 	} else {
-		runTUIMode(abs, isOverview)
+		if err := runTUIMode(abs, isOverview); err != nil {
+			fmt.Fprintf(os.Stderr, "analyzer error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -105,24 +109,29 @@ func resolveScanTarget(envPath string, args []string) (string, bool, error) {
 	return abs, false, nil
 }
 
-func runTUIMode(path string, isOverview bool) {
-	// Warm overview cache only when the user opens a specific directory.
-	// Overview mode already schedules the same measurements for the foreground UI;
-	// running the prefetcher there doubles the du/io workload on cold start.
+func runTUIMode(path string, isOverview bool) error {
+	m := newModel(path, isOverview)
+	defer m.stopForExit()
 	if !isOverview {
-		prefetchCtx, prefetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		prefetchCtx, prefetchCancel := context.WithTimeout(m.lifetimeContext(), 30*time.Second)
 		defer prefetchCancel()
-		go prefetchOverviewCache(prefetchCtx)
+		m.startOverviewPrefetch(prefetchCtx)
 	}
+	return runAnalyzerProgram(m, tea.WithAltScreen())
+}
 
-	p := tea.NewProgram(newModel(path, isOverview), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "analyzer error: %v\n", err)
-		os.Exit(1)
+func runAnalyzerProgram(m model, options ...tea.ProgramOption) error {
+	defer m.stopForExit()
+	options = append(options, tea.WithFilter(analyzerExitFilter))
+	final, err := tea.NewProgram(m, options...).Run()
+	if stopped, ok := final.(interface{ stopForExit() }); ok {
+		stopped.stopForExit()
 	}
+	return err
 }
 
 func newModel(path string, isOverview bool) model {
+	lifecycle := newAnalyzerLifecycle()
 	var filesScanned, dirsScanned, bytesScanned int64
 	currentPath := &atomic.Value{}
 	currentPath.Store("")
@@ -133,6 +142,7 @@ func newModel(path string, isOverview bool) model {
 	}
 
 	m := model{
+		lifecycle:           lifecycle,
 		path:                path,
 		selected:            0,
 		status:              "Preparing scan...",
@@ -146,10 +156,11 @@ func newModel(path string, isOverview bool) model {
 		isOverview:          isOverview,
 		cache:               make(map[string]historyEntry),
 		overviewSizeCache:   make(map[string]int64),
-		overviewScanningSet: make(map[string]bool),
+		overviewScanningSet: make(map[string]*scanPublication),
+		cachePublications:   make(map[string]*scanPublication),
 		multiSelected:       make(map[string]bool),
 		largeMultiSelected:  make(map[string]bool),
-		liveSortMode:        liveScanSortModeFromEnv(),
+		liveSortMode:        liveSortFreezeOnMove,
 		snapshotRunner:      runLocalSnapshotCommand,
 	}
 
@@ -198,6 +209,7 @@ func createOverviewEntriesWithInsights(insightEntries []dirEntry) []dirEntry {
 	}
 
 	entries = append(entries, systemOverviewRoots()...)
+	entries = append(entries, mountedVolumeOverviewEntries()...)
 
 	// Hidden space insights: paths that silently accumulate disk usage.
 	entries = append(entries, insightEntries...)
@@ -214,8 +226,19 @@ func systemOverviewRoots() []dirEntry {
 
 func sumKnownEntrySizes(entries []dirEntry) int64 {
 	var total int64
-	for _, entry := range entries {
-		if entry.Size > 0 {
+	for i, entry := range entries {
+		if entry.Size <= 0 {
+			continue
+		}
+		covered := false
+		for j, parent := range entries {
+			if parent.Size > 0 && j != i && (overviewPathContains(parent.Path, entry.Path) ||
+				(j < i && filepath.Clean(parent.Path) == filepath.Clean(entry.Path))) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
 			total += entry.Size
 		}
 	}
@@ -261,4 +284,27 @@ func safePreview(path string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), openCommandTimeout)
 	defer cancel()
 	return exec.CommandContext(ctx, "open", path).Run()
+}
+
+func overviewPathContains(parent, child string) bool {
+	if parent == "" || child == "" {
+		return false
+	}
+	if home := os.Getenv("HOME"); home != "" && filepath.Clean(parent) == filepath.Clean(home) {
+		library := filepath.Join(home, "Library")
+		if filepath.Clean(child) == library || pathIsWithin(child, library) {
+			return false
+		}
+	}
+	if home := os.Getenv("HOME"); home != "" && filepath.Clean(parent) == filepath.Join(home, "Downloads") {
+		// This insight measures old immediate children, not every descendant.
+		return false
+	}
+	rel, err := filepath.Rel(parent, child)
+	if err == nil && rel != "." {
+		if first, _, _ := strings.Cut(rel, string(filepath.Separator)); overviewDuIgnoreNames[first] {
+			return false
+		}
+	}
+	return filepath.Clean(parent) != filepath.Clean(child) && pathIsWithin(filepath.Clean(child), filepath.Clean(parent))
 }

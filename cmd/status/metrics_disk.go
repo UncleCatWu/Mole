@@ -47,6 +47,7 @@ var skipDiskFSTypes = map[string]bool{
 var (
 	diskPartitionsFunc = disk.Partitions
 	diskUsageFunc      = disk.Usage
+	diskIOCountersFunc = disk.IOCounters
 )
 
 const (
@@ -73,7 +74,6 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 	var (
 		disks      []DiskStatus
 		seenDevice = make(map[string]bool)
-		seenVolume = make(map[string]bool)
 	)
 	for _, part := range partitions {
 		if shouldSkipDiskPartition(part) {
@@ -91,23 +91,27 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 			continue
 		}
 		total := usage.Total
+		var plistProbe *diskPlistProbe
 		if useCorrections && runtime.GOOS == "darwin" {
-			total = correctDiskTotalBytes(part.Mountpoint, total)
+			// The total-size correction and the APFS container-free correction
+			// both read the same `diskutil info -plist` document, so one bounded
+			// probe per mount serves both instead of spawning diskutil twice.
+			plistProbe = newDiskPlistProbe(part.Mountpoint)
+			total = correctDiskTotalBytesWithProbe(total, plistProbe)
 		}
 		// Skip <1GB volumes.
 		if total < 1<<30 {
 			continue
 		}
-		// Use size-based dedupe key for shared pools.
-		volKey := fmt.Sprintf("%s:%d", part.Fstype, total)
-		if seenVolume[volKey] {
-			continue
-		}
+		// APFS volumes in one synthesized container share a base device.
+		// Equal capacity alone is not evidence of a shared pool: independent
+		// disks of the same model commonly have exactly the same byte count.
 		used := usage.Used
 		usedPercent := usage.UsedPercent
 		purgeable := uint64(0)
 		if useCorrections && runtime.GOOS == "darwin" && strings.ToLower(part.Fstype) == "apfs" {
-			used, usedPercent, purgeable = correctAPFSDiskUsage(part.Mountpoint, total, usage.Used, usage.Free)
+			used, usedPercent, purgeable = correctAPFSDiskUsageWithProbe(
+				part.Mountpoint, total, usage.Used, usage.Free, plistProbe)
 		}
 
 		disks = append(disks, DiskStatus{
@@ -122,7 +126,6 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 			Purgeable:   purgeable,
 		})
 		seenDevice[baseDevice] = true
-		seenVolume[volKey] = true
 	}
 
 	if useCorrections {
@@ -299,15 +302,63 @@ func parseDiskMetadata(out string) (diskMetadata, error) {
 	return metadata, nil
 }
 
+// diskPlistProbe memoizes one bounded `diskutil info -plist <mount>` read for
+// a single collection pass. The total-size correction and the APFS
+// container-free correction ask about the same mountpoint and the plist
+// already carries both values, so sharing the probe removes one diskutil
+// subprocess per volume without changing either fallback chain.
+type diskPlistProbe struct {
+	mountpoint string
+	once       sync.Once
+	raw        string
+	err        error
+}
+
+func newDiskPlistProbe(mountpoint string) *diskPlistProbe {
+	return &diskPlistProbe{mountpoint: mountpoint}
+}
+
+// output runs the probe at most once; concurrent callers are not expected (the
+// collection loop is serial) but sync.Once keeps it safe and idempotent.
+func (p *diskPlistProbe) output() (string, error) {
+	p.once.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		p.raw, p.err = runCmd(ctx, "diskutil", "info", "-plist", p.mountpoint)
+	})
+	return p.raw, p.err
+}
+
+func (p *diskPlistProbe) totalBytes() (uint64, error) {
+	out, err := p.output()
+	if err != nil {
+		return 0, err
+	}
+	// Prefer TotalSize, but keep older/plainer keys as fallbacks.
+	return extractPlistUint(out, "TotalSize", "DiskSize", "Size")
+}
+
+func (p *diskPlistProbe) containerFreeBytes() (uint64, error) {
+	out, err := p.output()
+	if err != nil {
+		return 0, err
+	}
+	return extractPlistUint(out, "APFSContainerFree")
+}
+
 // correctDiskTotalBytes uses diskutil's plist output when macOS reports a
 // meaningfully different disk size than gopsutil. This fixes external APFS
 // volumes that can show doubled capacities through statfs/gopsutil.
 func correctDiskTotalBytes(mountpoint string, rawTotal uint64) uint64 {
+	return correctDiskTotalBytesWithProbe(rawTotal, newDiskPlistProbe(mountpoint))
+}
+
+func correctDiskTotalBytesWithProbe(rawTotal uint64, probe *diskPlistProbe) uint64 {
 	if rawTotal == 0 || !commandExists("diskutil") {
 		return rawTotal
 	}
 
-	diskutilTotal, err := getDiskutilTotalBytes(mountpoint)
+	diskutilTotal, err := probe.totalBytes()
 	if err != nil || diskutilTotal == 0 {
 		return rawTotal
 	}
@@ -319,19 +370,6 @@ func correctDiskTotalBytes(mountpoint string, rawTotal uint64) uint64 {
 	return rawTotal
 }
 
-func getDiskutilTotalBytes(mountpoint string) (uint64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	out, err := runCmd(ctx, "diskutil", "info", "-plist", mountpoint)
-	if err != nil {
-		return 0, err
-	}
-
-	// Prefer TotalSize, but keep older/plainer keys as fallbacks.
-	return extractPlistUint(out, "TotalSize", "DiskSize", "Size")
-}
-
 // correctAPFSDiskUsage returns Finder-accurate used bytes, percent, and the
 // purgeable bytes Finder counts as free, for an APFS volume. It accounts for
 // purgeable caches and APFS local snapshots that statfs incorrectly counts as
@@ -340,6 +378,10 @@ func getDiskutilTotalBytes(mountpoint string) (uint64, error) {
 //  2. diskutil APFSContainerFree, corrects APFS snapshot space
 //  3. Raw gopsutil values, original statfs-based calculation
 func correctAPFSDiskUsage(mountpoint string, total, rawUsed, rawFree uint64) (used uint64, usedPercent float64, purgeable uint64) {
+	return correctAPFSDiskUsageWithProbe(mountpoint, total, rawUsed, rawFree, newDiskPlistProbe(mountpoint))
+}
+
+func correctAPFSDiskUsageWithProbe(mountpoint string, total, rawUsed, rawFree uint64, probe *diskPlistProbe) (used uint64, usedPercent float64, purgeable uint64) {
 	// Tier 1: Finder via osascript (startup disk at "/" only).
 	if mountpoint == "/" && commandExists("osascript") {
 		if finderFree, finderTotal, err := getFinderStartupDiskFreeBytes(); err == nil &&
@@ -352,7 +394,7 @@ func correctAPFSDiskUsage(mountpoint string, total, rawUsed, rawFree uint64) (us
 
 	// Tier 2: diskutil APFSContainerFree (corrects APFS local snapshots).
 	if commandExists("diskutil") {
-		if containerFree, err := getAPFSContainerFreeBytes(mountpoint); err == nil && containerFree <= total {
+		if containerFree, err := probe.containerFreeBytes(); err == nil && containerFree <= total {
 			corrected := total - containerFree
 			// Only apply if it meaningfully differs (>1GB) from raw to avoid noise.
 			if rawUsed > corrected && rawUsed-corrected > 1<<30 {
@@ -380,25 +422,22 @@ func finderPurgeableBytes(rawFree, finderFree uint64) uint64 {
 	return finderFree - rawFree
 }
 
-// getAPFSContainerFreeBytes returns the APFS container free space (including
-// purgeable snapshot space) by parsing `diskutil info -plist`. This corrects
-// for APFS local snapshots which statfs counts as used.
-func getAPFSContainerFreeBytes(mountpoint string) (uint64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	out, err := runCmd(ctx, "diskutil", "info", "-plist", mountpoint)
-	if err != nil {
-		return 0, err
-	}
-
-	return extractPlistUint(out, "APFSContainerFree")
+// authPromptsDisabled mirrors the shell test-mode guard: MOLE_TEST_MODE or
+// MOLE_TEST_NO_AUTH set to 1 means nothing may raise an authorization prompt.
+func authPromptsDisabled() bool {
+	return os.Getenv("MOLE_TEST_MODE") == "1" || os.Getenv("MOLE_TEST_NO_AUTH") == "1"
 }
 
 // getFinderStartupDiskFreeBytes queries Finder via osascript for the startup
 // disk free space. Finder's value includes purgeable caches and APFS snapshots,
 // matching the "X GB of Y GB used" display. Results are cached for 2 minutes.
 func getFinderStartupDiskFreeBytes() (free, total uint64, err error) {
+	// An Apple event to Finder can raise a TCC Automation prompt, so test and
+	// no-auth runs fall through to the diskutil and statfs tiers instead.
+	if authPromptsDisabled() {
+		return 0, 0, errors.New("finder query disabled in test mode")
+	}
+
 	finderDiskCacheMu.Lock()
 	defer finderDiskCacheMu.Unlock()
 
@@ -473,7 +512,7 @@ func uint64AbsDiff(a, b uint64) uint64 {
 }
 
 func (c *Collector) collectDiskIO(now time.Time) DiskIOStatus {
-	counters, err := disk.IOCounters()
+	counters, err := diskIOCountersFunc()
 	if err != nil || len(counters) == 0 {
 		return DiskIOStatus{}
 	}

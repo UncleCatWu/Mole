@@ -2,6 +2,10 @@
 # User Data Cleanup Module
 set -euo pipefail
 
+_mole_user_module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1090
+source "$_mole_user_module_dir/purge_shared.sh"
+
 _user_process_delete_guard_allows() {
     mole_clean_process_guard "$_MOLE_USER_PROCESS_GUARD_PROBE" "$_MOLE_USER_PROCESS_GUARD_FAMILY started"
 }
@@ -39,6 +43,15 @@ clean_trash() {
     fi
     stop_section_spinner
 
+    # Without Full Disk Access ~/.Trash cannot be listed, so every count below
+    # would read zero and Trash would be skipped without a word. Listing is the
+    # only reliable probe: stat and -r both succeed under that block.
+    if [[ -d "$HOME/.Trash" ]] && ! command ls -A "$HOME/.Trash" > /dev/null 2>&1; then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Trash · skipped, grant Full Disk Access to your terminal"
+        note_activity
+        return 0
+    fi
+
     # Always count and delete directly. The previous Finder AppleScript path
     # triggered macOS's "Show warning before emptying the Trash" dialog and
     # blocked mo clean on user confirmation. Volume Trashes
@@ -53,27 +66,55 @@ clean_trash() {
         if [[ $trash_count -gt 0 ]]; then
             local preview_count=0
             local trash_item
+            # Each item is measured; one large folder takes over a second.
+            start_section_spinner "Measuring Trash..."
             while IFS= read -r -d '' trash_item; do
                 [[ -e "$trash_item" ]] || continue
                 if is_path_whitelisted "$trash_item" 2> /dev/null ||
                     (declare -f holds_compiled_model_cache > /dev/null 2>&1 &&
-                        holds_compiled_model_cache "$trash_item" 2> /dev/null) ||
-                    ! validate_path_for_deletion "$trash_item" 2> /dev/null; then
+                        holds_compiled_model_cache "$trash_item" 2> /dev/null); then
                     continue
                 fi
                 local trash_item_kb
                 local size_rc=0
-                trash_item_kb=$(get_path_size_kb "$trash_item" 2> /dev/null) || size_rc=$?
-                [[ $size_rc -eq 0 ]] || _mole_record_clean_cancellation "$size_rc"
-                [[ $size_rc -eq 0 ]] || return "$size_rc"
-                [[ "$trash_item_kb" =~ ^[0-9]+$ ]] || trash_item_kb=0
+                trash_item_kb=$(get_path_size_kb "$trash_item" "" readable 2> /dev/null) || size_rc=$?
+                # The real run empties an item whose sizing timed out or
+                # failed, so the preview lists it instead of dropping it or
+                # cancelling the later sections. Only a timeout leaves its size
+                # unknown; a signal still cancels.
+                mole_item_size_continues "$size_rc" || {
+                    local trash_stop_rc=$?
+                    stop_section_spinner
+                    return "$trash_stop_rc"
+                }
+                local trash_size_known=true
+                [[ $size_rc -eq 0 && "$trash_item_kb" =~ ^[0-9]+$ ]] || trash_item_kb=0
+                mole_rc_timeout "$size_rc" && trash_size_known=false
+                if (declare -f holds_compiled_model_cache > /dev/null 2>&1 &&
+                    holds_compiled_model_cache "$trash_item" 2> /dev/null); then
+                    continue
+                fi
+                # Same final predicate as the real sink, including the #1517
+                # top-level Trash exemption, run after sizing so live-owner and
+                # SQLite state is current. The recorder then skips its own
+                # should_protect_path pass, which lacks that exemption.
+                local validate_rc=0
+                validate_path_for_deletion "$trash_item" 2> /dev/null || validate_rc=$?
+                if mole_rc_timeout_or_signal "$validate_rc"; then
+                    stop_section_spinner
+                    _mole_record_clean_cancellation "$validate_rc"
+                    return "$validate_rc"
+                fi
+                [[ $validate_rc -eq 0 ]] || continue
                 if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                    record_dry_run_cleanup_target "$trash_item" "$trash_item_kb" 1 true || continue
+                    local _MOLE_DRY_RUN_TARGET_PREVALIDATED=true
+                    record_dry_run_cleanup_target "$trash_item" "$trash_item_kb" 1 "$trash_size_known" || continue
                 fi
                 preview_count=$((preview_count + 1))
             done < <(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
+            stop_section_spinner
             if [[ $preview_count -gt 0 ]]; then
-                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Trash · would empty, $preview_count items"
+                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Trash · would empty, $(mole_count_label "$preview_count" item)"
                 note_activity
             fi
         fi
@@ -91,11 +132,20 @@ clean_trash() {
 
     local cleaned_count=0
     local skipped_count=0
+    local processed_count=0
     while IFS= read -r -d '' item; do
         if safe_remove "$item" true; then
             cleaned_count=$((cleaned_count + 1))
         else
             skipped_count=$((skipped_count + 1))
+        fi
+        # A Trash of 17,000 small folders took 18 minutes behind a bare
+        # "Emptying trash..." that read as a hang (2026-10-30), so a long
+        # run shows its count every 100 items. Without a spinner (no
+        # terminal) the update returns before doing anything.
+        processed_count=$((processed_count + 1))
+        if [[ $trash_count -gt 100 && $((processed_count % 100)) -eq 0 ]]; then
+            update_inline_spinner_message "Emptying trash... $processed_count/$trash_count" || true
         fi
     done < <(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
 
@@ -103,13 +153,13 @@ clean_trash() {
 
     if [[ $cleaned_count -gt 0 ]]; then
         if [[ $skipped_count -gt 0 ]]; then
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Trash · removed $cleaned_count items, $skipped_count skipped"
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Trash · removed $(mole_count_label "$cleaned_count" item), $skipped_count could not be removed"
         else
-            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · emptied, $cleaned_count items"
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · emptied, $(mole_count_label "$cleaned_count" item)"
         fi
         note_activity
     elif [[ $skipped_count -gt 0 ]]; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Trash · $skipped_count items could not be removed"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Trash · $(mole_count_label "$skipped_count" item) could not be removed"
         note_activity
     fi
 }
@@ -153,6 +203,82 @@ _user_cache_deno_delete_guard() {
     return 0
 }
 
+_user_cache_root_has_dedicated_browser_cleanup() {
+    # Mixed parents stay out of the generic batch: their exact browser leaves
+    # have dedicated cleanup flows, and a parent would also double-count them.
+    case "$1" in
+        "$HOME/Library/Caches/Google" | "$HOME/Library/Caches/Chromium" | \
+            "$HOME/Library/Caches/com.apple.Safari" | "$HOME/Library/Caches/com.microsoft.edgemac" | \
+            "$HOME/Library/Caches/company.thebrowser.Browser" | "$HOME/Library/Caches/company.thebrowser.dia" | \
+            "$HOME/Library/Caches/Dia" | "$HOME/Library/Caches/BraveSoftware" | \
+            "$HOME/Library/Caches/net.imput.helium" | "$HOME/Library/Caches/Yandex" | \
+            "$HOME/Library/Caches/Firefox" | "$HOME/Library/Caches/com.operasoftware.Opera" | \
+            "$HOME/Library/Caches/com.vivaldi.Vivaldi" | "$HOME/Library/Caches/Comet" | \
+            "$HOME/Library/Caches/com.kagi.kagimacOS" | "$HOME/Library/Caches/zen" | \
+            "$HOME/Library/Caches/com.tencent.QQBrowser3" | "$HOME/Library/Caches/BrowserOS") return 0 ;;
+    esac
+    return 1
+}
+
+# Log globs must never enumerate through redirected roots. Bind the directories
+# before enumeration and again after sizing and at the last deletion boundary.
+_user_log_delete_guard() {
+    local candidate="$1"
+    [[ ! -L "$_MOLE_USER_LOG_ROOT" ]] || return 1
+    _mole_path_matches_identity "$_MOLE_USER_LOG_ROOT" \
+        "$_MOLE_USER_LOG_PARENT" "$_MOLE_USER_LOG_PARENT_ID" "$_MOLE_USER_LOG_ROOT_ID" || return 1
+    if [[ "${candidate%/*}" == "$_MOLE_USER_LOG_ROOT/DiagnosticReports" ]]; then
+        [[ -n "$_MOLE_USER_REPORTS_ID" && ! -L "$_MOLE_USER_LOG_ROOT/DiagnosticReports" ]] || return 1
+        _mole_path_matches_identity "$_MOLE_USER_LOG_ROOT/DiagnosticReports" \
+            "$_MOLE_USER_REPORTS_PARENT" "$_MOLE_USER_LOG_ROOT_ID" "$_MOLE_USER_REPORTS_ID" || return 1
+    else
+        [[ "${candidate%/*}" == "$_MOLE_USER_LOG_ROOT" ]] || return 1
+    fi
+}
+
+_clean_user_log_directory() {
+    local _MOLE_USER_LOG_ROOT="$1"
+    local label="$2" ancestor="$1"
+    [[ -d "$ancestor" ]] || return 0
+    # HOME may have a canonical system alias; roots below it must be physical.
+    while [[ "$ancestor" != "$HOME" ]]; do
+        [[ "$ancestor" == "$HOME/"* && ! -L "$ancestor" ]] || return 0
+        ancestor="${ancestor%/*}"
+    done
+    _mole_snapshot_path_identity "$_MOLE_USER_LOG_ROOT" || return 0
+    local _MOLE_USER_LOG_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+    local _MOLE_USER_LOG_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+    local _MOLE_USER_LOG_ROOT_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+    local _MOLE_USER_REPORTS_ID="" _MOLE_USER_REPORTS_PARENT=""
+    local reports="$_MOLE_USER_LOG_ROOT/DiagnosticReports"
+    local -a targets=()
+    local entry
+    for entry in "$_MOLE_USER_LOG_ROOT"/*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        if [[ "$_MOLE_USER_LOG_ROOT" == "$HOME/Library/Logs" && "$entry" == "$reports" ]]; then
+            # Keep the crash-report directory itself (#1689), including a link.
+            if [[ -d "$reports" && ! -L "$reports" ]] && _mole_snapshot_path_identity "$reports"; then
+                _MOLE_USER_REPORTS_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+                _MOLE_USER_REPORTS_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+                local report
+                for report in "$reports"/*; do
+                    [[ -e "$report" || -L "$report" ]] && targets+=("$report")
+                done
+            fi
+            continue
+        fi
+        targets+=("$entry")
+    done
+    [[ ${#targets[@]} -gt 0 ]] || return 0
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD=_user_log_delete_guard
+    local clean_rc=0
+    safe_clean_guarded _user_log_delete_guard "${targets[@]}" "$label" || clean_rc=$?
+    if mole_rc_timeout_or_signal "$clean_rc"; then
+        return "$clean_rc"
+    fi
+    return 0
+}
+
 clean_user_essentials() {
     start_section_spinner "Scanning caches..."
     # Deno's default root sits inside the otherwise broad user-cache sweep,
@@ -177,6 +303,7 @@ clean_user_essentials() {
     if [[ "$deno_cache_root_valid" == "true" ]]; then
         for user_cache_target in "$HOME/Library/Caches"/*; do
             [[ -e "$user_cache_target" || -L "$user_cache_target" ]] || continue
+            _user_cache_root_has_dedicated_browser_cleanup "$user_cache_target" && continue
             case "$deno_cache_root" in
                 "$user_cache_target" | "$user_cache_target"/*) continue ;;
             esac
@@ -212,11 +339,9 @@ clean_user_essentials() {
     fi
     stop_section_spinner
 
-    safe_clean ~/Library/Logs/* "User app logs"
+    _clean_user_log_directory "$HOME/Library/Logs" "User app logs" || return $?
 
-    if [[ "${MOLE_SKIP_TRASH_CLEANUP:-0}" != "1" ]]; then
-        clean_trash
-    fi
+    clean_trash
     stop_section_spinner
 
     # Recent items
@@ -256,7 +381,7 @@ _incomplete_download_delete_guard_allows() {
 
     local open_state=0
     _mole_paths_have_open_handle "$path" || open_state=$?
-    if [[ $open_state -eq 124 || $open_state -ge 128 ]]; then
+    if mole_rc_timeout_or_signal "$open_state"; then
         _mole_record_clean_cancellation "$open_state"
         return "$open_state"
     fi
@@ -275,21 +400,19 @@ _incomplete_download_delete_guard_allows() {
 # view says the exact file is idle. The guarded cleanup repeats the probe after
 # sizing, and safe_remove repeats it again at the real deletion boundary.
 _clean_incomplete_downloads() {
-    local -a patterns=(
-        "$HOME/Downloads/*.download"
-        "$HOME/Downloads/*.crdownload"
-        "$HOME/Downloads/*.part"
-    )
-    local labels=("Safari incomplete downloads" "Chrome incomplete downloads" "Partial incomplete downloads")
+    [[ -d "$HOME/Downloads" ]] || return 0
+
+    local -a extensions=("download" "crdownload" "part")
+    local -a labels=("Safari incomplete downloads" "Chrome incomplete downloads" "Partial incomplete downloads")
     local i=0
-    for pattern in "${patterns[@]}"; do
+    for ext in "${extensions[@]}"; do
         local label="${labels[$i]}"
         i=$((i + 1))
-        for f in $pattern; do
+        for f in "$HOME/Downloads/"*."$ext"; do
             [[ -e "$f" ]] || continue
             local open_state=0
             _mole_paths_have_open_handle "$f" || open_state=$?
-            if [[ $open_state -eq 124 || $open_state -ge 128 ]]; then
+            if mole_rc_timeout_or_signal "$open_state"; then
                 _mole_record_clean_cancellation "$open_state"
                 return 0
             fi
@@ -306,7 +429,7 @@ _clean_incomplete_downloads() {
             local guarded_rc=0
             safe_clean_guarded _incomplete_download_delete_guard_allows \
                 "$f" "$label" || guarded_rc=$?
-            if [[ $guarded_rc -eq 124 || $guarded_rc -ge 128 ]]; then
+            if mole_rc_timeout_or_signal "$guarded_rc"; then
                 _mole_record_clean_cancellation "$guarded_rc"
                 return 0
             fi
@@ -318,6 +441,52 @@ _clean_incomplete_downloads() {
     done
 }
 
+# Mail writes one folder per opened attachment under Mail Downloads and puts
+# the copy inside it. Only a copy nobody touched is Mail's to recreate: a file
+# saved over keeps a modification time later than its creation, and a file
+# saved beside it (an export, a Save As, an Office lock file) is born after the
+# folder or moves the folder's own modification time. Either may be the only
+# place an edit lives, so the folder must be older than the age window and
+# neither it nor the file may have been written since Mail created them. The
+# same predicate as Mole Mac's MailDownloadsPolicy, asked again at the sink.
+_mail_attachment_is_untouched_copy() {
+    local path="$1" root="$2" age_days="$3"
+    local rel="${path#"$root"/}"
+    [[ "$rel" != "$path" && "$rel" == */* ]] || return 1
+    local folder_name="${rel%%/*}" file_name="${rel#*/}"
+    [[ -n "$folder_name" && -n "$file_name" && "$file_name" != */* ]] || return 1
+    [[ "$folder_name" != .* && "$file_name" != .* ]] || return 1
+    local ancestor="$root"
+    while [[ "$ancestor" != "$HOME" ]]; do
+        [[ "$ancestor" == "$HOME/"* && ! -L "$ancestor" ]] || return 1
+        ancestor="${ancestor%/*}"
+    done
+
+    local file_info="" folder_info=""
+    file_info=$("$STAT_BSD" -f '%HT|%l|%u|%B|%m' "$path" 2> /dev/null) || return 1
+    folder_info=$("$STAT_BSD" -f '%HT|%B|%m' "$root/$folder_name" 2> /dev/null) || return 1
+    local f_type f_links f_uid f_birth f_mtime d_type d_birth d_mtime
+    IFS='|' read -r f_type f_links f_uid f_birth f_mtime <<< "$file_info"
+    IFS='|' read -r d_type d_birth d_mtime <<< "$folder_info"
+    [[ "$f_type" == "Regular File" && "$d_type" == "Directory" ]] || return 1
+    [[ "$f_links" == "1" && "$f_uid" == "$UID" ]] || return 1
+    local value
+    for value in "$f_birth" "$f_mtime" "$d_birth" "$d_mtime" "$age_days"; do
+        [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    done
+    local now=""
+    now=$(date +%s 2> /dev/null) || return 1
+    [[ "$now" =~ ^[0-9]+$ ]] || return 1
+    # Writing the copy itself can take a moment, hence two seconds of slack.
+    ((f_birth > 0 && f_mtime <= f_birth + 2)) || return 1
+    ((d_birth > 0 && d_birth < now - age_days * 86400)) || return 1
+    ((f_birth <= d_birth + 2 && d_mtime <= d_birth + 2)) || return 1
+}
+
+_mail_attachment_delete_guard() {
+    _mail_attachment_is_untouched_copy "$1" "$_MOLE_MAIL_GUARD_ROOT" "$_MOLE_MAIL_GUARD_AGE_DAYS"
+}
+
 # Internal: Clean old mail downloads.
 _clean_mail_downloads() {
     local mail_age_days=${MOLE_MAIL_AGE_DAYS:-}
@@ -325,15 +494,19 @@ _clean_mail_downloads() {
         mail_age_days=30
     fi
 
-    if pgrep -x "Mail" > /dev/null 2>&1; then
-        debug_log "Mail is running, skipping Mail Downloads cleanup"
-        return 0
-    fi
-
     local -a mail_dirs=(
         "$HOME/Library/Mail Downloads"
         "$HOME/Library/Containers/com.apple.mail/Data/Library/Mail Downloads"
     )
+    # Probe Mail only when there is something to clean, so an unknown process
+    # state never prints a stop line for a directory that does not exist.
+    [[ -d "${mail_dirs[0]}" || -d "${mail_dirs[1]}" ]] || return 0
+
+    local _MOLE_CLEAN_GUARD_REASON=""
+    if ! mole_clean_process_guard _mail_process_state "Mail started"; then
+        mole_report_guard_stop "Mail Downloads" debug_log "Mail is running, skipping Mail Downloads cleanup"
+        return 0
+    fi
     local count=0
     local cleaned_kb=0
     local spinner_active=false
@@ -376,8 +549,14 @@ _clean_mail_downloads() {
             if [[ "$dir_size_kb" -lt "$min_kb" ]]; then
                 continue
             fi
+            local _MOLE_MAIL_GUARD_ROOT="$target_path"
+            local _MOLE_MAIL_GUARD_AGE_DAYS="$mail_age_days"
             while IFS= read -r -d '' file_path; do
-                if [[ -f "$file_path" ]]; then
+                if _mail_attachment_is_untouched_copy "$file_path" "$target_path" "$mail_age_days" &&
+                    _mole_snapshot_path_identity "$file_path"; then
+                    local file_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+                    local file_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+                    local file_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
                     local file_size_kb
                     size_rc=0
                     file_size_kb=$(get_path_size_kb "$file_path") || size_rc=$?
@@ -396,7 +575,9 @@ _clean_mail_downloads() {
                             record_dry_run_cleanup_target "$file_path" "$file_size_kb" 1 true || continue
                         fi
                         MOLE_DRY_RUN=1 safe_remove "$file_path" true "$file_size_kb" && remove_rc=0
-                    elif safe_remove "$file_path" true "$file_size_kb"; then
+                    elif _MOLE_SAFE_REMOVE_FINAL_GUARD=_mail_attachment_delete_guard safe_remove \
+                        "$file_path" true "$file_size_kb" "" \
+                        "$file_parent" "$file_parent_id" "$file_target_id"; then
                         remove_rc=0
                     fi
                     if [[ $remove_rc -eq 0 ]]; then
@@ -404,7 +585,7 @@ _clean_mail_downloads() {
                         cleaned_kb=$((cleaned_kb + file_size_kb))
                     fi
                 fi
-            done < <(command find "$target_path" -type f -mtime +"$mail_age_days" -print0 2> /dev/null || true)
+            done < <(command find "$target_path" -mindepth 2 -maxdepth 2 -type f -print0 2> /dev/null || true)
         fi
     done
     if [[ "$spinner_active" == "true" ]]; then
@@ -422,6 +603,8 @@ _clean_mail_downloads() {
     fi
 }
 
+# Legacy helpers retained for upstream comparison and fixture regressions only.
+# The clean command never dispatches these installed-bundle interior pruners.
 # Chrome, Edge, and Brave are all Chromium: same versioned framework layout
 # (Contents/Frameworks/<X>.framework/Versions with a Current symlink), same
 # keep-Current + keep-newer-staged-update rules, same removal and accounting.
@@ -481,7 +664,7 @@ _clean_chromium_old_versions() {
         local newest_version=""
         local newest_mtime=0
         local current_mtime
-        current_mtime=$(stat -f%m "$versions_dir/$current_version" 2> /dev/null || echo "0")
+        current_mtime=$("$STAT_BSD" -f%m "$versions_dir/$current_version" 2> /dev/null || echo "0")
         [[ "$current_mtime" =~ ^[0-9]+$ ]] || current_mtime=0
 
         local -a old_versions=()
@@ -491,7 +674,7 @@ _clean_chromium_old_versions() {
             name=$(basename "$dir")
             [[ "$name" == "Current" ]] && continue
             local mtime
-            mtime=$(stat -f%m "$dir" 2> /dev/null || echo "0")
+            mtime=$("$STAT_BSD" -f%m "$dir" 2> /dev/null || echo "0")
             if [[ "$mtime" =~ ^[0-9]+$ ]] && [[ "$mtime" -gt "$newest_mtime" ]]; then
                 newest_mtime="$mtime"
                 newest_version="$name"
@@ -565,7 +748,7 @@ _clean_chromium_old_versions() {
             fi
 
             local removed=false
-            if has_sudo_session; then
+            if [[ "${SYSTEM_CLEAN:-true}" == "true" ]] && has_sudo_session; then
                 safe_sudo_remove "$dir" "$size_kb" > /dev/null 2>&1 && removed=true
             else
                 safe_remove "$dir" true "$size_kb" > /dev/null 2>&1 && removed=true
@@ -585,15 +768,13 @@ _clean_chromium_old_versions() {
         local size_human
         size_human=$(bytes_to_human "$((total_size * 1024))")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} ${label} old versions${NC} · ${YELLOW}${cleaned_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} ${label} old versions${NC} · ${YELLOW}$(mole_count_label "${cleaned_count}" dir), $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} ${label} old versions${NC} · ${line_color}${cleaned_count} dirs, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} ${label} old versions${NC} · ${line_color}$(mole_count_label "${cleaned_count}" dir), $(colorize_human_size "${size_human}")"
         fi
-        files_cleaned=$((files_cleaned + cleaned_count))
-        total_size_cleaned=$((total_size_cleaned + total_size))
-        total_items=$((total_items + 1))
+        mole_add_cleaned_row "$cleaned_count" "$total_size"
         note_activity
     fi
     if [[ -n "$stopped_reason" ]]; then
@@ -639,7 +820,46 @@ _onedrive_process_state() {
     mole_pgrep_any -x "OneDrive"
 }
 
+_clean_chrome_disk_caches_guarded() {
+    mole_cleanup_targets_exist "$HOME/Library/Caches/Google/Chrome"/* || return 0
+    if ! mole_clean_process_guard is_google_chrome_running "Chrome started"; then
+        mole_report_guard_stop "Chrome cache" mole_defer_cleanup_family "Chrome"
+        return 1
+    fi
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD=_user_process_delete_guard_allows
+    _user_safe_clean_process_guarded is_google_chrome_running "Chrome" "Chrome cache" \
+        "$HOME/Library/Caches/Google/Chrome"/* "Chrome cache"
+}
+
+_mail_process_state() {
+    mole_pgrep_any -x "Mail"
+}
+
+_arc_process_state() {
+    mole_pgrep_any -x "Arc"
+}
+
+_vivaldi_process_state() {
+    mole_pgrep_any -x "Vivaldi"
+}
+
+_qqbrowser_process_state() {
+    mole_pgrep_any -x "QQBrowser3"
+}
+
+_browseros_process_state() {
+    mole_pgrep_any \
+        -x "BrowserOS" \
+        -x "BrowserOS Helper" \
+        -f "/BrowserOS[.]app/"
+}
+
+_utm_process_state() {
+    mole_pgrep_any -x "UTM"
+}
+
 _clean_chrome_profile_caches_guarded() {
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD=_user_process_delete_guard_allows
     _user_safe_clean_process_guarded is_google_chrome_running "Chrome" "Chrome app cache" \
         ~/Library/Application\ Support/Google/Chrome/*/Application\ Cache/* "Chrome app cache" || return 1
     _user_safe_clean_process_guarded is_google_chrome_running "Chrome" "Chrome code cache" \
@@ -828,15 +1048,13 @@ clean_edge_updater_old_versions() {
         local size_human
         size_human=$(bytes_to_human "$((total_size * 1024))")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Edge updater old versions${NC} · ${YELLOW}${cleaned_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Edge updater old versions${NC} · ${YELLOW}$(mole_count_label "${cleaned_count}" dir), $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Edge updater old versions${NC} · ${line_color}${cleaned_count} dirs, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Edge updater old versions${NC} · ${line_color}$(mole_count_label "${cleaned_count}" dir), $(colorize_human_size "${size_human}")"
         fi
-        files_cleaned=$((files_cleaned + cleaned_count))
-        total_size_cleaned=$((total_size_cleaned + total_size))
-        total_items=$((total_items + 1))
+        mole_add_cleaned_row "$cleaned_count" "$total_size"
         note_activity
     fi
     if [[ -n "$stopped_reason" ]]; then
@@ -875,12 +1093,15 @@ clean_finder_metadata() {
 
 # Conservative cleanup for support caches not covered by generic rules.
 clean_support_app_data() {
-    local support_age_days="${MOLE_SUPPORT_CACHE_AGE_DAYS:-30}"
-    [[ "$support_age_days" =~ ^[0-9]+$ ]] || support_age_days=30
+    local support_age_days=30
 
     local crash_reporter_dir="$HOME/Library/Application Support/CrashReporter"
     if [[ -d "$crash_reporter_dir" && ! -L "$crash_reporter_dir" ]]; then
-        safe_find_delete "$crash_reporter_dir" "*" "$support_age_days" "f" || true
+        local crash_reporter_rc=0
+        safe_find_delete "$crash_reporter_dir" "*" "$support_age_days" "f" || crash_reporter_rc=$?
+        if mole_rc_signal "$crash_reporter_rc"; then
+            return "$crash_reporter_rc"
+        fi
     fi
 
     # Do not sweep com.apple.idleassetsd here. It stores the aerial screen saver
@@ -896,14 +1117,17 @@ clean_support_app_data() {
 }
 
 # App caches (merged: macOS system caches + Sandboxed apps).
+# Runs in the caller's shell and returns the count in
+# CACHE_TOP_LEVEL_ENTRY_COUNT: it is called once per container, and a command
+# substitution plus two $(shopt -p) captures cost three forks each time.
 cache_top_level_entry_count_capped() {
     local dir="$1"
     local cap="${2:-101}"
     local count=0
-    local _nullglob_state
-    local _dotglob_state
-    _nullglob_state=$(shopt -p nullglob || true)
-    _dotglob_state=$(shopt -p dotglob || true)
+    local restore_nullglob=false
+    local restore_dotglob=false
+    shopt -q nullglob || restore_nullglob=true
+    shopt -q dotglob || restore_dotglob=true
     shopt -s nullglob dotglob
 
     local item
@@ -915,12 +1139,12 @@ cache_top_level_entry_count_capped() {
         fi
     done
 
-    # eval: restore shopt state captured by $(shopt -p)
-    eval "$_nullglob_state"
-    eval "$_dotglob_state"
+    [[ "$restore_nullglob" == "true" ]] && shopt -u nullglob
+    [[ "$restore_dotglob" == "true" ]] && shopt -u dotglob
 
     [[ "$count" =~ ^[0-9]+$ ]] || count=0
-    printf '%s\n' "$count"
+    CACHE_TOP_LEVEL_ENTRY_COUNT=$count
+    return 0
 }
 
 directory_has_entries() {
@@ -949,6 +1173,104 @@ directory_has_entries() {
     return 1
 }
 
+# Rendered wallpaper bitmaps the wallpaper agent keeps in its container: one
+# uncompressed BMP per picture and display size, named
+# `<sha256>-<width>-<height>-<n>-<hex>.bmp`. The agent never prunes them (a
+# user report measured 179.53 GB) and renders again from the source picture.
+# Only an exact render file older than a week that is not a render of a
+# picture that may be on screen (the newest of each display size, plus the
+# newest overall) is offered; the rest of the container stays. Two displays of
+# one size showing different pictures keep only the newer render, whose loss
+# costs a re-render; Mole Mac's policy accepts the same limit. Fills
+# _MOLE_WALLPAPER_RENDERS with at most the 50 oldest candidates, so a large
+# backlog drains over a few runs instead of probing thousands of files in one;
+# a listing timeout offers nothing, a signal returns its status.
+_MOLE_WALLPAPER_RENDERS=()
+_wallpaper_stale_render_files() {
+    _MOLE_WALLPAPER_RENDERS=()
+    local root="$HOME/Library/Containers/com.apple.wallpaper.agent/Data/Library/Caches/com.apple.wallpaper.caches"
+    local probe="$HOME" component
+    for component in Library Containers com.apple.wallpaper.agent Data Library Caches com.apple.wallpaper.caches; do
+        probe="$probe/$component"
+        [[ -d "$probe" && ! -L "$probe" ]] || return 0
+    done
+
+    local cutoff uid folder kind listing list_rc path
+    cutoff=$(($(date +%s) - 7 * 24 * 60 * 60))
+    uid=$(id -u)
+    for folder in "$root"/extension-com.apple.wallpaper.extension.*; do
+        kind="${folder##*/extension-com.apple.wallpaper.extension.}"
+        [[ -n "$kind" && ${#kind} -le 64 && "$kind" != *..* && "$kind" =~ ^[a-z0-9.]+$ ]] || continue
+        [[ -d "$folder" && ! -L "$folder" ]] || continue
+        list_rc=0
+        listing=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" find "$folder" -maxdepth 1 -type f -name '*.bmp' \
+            -user "$uid" -links 1 -exec "$STAT_BSD" -f '%m %N' {} + 2> /dev/null) || list_rc=$?
+        if mole_rc_signal "$list_rc"; then
+            _MOLE_WALLPAPER_RENDERS=()
+            return "$list_rc"
+        fi
+        # A timed-out or failed listing cannot show which picture is newest.
+        [[ $list_rc -eq 0 && -n "$listing" ]] || continue
+        # The newest picture must be judged on the whole listing; a folder too
+        # large to judge offers nothing rather than a truncated prefix.
+        [[ $(printf '%s\n' "$listing" | wc -l) -le 20000 ]] || continue
+        while IFS= read -r path; do
+            [[ -f "$path" && ! -L "$path" ]] && _MOLE_WALLPAPER_RENDERS+=("$path")
+        done < <(printf '%s\n' "$listing" | awk -v folder="$folder/" -v cutoff="$cutoff" '
+            {
+                mtime = $1
+                path = substr($0, length($1) + 2)
+                if (substr(path, 1, length(folder)) != folder) next
+                name = substr(path, length(folder) + 1)
+                if (name !~ /^[0-9a-f]+-[0-9]+-[0-9]+-[0-9]+-[0-9a-f]+\.bmp$/) next
+                split(name, part, "-")
+                if (length(part[1]) != 64 || length(part[2]) > 6 || length(part[3]) > 6 || length(part[4]) > 6) next
+                tail = part[5]
+                sub(/\.bmp$/, "", tail)
+                if (length(tail) > 32) next
+                n++
+                paths[n] = path
+                times[n] = mtime + 0
+                digests[n] = part[1]
+                size = part[2] "x" part[3]
+                if (!(size in newest_time) || times[n] > newest_time[size]) {
+                    newest_time[size] = times[n]
+                    newest_digest[size] = part[1]
+                }
+                if (n == 1 || times[n] > top_time) {
+                    top_time = times[n]
+                    top_digest = part[1]
+                }
+            }
+            END {
+                for (size in newest_digest) on_screen[newest_digest[size]] = 1
+                if (n > 0) on_screen[top_digest] = 1
+                for (i = 1; i <= n; i++)
+                    if (!(digests[i] in on_screen) && times[i] < cutoff) print times[i] " " paths[i]
+            }' | sort -n | head -n 50 | cut -d' ' -f2-)
+        [[ ${#_MOLE_WALLPAPER_RENDERS[@]} -lt 50 ]] || break
+    done
+    if [[ ${#_MOLE_WALLPAPER_RENDERS[@]} -gt 50 ]]; then
+        _MOLE_WALLPAPER_RENDERS=("${_MOLE_WALLPAPER_RENDERS[@]:0:50}")
+    fi
+    return 0
+}
+
+# Own probe budget: every render is one handle probe, and the shared section
+# budget must stay with the container rows after it.
+_clean_wallpaper_renders() {
+    local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
+    local wallpaper_rc=0
+    _wallpaper_stale_render_files || wallpaper_rc=$?
+    if mole_rc_signal "$wallpaper_rc"; then
+        return "$wallpaper_rc"
+    fi
+    if [[ ${#_MOLE_WALLPAPER_RENDERS[@]} -gt 0 ]]; then
+        safe_clean "${_MOLE_WALLPAPER_RENDERS[@]}" "Wallpaper agent cache"
+    fi
+    return 0
+}
+
 clean_app_caches() {
     # Every App Container handle probe in this section shares one wall-clock
     # budget, including the explicit Apple cache rows before the generic scan.
@@ -960,7 +1282,7 @@ clean_app_caches() {
     safe_clean ~/Library/Caches/com.apple.photoanalysisd "Photo analysis cache" || true
     safe_clean ~/Library/Caches/com.apple.akd "Apple ID cache" || true
     safe_clean ~/Library/Caches/com.apple.WebKit.Networking/* "WebKit network cache" || true
-    safe_clean ~/Library/DiagnosticReports/* "Diagnostic reports" || true
+    _clean_user_log_directory "$HOME/Library/DiagnosticReports" "Diagnostic reports" || return $?
     safe_clean ~/Library/Caches/com.apple.QuickLook.thumbnailcache "QuickLook thumbnails" || true
     safe_clean ~/Library/Caches/Quick\ Look/* "QuickLook cache" || true
     safe_clean ~/Library/Caches/com.apple.iconservices* "Icon services cache" || true
@@ -974,13 +1296,17 @@ clean_app_caches() {
     # running can crash Calendar.app until logout/login (#1508). Apple treats
     # this as a manual troubleshooting step, not routine cache maintenance.
     safe_clean ~/Library/Application\ Support/AddressBook/Sources/*/Photos.cache "Address Book photo cache" || true
-    clean_support_app_data
+    local support_rc=0
+    clean_support_app_data || support_rc=$?
+    if mole_rc_signal "$support_rc"; then
+        return "$support_rc"
+    fi
 
     # Stop initial scan indicator before entering per-group scans.
     stop_section_spinner
 
     # Sandboxed app caches
-    safe_clean ~/Library/Containers/com.apple.wallpaper.agent/Data/Library/Caches/* "Wallpaper agent cache"
+    _clean_wallpaper_renders || return $?
     safe_clean ~/Library/Containers/com.apple.mediaanalysisd/Data/Library/Caches/* "Media analysis cache"
     safe_clean ~/Library/Containers/com.apple.mediaanalysisd/Data/tmp/* "Media analysis temp files"
     safe_clean ~/Library/Containers/com.apple.AppStore/Data/Library/Caches/* "App Store cache"
@@ -1048,12 +1374,10 @@ clean_app_caches() {
                 size_human=$(bytes_to_human "$((total_size * 1024))")
                 local line_color
                 line_color=$(cleanup_result_color_kb "$total_size")
-                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Sandboxed app caches${NC} · ${line_color}$size_human${NC}"
+                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Sandboxed app caches${NC} · $(colorize_human_size "${size_human}")"
             fi
         fi
-        files_cleaned=$((files_cleaned + cleaned_count))
-        total_size_cleaned=$((total_size_cleaned + total_size))
-        total_items=$((total_items + 1))
+        mole_add_cleaned_row "$cleaned_count" "$total_size"
         note_activity
     fi
 
@@ -1112,11 +1436,9 @@ clean_handoff_pasteboard_cache() {
     else
         local line_color
         line_color=$(cleanup_result_color_kb "$total_kb")
-        echo -e "  ${line_color}${ICON_SUCCESS}${NC} Handoff clipboard cache${NC} · ${line_color}$size_human${NC}"
+        echo -e "  ${line_color}${ICON_SUCCESS}${NC} Handoff clipboard cache${NC} · $(colorize_human_size "${size_human}")"
     fi
-    files_cleaned=$((files_cleaned + cleaned_count))
-    total_size_cleaned=$((total_size_cleaned + total_kb))
-    total_items=$((total_items + 1))
+    mole_add_cleaned_row "$cleaned_count" "$total_kb"
     note_activity
 }
 
@@ -1136,7 +1458,8 @@ process_container_cache() {
     [[ -d "$cache_dir" ]] || return 0
     [[ -L "$cache_dir" ]] && return 0
     local item_count
-    item_count=$(cache_top_level_entry_count_capped "$cache_dir" 101)
+    cache_top_level_entry_count_capped "$cache_dir" 101
+    item_count=$CACHE_TOP_LEVEL_ENTRY_COUNT
     [[ "$item_count" =~ ^[0-9]+$ ]] || item_count=0
     [[ "$item_count" -eq 0 ]] && return 0
     local measure_item_sizes=true
@@ -1298,7 +1621,8 @@ clean_group_container_caches() {
 
             local item
             local quick_count
-            quick_count=$(cache_top_level_entry_count_capped "$candidate" 101)
+            cache_top_level_entry_count_capped "$candidate" 101
+            quick_count=$CACHE_TOP_LEVEL_ENTRY_COUNT
             [[ "$quick_count" =~ ^[0-9]+$ ]] || quick_count=0
             [[ "$quick_count" -eq 0 ]] && continue
 
@@ -1407,12 +1731,10 @@ clean_group_container_caches() {
                 size_human=$(bytes_to_human "$((total_size * 1024))")
                 local line_color
                 line_color=$(cleanup_result_color_kb "$total_size")
-                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Group Containers logs/caches${NC} · ${line_color}$size_human${NC}"
+                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Group Containers logs/caches${NC} · $(colorize_human_size "${size_human}")"
             fi
         fi
-        files_cleaned=$((files_cleaned + cleaned_count))
-        total_size_cleaned=$((total_size_cleaned + total_size))
-        total_items=$((total_items + 1))
+        mole_add_cleaned_row "$cleaned_count" "$total_size"
         note_activity
     fi
 }
@@ -1479,25 +1801,80 @@ validate_external_volume_target() {
         return 1
     fi
 
-    local disk_info=""
-    disk_info=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" command diskutil info "$resolved" 2> /dev/null || echo "")
-    if [[ -n "$disk_info" ]]; then
-        if echo "$disk_info" | grep -Eq 'Internal:[[:space:]]+Yes'; then
-            echo "Refusing to clean an internal volume: $resolved" >&2
-            return 1
-        fi
-
-        local protocol=""
-        protocol=$(echo "$disk_info" | awk -F: '/Protocol:/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')
-        case "$protocol" in
-            SMB | NFS | AFP | CIFS | WebDAV)
-                echo "Refusing to clean network volume protocol $protocol: $resolved" >&2
-                return 1
-                ;;
-        esac
+    local disk_info="" disk_info_rc=0 internal="" protocol=""
+    disk_info=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" command diskutil info -plist "$resolved" 2> /dev/null) || disk_info_rc=$?
+    mole_rc_signal "$disk_info_rc" && return "$disk_info_rc"
+    # Partial output, missing fields and string values are not external-disk
+    # evidence. Require the successful typed plist rather than localized text.
+    if [[ $disk_info_rc -ne 0 ]] ||
+        ! internal=$(printf '%s' "$disk_info" | /usr/bin/plutil -extract Internal raw -expect bool -o - - 2> /dev/null) ||
+        ! protocol=$(printf '%s' "$disk_info" | /usr/bin/plutil -extract BusProtocol raw -expect string -o - - 2> /dev/null) ||
+        [[ -z "$protocol" ]]; then
+        echo "Refusing to clean a volume diskutil could not describe: $resolved" >&2
+        echo "Check that it is still mounted with diskutil info -plist \"$resolved\", then retry" >&2
+        return 1
+    fi
+    if [[ "$internal" != "false" ]]; then
+        echo "Refusing to clean an internal volume: $resolved" >&2
+        return 1
     fi
 
+    case "$protocol" in
+        SMB | NFS | AFP | CIFS | WebDAV)
+            echo "Refusing to clean network volume protocol $protocol: $resolved" >&2
+            return 1
+            ;;
+    esac
+
     printf '%s\n' "$resolved"
+}
+
+_mole_external_volume_final_guard() {
+    local target="$1"
+    local previous_guard="${_MOLE_EXTERNAL_VOLUME_PREVIOUS_FINAL_GUARD:-}"
+    if [[ -n "$previous_guard" && "$previous_guard" != "_mole_external_volume_final_guard" ]] &&
+        declare -f "$previous_guard" > /dev/null 2>&1; then
+        "$previous_guard" "$target" || return $?
+    fi
+    _mole_path_matches_identity \
+        "$_MOLE_EXTERNAL_VOLUME_GUARD_PATH" \
+        "$_MOLE_EXTERNAL_VOLUME_GUARD_PARENT" \
+        "$_MOLE_EXTERNAL_VOLUME_GUARD_PARENT_ID" \
+        "$_MOLE_EXTERNAL_VOLUME_GUARD_TARGET_ID"
+}
+
+# Keep the normal failure short; retain every escaped diagnostic in the logs.
+_report_external_metadata_failure() {
+    local errors="$1" scan_rc="$2"
+    local detail="" first_detail=""
+    log_warning_to_file "External volume metadata cleanup stopped (exit $scan_rc)."
+    while IFS= read -r detail || [[ -n "$detail" ]]; do
+        [[ -n "$detail" ]] || continue
+        _mole_escape_log_value detail "$detail"
+        log_warning_to_file "$detail"
+        debug_log "$detail"
+        # The timeout wrapper writes its command trace to the same stderr.
+        if [[ -z "$first_detail" && "$detail" != '[TIMEOUT]'* ]]; then
+            first_detail="$detail"
+        fi
+    done < "$errors"
+    if [[ -n "$first_detail" ]]; then
+        printf '  %b%s%b\n' "$GRAY" "$(truncate_by_display_width "$first_detail" 320)" "$NC"
+    fi
+    local next_step=""
+    case "$first_detail" in
+        *'Permission denied'* | *'Operation not permitted'*)
+            next_step="Check this path's permissions and your terminal's disk access in System Settings."
+            ;;
+        *'No such file or directory'* | *'Device not configured'*)
+            next_step="Check that the external volume is still connected."
+            ;;
+        *)
+            _mole_escape_log_value next_step "$LOG_FILE"
+            next_step="Details: $next_step"
+            ;;
+    esac
+    printf '  %b%s%b\n' "$GRAY" "$next_step" "$NC"
 }
 
 clean_external_volume_target() {
@@ -1505,9 +1882,23 @@ clean_external_volume_target() {
     [[ -d "$volume" ]] || return 1
     [[ -L "$volume" ]] && return 1
 
+    if ! _mole_snapshot_path_identity "$volume"; then
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} External volume cleanup · ${GRAY}could not bind mounted volume, no changes${NC}"
+        note_activity
+        return 1
+    fi
+    local _MOLE_EXTERNAL_VOLUME_GUARD_PATH="$volume"
+    local _MOLE_EXTERNAL_VOLUME_GUARD_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+    local _MOLE_EXTERNAL_VOLUME_GUARD_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+    local _MOLE_EXTERNAL_VOLUME_GUARD_TARGET_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+    local _MOLE_EXTERNAL_VOLUME_PREVIOUS_FINAL_GUARD="${_MOLE_SAFE_REMOVE_FINAL_GUARD:-}"
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD="_mole_external_volume_final_guard"
+
+    # A volume Trash holds items the user can still restore from Finder, so
+    # it is never an OS-metadata target. Only temporary staging, .DS_Store and
+    # AppleDouble metadata are eligible here.
     local -a top_level_targets=(
         "$volume/.TemporaryItems"
-        "$volume/.Trashes"
     )
     local cleaned_count=0
     local total_size=0
@@ -1516,29 +1907,102 @@ clean_external_volume_target() {
 
     start_section_spinner "Scanning external volume..."
 
+    # Materialize the complete AppleDouble inventory before any external-volume
+    # mutation. A timed-out find can leave a valid-looking prefix on stdout;
+    # consuming that prefix from process substitution used to delete those rows
+    # and report success even though the scan itself returned 124.
+    local metadata_scan_timeout=15
+    local metadata_scan_file=""
+    local metadata_scan_errors=""
+    if ! metadata_scan_file=$(mktemp_file "external-volume-metadata") ||
+        ! metadata_scan_errors=$(create_temp_file); then
+        stop_section_spinner
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} External volume cleanup · ${GRAY}could not prepare scan, no changes${NC}"
+        note_activity
+        return 1
+    fi
+    local metadata_scan_rc=0
+    # Both metadata scans preserve these exact volume roots. Installation
+    # staging can be denied by macOS policy even with Full Disk Access.
+    # Escape find's pattern syntax so a volume name cannot change the scope.
+    local volume_pattern="${volume//\\/\\\\}"
+    volume_pattern="${volume_pattern//\*/\\*}"
+    volume_pattern="${volume_pattern//\?/\\?}"
+    volume_pattern="${volume_pattern//\[/\\[}"
+    local -a metadata_exclusions=(
+        -xdev \( -path "$volume_pattern/.TemporaryItems" -o -path "$volume_pattern/.Trashes"
+        -o -path "$volume_pattern/.Spotlight-V100" -o -path "$volume_pattern/.fseventsd"
+        -o -path "$volume_pattern/.DocumentRevisions-V100"
+        -o -path "$volume_pattern/.AppInstallationStaging" \) -prune -o
+    )
+    if [[ "$PROTECT_FINDER_METADATA" == "true" ]]; then
+        # The whitelist row protects Finder metadata as a whole, so no
+        # AppleDouble file is a candidate while it is active.
+        : > "$metadata_scan_file" || true
+    else
+        run_with_timeout "$metadata_scan_timeout" find -P "$volume" "${metadata_exclusions[@]}" \
+            -type f -name "._*" -print0 > "$metadata_scan_file" 2> "$metadata_scan_errors" || metadata_scan_rc=$?
+    fi
+    if [[ $metadata_scan_rc -ne 0 ]]; then
+        : > "$metadata_scan_file" || true
+        stop_section_spinner
+        if mole_rc_timeout "$metadata_scan_rc"; then
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} External volume cleanup · ${GRAY}scan timed out, no changes${NC}"
+        elif [[ $metadata_scan_rc -ge 128 ]]; then
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} External volume cleanup · ${GRAY}scan interrupted, no changes${NC}"
+        else
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} External volume cleanup · ${GRAY}scan failed, no changes${NC}"
+        fi
+        _report_external_metadata_failure "$metadata_scan_errors" "$metadata_scan_rc"
+        note_activity
+        _mole_record_clean_cancellation "$metadata_scan_rc"
+        return "$metadata_scan_rc"
+    fi
+
     local target_path
     for target_path in "${top_level_targets[@]}"; do
         [[ -e "$target_path" ]] || continue
         [[ -L "$target_path" ]] && continue
+        if ! _mole_snapshot_path_identity "$target_path"; then
+            continue
+        fi
+        local target_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+        local target_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+        local target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
         if should_protect_path "$target_path" 2> /dev/null || is_path_whitelisted "$target_path" 2> /dev/null; then
+            continue
+        fi
+        # macOS may expose these roots as write/search-only directories. Keep
+        # them without sizing or removal; other eligible metadata can proceed.
+        if [[ ! -r "$target_path" || ! -x "$target_path" ]]; then
+            local kept_reason=""
+            _mole_escape_log_value kept_reason "External volume cleanup kept unreadable directory: $target_path"
+            log_warning_to_file "$kept_reason"
+            debug_log "$kept_reason"
             continue
         fi
 
         local size_kb=""
         local size_rc=0
-        size_kb=$(get_path_size_kb "$target_path" 2> /dev/null) || size_rc=$?
-        [[ $size_rc -eq 0 ]] || _mole_record_clean_cancellation "$size_rc"
-        [[ $size_rc -eq 0 ]] || return "$size_rc"
-        [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+        # Readable bytes, like every other cleanup total: one unlistable
+        # subfolder must not cancel the rest of the volume's cleanup.
+        size_kb=$(get_path_size_kb "$target_path" "" readable 2> /dev/null) || size_rc=$?
+        mole_item_size_continues "$size_rc" || return $?
+        [[ $size_rc -eq 0 && "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
 
         if [[ "$DRY_RUN" == "true" ]]; then
+            if ! _mole_path_matches_identity \
+                "$target_path" "$target_parent" "$target_parent_id" "$target_id"; then
+                continue
+            fi
             if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
                 record_dry_run_cleanup_target "$target_path" "$size_kb" 1 true || continue
             fi
             found_any=true
             cleaned_count=$((cleaned_count + 1))
             total_size=$((total_size + size_kb))
-        elif safe_remove "$target_path" true > /dev/null 2>&1; then
+        elif safe_remove "$target_path" true "$size_kb" "" \
+            "$target_parent" "$target_parent_id" "$target_id" > /dev/null 2>&1; then
             found_any=true
             cleaned_count=$((cleaned_count + 1))
             total_size=$((total_size + size_kb))
@@ -1546,13 +2010,26 @@ clean_external_volume_target() {
     done
 
     if [[ "$PROTECT_FINDER_METADATA" != "true" ]]; then
-        clean_ds_store_tree "$volume" "${volume_name} volume, .DS_Store"
+        local finder_rc=0
+        clean_ds_store_tree "$volume" "${volume_name} volume, .DS_Store" \
+            "$metadata_scan_errors" "${metadata_exclusions[@]}" || finder_rc=$?
+        if [[ $finder_rc -ne 0 ]]; then
+            stop_section_spinner
+            _report_external_metadata_failure "$metadata_scan_errors" "$finder_rc"
+            _mole_record_clean_cancellation "$finder_rc"
+            return "$finder_rc"
+        fi
     fi
 
-    local metadata_scan_timeout="${MOLE_EXTERNAL_VOLUME_SCAN_TIMEOUT:-15}"
-    [[ "$metadata_scan_timeout" =~ ^[0-9]+$ ]] || metadata_scan_timeout=15
     while IFS= read -r -d '' metadata_file; do
         [[ -e "$metadata_file" ]] || continue
+        [[ -L "$metadata_file" ]] && continue
+        if ! _mole_snapshot_path_identity "$metadata_file"; then
+            continue
+        fi
+        local metadata_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+        local metadata_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+        local metadata_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
         if should_protect_path "$metadata_file" 2> /dev/null || is_path_whitelisted "$metadata_file" 2> /dev/null; then
             continue
         fi
@@ -1565,18 +2042,23 @@ clean_external_volume_target() {
         [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
 
         if [[ "$DRY_RUN" == "true" ]]; then
+            if ! _mole_path_matches_identity \
+                "$metadata_file" "$metadata_parent" "$metadata_parent_id" "$metadata_id"; then
+                continue
+            fi
             if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
                 record_dry_run_cleanup_target "$metadata_file" "$size_kb" 1 true || continue
             fi
             found_any=true
             cleaned_count=$((cleaned_count + 1))
             total_size=$((total_size + size_kb))
-        elif safe_remove "$metadata_file" true > /dev/null 2>&1; then
+        elif safe_remove "$metadata_file" true "$size_kb" "" \
+            "$metadata_parent" "$metadata_parent_id" "$metadata_id" > /dev/null 2>&1; then
             found_any=true
             cleaned_count=$((cleaned_count + 1))
             total_size=$((total_size + size_kb))
         fi
-    done < <(run_with_timeout "$metadata_scan_timeout" find -P "$volume" -xdev -type f -name "._*" -print0 2> /dev/null || true)
+    done < "$metadata_scan_file"
 
     stop_section_spinner
 
@@ -1588,11 +2070,9 @@ clean_external_volume_target() {
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} External volume cleanup${NC} · ${line_color}${volume_name}, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} External volume cleanup${NC} · ${line_color}${volume_name}, $(colorize_human_size "${size_human}")"
         fi
-        files_cleaned=$((files_cleaned + cleaned_count))
-        total_size_cleaned=$((total_size_cleaned + total_size))
-        total_items=$((total_items + 1))
+        mole_add_cleaned_row "$cleaned_count" "$total_size"
         note_activity
     fi
 
@@ -1601,9 +2081,11 @@ clean_external_volume_target() {
 
 # Browser caches (Safari/Chrome/Edge/Firefox).
 clean_browsers() {
+    # Refusal reason for the Arc, Brave, Vivaldi, and QQ Browser process guards.
+    local _MOLE_CLEAN_GUARD_REASON=""
     safe_clean ~/Library/Caches/com.apple.Safari/* "Safari cache"
     # Chrome/Chromium.
-    safe_clean ~/Library/Caches/Google/Chrome/* "Chrome cache"
+    _clean_chrome_disk_caches_guarded || true
     # Do not clean Chromium Service Worker ScriptCache. Even when the browser is
     # closed, removing MV3 extension bytecode can break extension service
     # workers and trigger security warnings during dry-run scans. See #785,
@@ -1652,9 +2134,7 @@ clean_browsers() {
     if [[ -d ~/Library/Application\ Support/Arc ]]; then
         safe_clean ~/Library/Caches/company.thebrowser.Browser/* "Arc cache"
         local _arc_profile
-        local _arc_running=false
-        pgrep -x "Arc" > /dev/null 2>&1 && _arc_running=true
-        if [[ "$_arc_running" != "true" ]]; then
+        if mole_clean_process_guard _arc_process_state "Arc started"; then
             safe_clean ~/Library/Application\ Support/Arc/*/Code\ Cache/* "Arc code cache"
             safe_clean ~/Library/Application\ Support/Arc/*/GPUCache/* "Arc GPU cache"
             safe_clean ~/Library/Application\ Support/Arc/*/DawnCache/* "Arc Dawn cache"
@@ -1675,6 +2155,8 @@ clean_browsers() {
             safe_clean ~/Library/Application\ Support/Arc/User\ Data/component_crx_cache/* "Arc component CRX cache"
             safe_clean ~/Library/Application\ Support/Arc/User\ Data/extensions_crx_cache/* "Arc extensions CRX cache"
             safe_clean ~/Library/Application\ Support/Arc/User\ Data/Crashpad/completed/* "Arc crash reports"
+        else
+            mole_report_guard_stop "Arc profile caches" debug_log "Arc is running, skipping Arc profile caches"
         fi
         for _arc_profile in "$HOME/Library/Application Support/Arc"/*/; do
             clean_service_worker_cache "Arc" "${_arc_profile%/}/Service Worker/CacheStorage"
@@ -1684,11 +2166,11 @@ clean_browsers() {
             clean_service_worker_cache "Arc" "${_arc_profile%/}/Service Worker/CacheStorage"
         done
     fi
-    # Dia Browser. company.thebrowser.dia only holds Sentry crash state; the real
-    # caches are the Chromium ones under ~/Library/Caches/Dia/User Data (HTTP and
-    # code cache) and ~/Library/Application Support/Dia/User Data (GPU and CRX
-    # caches). Dia has no ShaderCache / GrShaderCache / DawnCache / Crashpad tree
-    # like Arc, so those rows are intentionally absent.
+    # Dia Browser. The bundle-ID cache can hold Sentry state and Sparkle updates;
+    # should_protect_path keeps the Sparkle directory out of this wildcard sweep.
+    # Chromium caches live under ~/Library/Caches/Dia/User Data (HTTP and code)
+    # and ~/Library/Application Support/Dia/User Data (GPU and CRX).
+    # Only the observed cache leaves are listed below, not Arc's full layout.
     safe_clean ~/Library/Caches/company.thebrowser.dia/* "Dia cache"
     if [[ -d ~/Library/Application\ Support/Dia ]]; then
         local _dia_profile
@@ -1722,11 +2204,12 @@ clean_browsers() {
         done
     fi
     if [[ -d ~/Library/Application\ Support/BraveSoftware ]]; then
-        safe_clean ~/Library/Caches/BraveSoftware/Brave-Browser/* "Brave cache"
+        if mole_cleanup_targets_exist "$HOME/Library/Caches/BraveSoftware/Brave-Browser"/*; then
+            _user_safe_clean_process_guarded is_brave_browser_running "Brave" "Brave cache" \
+                ~/Library/Caches/BraveSoftware/Brave-Browser/* "Brave cache" || true
+        fi
         local _brave_profile
-        local _brave_running=false
-        pgrep -x "Brave Browser" > /dev/null 2>&1 && _brave_running=true
-        if [[ "$_brave_running" != "true" ]]; then
+        if mole_clean_process_guard is_brave_browser_running "Brave started"; then
             safe_clean ~/Library/Application\ Support/BraveSoftware/Brave-Browser/*/Application\ Cache/* "Brave app cache"
             safe_clean ~/Library/Application\ Support/BraveSoftware/Brave-Browser/*/Code\ Cache/* "Brave code cache"
             safe_clean ~/Library/Application\ Support/BraveSoftware/Brave-Browser/*/GPUCache/* "Brave GPU cache"
@@ -1738,6 +2221,8 @@ clean_browsers() {
             safe_clean ~/Library/Application\ Support/BraveSoftware/Brave-Browser/GrShaderCache/* "Brave GR shader cache"
             safe_clean ~/Library/Application\ Support/BraveSoftware/Brave-Browser/GraphiteDawnCache/* "Brave Dawn cache"
             safe_clean ~/Library/Application\ Support/BraveSoftware/Brave-Browser/Crashpad/completed/* "Brave crash reports"
+        else
+            mole_report_guard_stop "Brave profile caches" debug_log "Brave is running, skipping Brave profile caches"
         fi
         for _brave_profile in "$HOME/Library/Application Support/BraveSoftware/Brave-Browser"/*/; do
             clean_service_worker_cache "Brave" "${_brave_profile%/}/Service Worker/CacheStorage"
@@ -1783,9 +2268,7 @@ clean_browsers() {
     if [[ -d ~/Library/Application\ Support/Vivaldi ]]; then
         safe_clean ~/Library/Caches/com.vivaldi.Vivaldi/* "Vivaldi cache"
         local _vivaldi_profile
-        local _vivaldi_running=false
-        pgrep -x "Vivaldi" > /dev/null 2>&1 && _vivaldi_running=true
-        if [[ "$_vivaldi_running" != "true" ]]; then
+        if mole_clean_process_guard _vivaldi_process_state "Vivaldi started"; then
             safe_clean ~/Library/Application\ Support/Vivaldi/*/Code\ Cache/* "Vivaldi code cache"
             safe_clean ~/Library/Application\ Support/Vivaldi/*/GPUCache/* "Vivaldi GPU cache"
             safe_clean ~/Library/Application\ Support/Vivaldi/*/DawnCache/* "Vivaldi Dawn cache"
@@ -1795,6 +2278,8 @@ clean_browsers() {
             safe_clean ~/Library/Application\ Support/Vivaldi/GrShaderCache/* "Vivaldi GR shader cache"
             safe_clean ~/Library/Application\ Support/Vivaldi/GraphiteDawnCache/* "Vivaldi Dawn cache"
             safe_clean ~/Library/Application\ Support/Vivaldi/Crashpad/completed/* "Vivaldi crash reports"
+        else
+            mole_report_guard_stop "Vivaldi profile caches" debug_log "Vivaldi is running, skipping Vivaldi profile caches"
         fi
         for _vivaldi_profile in "$HOME/Library/Application Support/Vivaldi"/*/; do
             clean_service_worker_cache "Vivaldi" "${_vivaldi_profile%/}/Service Worker/CacheStorage"
@@ -1803,16 +2288,13 @@ clean_browsers() {
     safe_clean ~/Library/Caches/Comet/* "Comet cache"
     safe_clean ~/Library/Caches/com.kagi.kagimacOS/* "Orion cache"
     safe_clean ~/Library/Caches/zen/* "Zen cache"
-    clean_chrome_old_versions || return $?
-    clean_edge_old_versions || return $?
+    # Installed browser bundles stay intact under this fork's app-bundle policy.
+    # Only updater staging outside the installed app remains an eligible target.
     clean_edge_updater_old_versions || return $?
-    clean_brave_old_versions || return $?
     # QQ Browser 3 (Chromium-based).
     if [[ -d ~/Library/Application\ Support/QQBrowser3 ]]; then
         safe_clean ~/Library/Caches/com.tencent.QQBrowser3/* "QQ Browser cache"
-        local _qqbrowser_running=false
-        pgrep -x "QQBrowser3" > /dev/null 2>&1 && _qqbrowser_running=true
-        if [[ "$_qqbrowser_running" != "true" ]]; then
+        if mole_clean_process_guard _qqbrowser_process_state "QQ Browser started"; then
             safe_clean ~/Library/Application\ Support/QQBrowser3/*/Code\ Cache/* "QQ Browser code cache"
             safe_clean ~/Library/Application\ Support/QQBrowser3/*/GPUCache/* "QQ Browser GPU cache"
             safe_clean ~/Library/Application\ Support/QQBrowser3/ShaderCache/* "QQ Browser shader cache"
@@ -1820,6 +2302,38 @@ clean_browsers() {
             safe_clean ~/Library/Application\ Support/QQBrowser3/GraphiteDawnCache/* "QQ Browser Dawn cache"
             safe_clean ~/Library/Application\ Support/QQBrowser3/component_crx_cache/* "QQ Browser component cache"
             safe_clean ~/Library/Application\ Support/QQBrowser3/Crashpad/completed/* "QQ Browser crash reports"
+        else
+            mole_report_guard_stop "QQ Browser profile caches" debug_log "QQ Browser is running, skipping QQ Browser profile caches"
+        fi
+    fi
+    # BrowserOS (Chromium-based agentic browser).
+    if [[ -d ~/Library/Application\ Support/BrowserOS || -d ~/Library/Caches/BrowserOS ]]; then
+        if mole_clean_process_guard _browseros_process_state "BrowserOS started"; then
+            local browseros_rc=0
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Caches/BrowserOS/*/Cache/* "BrowserOS HTTP cache" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Caches/BrowserOS/*/Code\ Cache/* "BrowserOS code cache" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Application\ Support/BrowserOS/*/GPUCache/* "BrowserOS GPU cache" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Application\ Support/BrowserOS/*/DawnGraphiteCache/* "BrowserOS Dawn Graphite cache" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Application\ Support/BrowserOS/*/DawnWebGPUCache/* "BrowserOS Dawn WebGPU cache" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Application\ Support/BrowserOS/ShaderCache/* "BrowserOS shader cache" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Application\ Support/BrowserOS/GrShaderCache/* "BrowserOS GR shader cache" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Application\ Support/BrowserOS/GraphiteDawnCache/* "BrowserOS Dawn cache" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Application\ Support/BrowserOS/GPUPersistentCache/* "BrowserOS GPU persistent cache" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Application\ Support/BrowserOS/component_crx_cache/* "BrowserOS component cache" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+            _dev_safe_clean_process_guarded _browseros_process_state "BrowserOS" "BrowserOS profile caches" ~/Library/Application\ Support/BrowserOS/Crashpad/completed/* "BrowserOS crash reports" || browseros_rc=$?
+            if mole_rc_timeout_or_signal "$browseros_rc"; then return "$browseros_rc"; fi
+        else
+            mole_report_guard_stop "BrowserOS profile caches" debug_log "BrowserOS is running, skipping BrowserOS profile caches"
         fi
     fi
 }
@@ -1916,8 +2430,14 @@ clean_office_applications() {
 # Virtualization caches.
 clean_utm_caches() {
     local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
-    if pgrep -x "UTM" > /dev/null 2>&1; then
-        debug_log "Skipping UTM caches while UTM is running"
+    # Same reason as Mail Downloads: no UTM targets, no process question.
+    mole_cleanup_targets_exist \
+        "$HOME/Library/Caches/com.utmapp.UTM"/* \
+        "$HOME/Library/Containers/com.utmapp.UTM/Data/Library/Caches"/* \
+        "$HOME/Library/Containers/com.utmapp.UTM/Data/tmp"/* || return 0
+    local _MOLE_CLEAN_GUARD_REASON=""
+    if ! mole_clean_process_guard _utm_process_state "UTM started"; then
+        mole_report_guard_stop "UTM caches" debug_log "Skipping UTM caches while UTM is running"
         return 0
     fi
 
@@ -1974,6 +2494,7 @@ clean_tart_caches() {
         start_section_spinner "Pruning Tart caches..."
     fi
     local prune_succeeded=false
+    local prune_rc=0
     tart_state=0
     mole_pgrep_any -x "tart" || tart_state=$?
     if [[ $tart_state -ne 1 ]]; then
@@ -1987,9 +2508,17 @@ clean_tart_caches() {
         return 0
     elif run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" tart prune --entries caches --older-than "$MOLE_ORPHAN_AGE_DAYS" > /dev/null 2>&1; then
         prune_succeeded=true
+    else
+        prune_rc=$?
     fi
     if [[ -t 1 ]]; then
         stop_section_spinner
+    fi
+    if mole_rc_signal "$prune_rc"; then
+        # Ctrl-C while tart holds the terminal reaches only the child.
+        debug_log "Tart caches: owner command interrupted (exit $prune_rc)"
+        _mole_record_clean_cancellation "$prune_rc" "Tart caches"
+        return "$prune_rc"
     fi
 
     if [[ "$prune_succeeded" != "true" ]]; then
@@ -2025,20 +2554,33 @@ clean_virtualization_tools() {
 
 # Estimate item size for Application Support cleanup.
 # Files use stat; directories use du with timeout to avoid long blocking scans.
+# Only expose a completed bounded producer. NUL paths stay in the scratch
+# file, never in a shell variable; nonzero/partial output is discarded.
+_app_support_scan_entries() {
+    local dir="$1" maxdepth="${2:-1}" output="" scan_rc=0 timeout=""
+    output=$(mktemp_file "app-support-scan") || return 1
+    timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" \
+        "${_MOLE_APP_SUPPORT_DEADLINE:-}") || scan_rc=$?
+    if [[ $scan_rc -eq 0 ]]; then
+        run_with_timeout "$timeout" find "$dir" -mindepth 1 -maxdepth "$maxdepth" \
+            -print0 > "$output" 2> /dev/null || scan_rc=$?
+    fi
+    if [[ $scan_rc -ne 0 ]]; then
+        rm -f "$output" # SAFE: exact scratch file created by this helper
+        return "$scan_rc"
+    fi
+    printf '%s\n' "$output"
+}
+
 app_support_entry_count_capped() {
-    local dir="$1"
-    local maxdepth="${2:-1}"
-    local cap="${3:-101}"
-    local count=0
-
-    while IFS= read -r -d '' _entry; do
-        count=$((count + 1))
-        if ((count >= cap)); then
-            break
-        fi
-    done < <(command find "$dir" -mindepth 1 -maxdepth "$maxdepth" -print0 2> /dev/null)
-
-    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    local dir="$1" maxdepth="${2:-1}" cap="${3:-101}"
+    local output="" count=0 entry scan_rc=0
+    output=$(_app_support_scan_entries "$dir" "$maxdepth") || scan_rc=$?
+    [[ $scan_rc -eq 0 ]] || return "$scan_rc"
+    while IFS= read -r -d '' entry; do
+        if ((count < cap)); then count=$((count + 1)); fi
+    done < "$output"
+    rm -f "$output" # SAFE: exact completed scratch scan owned by this helper
     printf '%s\n' "$count"
 }
 
@@ -2048,7 +2590,7 @@ app_support_item_size_bytes() {
 
     if [[ -f "$item" && ! -L "$item" ]]; then
         local file_bytes
-        file_bytes=$(stat -f%z "$item" 2> /dev/null || echo "0")
+        file_bytes=$("$STAT_BSD" -f%z "$item" 2> /dev/null || echo "0")
         [[ "$file_bytes" =~ ^[0-9]+$ ]] || return 1
         printf '%s\n' "$file_bytes"
         return 0
@@ -2058,7 +2600,7 @@ app_support_item_size_bytes() {
         # Fast path: if directory has too many items, skip detailed size calculation
         # to avoid hanging on deep directories (e.g., node_modules, .git)
         local item_count
-        item_count=$(app_support_entry_count_capped "$item" 2 10001)
+        item_count=$(app_support_entry_count_capped "$item" 2 10001) || return $?
         if [[ "$item_count" -gt 10000 ]]; then
             # Return 1 to signal "too many items, size unknown"
             return 1
@@ -2066,9 +2608,9 @@ app_support_item_size_bytes() {
 
         local du_output
         # Use stricter timeout for directories
-        if ! du_output=$(run_with_timeout "$timeout_seconds" du -skP "$item" 2> /dev/null); then
-            return 1
-        fi
+        local size_rc=0
+        du_output=$(run_with_timeout "$timeout_seconds" du -skP "$item" 2> /dev/null) || size_rc=$?
+        [[ $size_rc -eq 0 ]] || return "$size_rc"
 
         local size_kb="${du_output%%[^0-9]*}"
         [[ "$size_kb" =~ ^[0-9]+$ ]] || return 1
@@ -2098,308 +2640,314 @@ app_support_dir_has_regenerable_cache_markers() {
     return 1
 }
 
+# These leaves are eligible only through real components below this HOME.
+# A symlinked Crashpad parent must not turn an authored external tree into an
+# Application Support cache merely because its completed leaf is not a link.
+_app_support_path_has_no_symlink() {
+    local path="$1" probe="$1"
+    [[ "$path" == "$HOME/"* && "$path" != *"/../"* && "$path" != */.. ]] || return 1
+    while [[ "$probe" != "$HOME" ]]; do
+        [[ -L "$probe" ]] && return 1
+        probe="${probe%/*}"
+        [[ -n "$probe" ]] || return 1
+    done
+    [[ ! -L "$HOME" ]]
+}
+
+_app_support_final_guard() {
+    local previous_guard="${_MOLE_APP_SUPPORT_PREVIOUS_FINAL_GUARD:-}"
+    if [[ -n "$previous_guard" && "$previous_guard" != "_app_support_final_guard" ]]; then
+        "$previous_guard" "$1" || return $?
+    fi
+    _app_support_path_has_no_symlink "$1" || return 1
+    _mole_path_matches_identity "$_MOLE_APP_SUPPORT_CANDIDATE" \
+        "$_MOLE_APP_SUPPORT_CANDIDATE_PARENT" "$_MOLE_APP_SUPPORT_CANDIDATE_PARENT_ID" \
+        "$_MOLE_APP_SUPPORT_CANDIDATE_ID" || return 1
+    _mole_path_matches_identity "$1" "$_MOLE_APP_SUPPORT_ITEM_PARENT" \
+        "$_MOLE_APP_SUPPORT_ITEM_PARENT_ID" "$_MOLE_APP_SUPPORT_ITEM_ID"
+}
+
+# Process one completed candidate plan. Totals belong to the calling section;
+# only removed receipts (or admitted previews) contribute to its summary.
+_clean_app_support_candidate() {
+    local candidate="$1" progress="$2" scan="" scan_rc=0 count=0 item
+    local pending_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
+    if mole_rc_timeout_or_signal "$pending_cancel"; then return "$pending_cancel"; fi
+    if ((SECONDS >= _MOLE_APP_SUPPORT_DEADLINE)); then
+        _MOLE_APP_SUPPORT_BUDGET_SPENT=true
+        return 0
+    fi
+    [[ -d "$candidate" && ! -L "$candidate" ]] || return 0
+    _app_support_path_has_no_symlink "$candidate" || return 0
+    if should_protect_path "$candidate" 2> /dev/null || is_path_whitelisted "$candidate" 2> /dev/null; then return 0; fi
+    _mole_snapshot_path_identity "$candidate" || return 0
+    local _MOLE_APP_SUPPORT_CANDIDATE="$candidate"
+    local _MOLE_APP_SUPPORT_CANDIDATE_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+    local _MOLE_APP_SUPPORT_CANDIDATE_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+    local _MOLE_APP_SUPPORT_CANDIDATE_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+    local _MOLE_APP_SUPPORT_PREVIOUS_FINAL_GUARD="${_MOLE_SAFE_REMOVE_FINAL_GUARD:-}"
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD="_app_support_final_guard"
+    local _MOLE_DRY_RUN_FINAL_GUARD="_app_support_final_guard"
+    scan=$(_app_support_scan_entries "$candidate" 1) || scan_rc=$?
+    if [[ $scan_rc -ge 128 ]]; then
+        _mole_record_clean_cancellation "$scan_rc"
+        return "$scan_rc"
+    fi
+    if [[ $scan_rc -ne 0 ]]; then
+        debug_log "Application Support candidate scan incomplete ($scan_rc); kept: $candidate"
+        total_size_partial=true
+        _MOLE_CLEAN_INVENTORY_PARTIAL=true
+        if ((SECONDS >= _MOLE_APP_SUPPORT_DEADLINE)); then _MOLE_APP_SUPPORT_BUDGET_SPENT=true; fi
+        return 0
+    fi
+    while IFS= read -r -d '' item; do count=$((count + 1)); done < "$scan"
+    local bulk=false
+    if ((count > 100)); then
+        bulk=true
+        stop_section_spinner
+        start_section_spinner "Scanning Application Support... $progress"
+    fi
+    local item_found=false candidate_size_bytes=0 candidate_size_partial=false
+    # A large candidate is one sink with unknown size; small candidates retain
+    # exact sizes. Both use the same completion predicate after the action.
+    if [[ "$bulk" == "true" ]]; then
+        printf '%s\0' "$candidate" > "$scan"
+    fi
+    local action_rc=0 item_size_bytes item_size_kb item_size_known size_rc
+    while IFS= read -r -d '' item; do
+        local pending_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
+        if mole_rc_timeout_or_signal "$pending_cancel"; then
+            action_rc=$pending_cancel
+            break
+        fi
+        if ((SECONDS >= _MOLE_APP_SUPPORT_DEADLINE)); then
+            _MOLE_APP_SUPPORT_BUDGET_SPENT=true
+            break
+        fi
+        [[ -e "$item" || -L "$item" ]] || continue
+        _app_support_path_has_no_symlink "$item" || continue
+        _mole_path_matches_identity "$candidate" "$_MOLE_APP_SUPPORT_CANDIDATE_PARENT" \
+            "$_MOLE_APP_SUPPORT_CANDIDATE_PARENT_ID" "$_MOLE_APP_SUPPORT_CANDIDATE_ID" || break
+        if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then continue; fi
+        item_size_known=false
+        item_size_kb=0
+        item_size_bytes=0
+        size_rc=0
+        if [[ "$bulk" != "true" && ! -L "$item" && (-f "$item" || -d "$item") ]]; then
+            item_size_bytes=$(app_support_item_size_bytes "$item" "$size_timeout_seconds") || size_rc=$?
+            if [[ $size_rc -ge 128 ]]; then
+                action_rc=$size_rc
+                break
+            fi
+            if mole_rc_timeout "$size_rc"; then
+                debug_log "Application Support item size timed out; kept: $item"
+                total_size_partial=true
+                _MOLE_CLEAN_INVENTORY_PARTIAL=true
+                continue
+            fi
+            if [[ $size_rc -eq 0 && "$item_size_bytes" =~ ^[0-9]+$ ]]; then
+                item_size_kb=$(((item_size_bytes + 1023) / 1024))
+                item_size_known=true
+            fi
+        fi
+        _app_support_path_has_no_symlink "$item" || continue
+        _mole_path_matches_identity "$candidate" "$_MOLE_APP_SUPPORT_CANDIDATE_PARENT" \
+            "$_MOLE_APP_SUPPORT_CANDIDATE_PARENT_ID" "$_MOLE_APP_SUPPORT_CANDIDATE_ID" || break
+        _mole_snapshot_path_identity "$item" || continue
+        local item_parent="$_MOLE_PATH_SNAPSHOT_PARENT" item_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+        local item_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+        local _MOLE_APP_SUPPORT_ITEM_PARENT="$item_parent"
+        local _MOLE_APP_SUPPORT_ITEM_PARENT_ID="$item_parent_id"
+        local _MOLE_APP_SUPPORT_ITEM_ID="$item_id"
+        action_rc=0
+        if [[ "$DRY_RUN" == "true" ]]; then
+            record_dry_run_cleanup_target "$item" "$item_size_kb" 1 "$item_size_known" || action_rc=$?
+        else
+            # Never accept a stale receipt from a mocked/legacy helper.
+            _MOLE_SAFE_REMOVE_OUTCOME=""
+            if [[ "$item_size_known" == "true" ]]; then
+                safe_remove "$item" true "$item_size_kb" "$_MOLE_APP_SUPPORT_DEADLINE" \
+                    "$item_parent" "$item_parent_id" "$item_id" > /dev/null 2>&1 || action_rc=$?
+            else
+                safe_remove "$item" true "" "$_MOLE_APP_SUPPORT_DEADLINE" \
+                    "$item_parent" "$item_parent_id" "$item_id" > /dev/null 2>&1 || action_rc=$?
+            fi
+        fi
+        pending_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
+        if mole_rc_timeout_or_signal "$pending_cancel"; then
+            action_rc=$pending_cancel
+            break
+        fi
+        if [[ $action_rc -ge 128 ]] || { [[ "$DRY_RUN" == "true" ]] && mole_rc_timeout "$action_rc"; }; then break; fi
+        if mole_rc_timeout "$action_rc"; then
+            # safe_remove records safety-guard cancellation in the parent;
+            # without that sticky state this is only a failed item removal.
+            total_size_partial=true
+            _MOLE_CLEAN_INVENTORY_PARTIAL=true
+            action_rc=0
+            continue
+        fi
+        if [[ $action_rc -ne 0 || ("$DRY_RUN" != "true" && "${_MOLE_SAFE_REMOVE_OUTCOME:-}" != "removed") ]]; then continue; fi
+        item_found=true
+        if [[ "$item_size_known" == "true" ]]; then
+            candidate_size_bytes=$((candidate_size_bytes + item_size_bytes))
+        else
+            candidate_size_partial=true
+        fi
+    done < "$scan"
+    rm -f "$scan" # SAFE: exact scratch scan created by this candidate invocation
+    if [[ "$item_found" == "true" ]]; then
+        total_size_bytes=$((total_size_bytes + candidate_size_bytes))
+        [[ "$candidate_size_partial" == "true" ]] && total_size_partial=true
+        cleaned_count=$((cleaned_count + 1))
+        found_any=true
+    fi
+    if mole_rc_timeout_or_signal "$action_rc"; then
+        _mole_record_clean_cancellation "$action_rc"
+        return "$action_rc"
+    fi
+    return 0
+}
+
 # Application Support logs/caches.
 clean_application_support_logs() {
+    local pending_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
+    if mole_rc_timeout_or_signal "$pending_cancel"; then return "$pending_cancel"; fi
     if [[ ! -d "$HOME/Library/Application Support" ]] || ! ls "$HOME/Library/Application Support" > /dev/null 2>&1; then
         note_activity
         echo -e "  ${GRAY}${ICON_WARNING}${NC} Skipped: No permission to access Application Support"
         return 0
     fi
     start_section_spinner "Scanning Application Support..."
-    local total_size_bytes=0
-    local total_size_partial=false
-    local cleaned_count=0
-    local found_any=false
-    local size_timeout_seconds="${MOLE_APP_SUPPORT_ITEM_SIZE_TIMEOUT_SEC:-0.4}"
-    if [[ ! "$size_timeout_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        size_timeout_seconds=0.4
+    local total_size_bytes=0 total_size_partial=false cleaned_count=0 found_any=false
+    local size_timeout_seconds="0.4"
+    [[ "$size_timeout_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]] || size_timeout_seconds=0.4
+    local _MOLE_APP_SUPPORT_DEADLINE=$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))
+    local _MOLE_APP_SUPPORT_BUDGET_SPENT=false
+    local app_scan="" scan_rc=0 section_rc=0 total_apps=0 app_count=0 app_dir
+    app_scan=$(_app_support_scan_entries "$HOME/Library/Application Support" 1) || scan_rc=$?
+    if [[ $scan_rc -ne 0 ]]; then
+        stop_section_spinner
+        if [[ $scan_rc -ge 128 ]]; then
+            _mole_record_clean_cancellation "$scan_rc"
+            return "$scan_rc"
+        fi
+        debug_log "Application Support root scan incomplete ($scan_rc); kept: $HOME/Library/Application Support"
+        _MOLE_CLEAN_INVENTORY_PARTIAL=true
+        return 0
     fi
-    # Enable nullglob for safe globbing.
-    local _ng_state
-    _ng_state=$(shopt -p nullglob || true)
-    shopt -s nullglob
-    local app_count=0
-    local total_apps
-    # Temporarily disable pipefail here so that a partial find failure (e.g. TCC
-    # restrictions on macOS 26+) does not propagate through the pipeline and abort
-    # the whole scan via set -e.
-    local pipefail_was_set=false
-    if [[ -o pipefail ]]; then
-        pipefail_was_set=true
-        set +o pipefail
-    fi
-    total_apps=$(command find "$HOME/Library/Application Support" -mindepth 1 -maxdepth 1 -type d 2> /dev/null | wc -l | tr -d ' ')
-    [[ "$total_apps" =~ ^[0-9]+$ ]] || total_apps=0
+    while IFS= read -r -d '' app_dir; do [[ -d "$app_dir" ]] && total_apps=$((total_apps + 1)); done < "$app_scan"
     local last_progress_update
     last_progress_update=$(get_epoch_seconds)
-    for app_dir in ~/Library/Application\ Support/*; do
-        [[ -d "$app_dir" ]] || continue
-        local app_name="${app_dir##*/}"
+    while IFS= read -r -d '' app_dir; do
+        pending_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
+        if mole_rc_timeout_or_signal "$pending_cancel"; then
+            section_rc=$pending_cancel
+            break
+        fi
+        if ((SECONDS >= _MOLE_APP_SUPPORT_DEADLINE)); then
+            _MOLE_APP_SUPPORT_BUDGET_SPENT=true
+            break
+        fi
+        [[ -d "$app_dir" && ! -L "$app_dir" ]] || continue
+        local app_name="${app_dir##*/}" app_name_lower
         app_count=$((app_count + 1))
-        update_progress_if_needed "$app_count" "$total_apps" last_progress_update 1 || true
-        local is_protected=false
-        if is_path_whitelisted "$app_dir" 2> /dev/null; then
-            is_protected=true
-        elif should_protect_path "$app_dir" 2> /dev/null; then
-            is_protected=true
-        elif should_protect_data "$app_name"; then
-            is_protected=true
-        else
-            local app_name_lower
-            app_name_lower=$(echo "$app_name" | LC_ALL=C tr '[:upper:]' '[:lower:]')
-            if should_protect_data "$app_name_lower"; then
-                is_protected=true
-            fi
-        fi
-        if [[ "$is_protected" == "true" ]]; then
-            continue
-        fi
-        if is_critical_system_component "$app_name"; then
-            continue
-        fi
-        # Application Support can hold licenses, databases, offline assets and
-        # session state. Keep this generic pass to explicit, regenerable cache
-        # subtrees only; app-specific log/cache cleanup belongs in allowlisted
-        # app modules above.
+        update_progress_if_needed "$app_count" "$total_apps" last_progress_update 1 "Application Support" || true
+        if is_path_whitelisted "$app_dir" 2> /dev/null || should_protect_path "$app_dir" 2> /dev/null || should_protect_data "$app_name" || is_critical_system_component "$app_name"; then continue; fi
+        mole_ascii_lowercase app_name_lower "$app_name"
+        should_protect_data "$app_name_lower" && continue
         local -a start_candidates=(
-            "$app_dir/Code Cache"
-            "$app_dir/GPUCache"
-            "$app_dir/DawnCache"
-            "$app_dir/GrShaderCache"
-            "$app_dir/GraphiteDawnCache"
-            "$app_dir/DawnGraphiteCache"
-            "$app_dir/DawnWebGPUCache"
-            "$app_dir/Crashpad/completed"
+            "$app_dir/Code Cache" "$app_dir/GPUCache" "$app_dir/DawnCache"
+            "$app_dir/GrShaderCache" "$app_dir/GraphiteDawnCache" "$app_dir/DawnGraphiteCache"
+            "$app_dir/DawnWebGPUCache" "$app_dir/Crashpad/completed"
         )
-        if app_support_dir_has_regenerable_cache_markers "$app_dir"; then
-            start_candidates+=(
-                "$app_dir/Cache"
-                "$app_dir/CachedData"
-            )
-        fi
+        if app_support_dir_has_regenerable_cache_markers "$app_dir"; then start_candidates+=("$app_dir/Cache" "$app_dir/CachedData"); fi
+        local candidate app_label="$app_name"
+        [[ ${#app_label} -gt 24 ]] && app_label="${app_label:0:21}..."
         for candidate in "${start_candidates[@]}"; do
-            if [[ -d "$candidate" ]]; then
-                if should_protect_path "$candidate" 2> /dev/null || is_path_whitelisted "$candidate" 2> /dev/null; then
-                    continue
-                fi
-                # Quick count check - skip if too many items to avoid hanging
-                local quick_count
-                quick_count=$(app_support_entry_count_capped "$candidate" 1 101)
-                if [[ "$quick_count" -gt 100 ]]; then
-                    # Too many items - use bulk removal instead of item-by-item
-                    local app_label="$app_name"
-                    if [[ ${#app_label} -gt 24 ]]; then
-                        app_label="${app_label:0:21}..."
-                    fi
-                    stop_section_spinner
-                    start_section_spinner "Scanning Application Support... $app_count/$total_apps [$app_label, bulk clean]"
-                    if [[ "$DRY_RUN" == "true" ]]; then
-                        if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                            record_dry_run_cleanup_target "$candidate" 0 1 false || continue
-                        fi
-                    else
-                        # Remove entire candidate directory in one go
-                        safe_remove "$candidate" true > /dev/null 2>&1 || true
-                    fi
-                    found_any=true
-                    cleaned_count=$((cleaned_count + 1))
-                    total_size_partial=true
-                    continue
-                fi
-
-                local item_found=false
-                local candidate_size_bytes=0
-                local candidate_size_partial=false
-                local candidate_item_count=0
-                while IFS= read -r -d '' item; do
-                    [[ -e "$item" ]] || continue
-                    if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
-                        continue
-                    fi
-                    local item_size_known=false
-                    local item_size_kb=0
-                    local item_size_bytes=""
-                    if [[ ! -L "$item" && (-f "$item" || -d "$item") ]]; then
-                        if item_size_bytes=$(app_support_item_size_bytes "$item" "$size_timeout_seconds"); then
-                            if [[ "$item_size_bytes" =~ ^[0-9]+$ ]]; then
-                                item_size_kb=$(((item_size_bytes + 1023) / 1024))
-                                item_size_known=true
-                            else
-                                candidate_size_partial=true
-                            fi
-                        else
-                            candidate_size_partial=true
-                        fi
-                    fi
-                    if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                        record_dry_run_cleanup_target "$item" "$item_size_kb" 1 "$item_size_known" || continue
-                    fi
-                    if [[ "$item_size_known" == "true" ]]; then
-                        candidate_size_bytes=$((candidate_size_bytes + item_size_bytes))
-                    fi
-                    item_found=true
-                    candidate_item_count=$((candidate_item_count + 1))
-                    if ((candidate_item_count % 250 == 0)); then
-                        local current_time
-                        current_time=$(get_epoch_seconds)
-                        if [[ "$current_time" =~ ^[0-9]+$ ]] && ((current_time - last_progress_update >= 1)); then
-                            local app_label="$app_name"
-                            if [[ ${#app_label} -gt 24 ]]; then
-                                app_label="${app_label:0:21}..."
-                            fi
-                            stop_section_spinner
-                            start_section_spinner "Scanning Application Support... $app_count/$total_apps [$app_label, $candidate_item_count items]"
-                            last_progress_update=$current_time
-                        fi
-                    fi
-                    if [[ "$DRY_RUN" != "true" ]]; then
-                        if [[ "$item_size_known" == "true" ]]; then
-                            safe_remove "$item" true "$item_size_kb" > /dev/null 2>&1 || true
-                        else
-                            safe_remove "$item" true > /dev/null 2>&1 || true
-                        fi
-                    fi
-                done < <(command find "$candidate" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
-                if [[ "$item_found" == "true" ]]; then
-                    total_size_bytes=$((total_size_bytes + candidate_size_bytes))
-                    [[ "$candidate_size_partial" == "true" ]] && total_size_partial=true
-                    cleaned_count=$((cleaned_count + 1))
-                    found_any=true
-                fi
+            [[ "$_MOLE_APP_SUPPORT_BUDGET_SPENT" == "true" ]] && break
+            local candidate_rc=0
+            _clean_app_support_candidate "$candidate" "$app_count/$total_apps [$app_label, bulk clean]" || candidate_rc=$?
+            if mole_rc_timeout_or_signal "$candidate_rc"; then
+                section_rc=$candidate_rc
+                break
             fi
         done
-    done
-    # Group Containers logs (explicit allowlist).
-    local known_group_containers=(
-        "group.com.apple.contentdelivery"
-    )
-    for container in "${known_group_containers[@]}"; do
-        local container_path="$HOME/Library/Group Containers/$container"
-        local -a gc_candidates=("$container_path/Logs" "$container_path/Library/Logs")
-        for candidate in "${gc_candidates[@]}"; do
-            if [[ -d "$candidate" ]]; then
-                # Quick count check - skip if too many items
-                local quick_count
-                quick_count=$(app_support_entry_count_capped "$candidate" 1 101)
-                if [[ "$quick_count" -gt 100 ]]; then
-                    local container_label="$container"
-                    if [[ ${#container_label} -gt 24 ]]; then
-                        container_label="${container_label:0:21}..."
-                    fi
-                    stop_section_spinner
-                    start_section_spinner "Scanning Application Support... group [$container_label, bulk clean]"
-                    if [[ "$DRY_RUN" == "true" ]]; then
-                        if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                            record_dry_run_cleanup_target "$candidate" 0 1 false || continue
-                        fi
-                    else
-                        safe_remove "$candidate" true > /dev/null 2>&1 || true
-                    fi
-                    found_any=true
-                    cleaned_count=$((cleaned_count + 1))
-                    total_size_partial=true
-                    continue
+        [[ $section_rc -ne 0 || "$_MOLE_APP_SUPPORT_BUDGET_SPENT" == "true" ]] && break
+    done < "$app_scan"
+    rm -f "$app_scan" # SAFE: exact completed scratch root scan created by this section
+    if [[ $section_rc -eq 0 && "$_MOLE_APP_SUPPORT_BUDGET_SPENT" != "true" ]]; then
+        local container container_path container_label candidate
+        local known_group_containers=("group.com.apple.contentdelivery")
+        for container in "${known_group_containers[@]}"; do
+            container_path="$HOME/Library/Group Containers/$container"
+            container_label="$container"
+            [[ ${#container_label} -gt 24 ]] && container_label="${container_label:0:21}..."
+            for candidate in "$container_path/Logs" "$container_path/Library/Logs"; do
+                [[ "$_MOLE_APP_SUPPORT_BUDGET_SPENT" == "true" ]] && break
+                local candidate_rc=0
+                _clean_app_support_candidate "$candidate" "group [$container_label, bulk clean]" || candidate_rc=$?
+                if mole_rc_timeout_or_signal "$candidate_rc"; then
+                    section_rc=$candidate_rc
+                    break
                 fi
-
-                local item_found=false
-                local candidate_size_bytes=0
-                local candidate_size_partial=false
-                local candidate_item_count=0
-                while IFS= read -r -d '' item; do
-                    [[ -e "$item" ]] || continue
-                    local item_size_known=false
-                    local item_size_kb=0
-                    local item_size_bytes=""
-                    if [[ ! -L "$item" && (-f "$item" || -d "$item") ]]; then
-                        if item_size_bytes=$(app_support_item_size_bytes "$item" "$size_timeout_seconds"); then
-                            if [[ "$item_size_bytes" =~ ^[0-9]+$ ]]; then
-                                item_size_kb=$(((item_size_bytes + 1023) / 1024))
-                                item_size_known=true
-                            else
-                                candidate_size_partial=true
-                            fi
-                        else
-                            candidate_size_partial=true
-                        fi
-                    fi
-                    if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                        record_dry_run_cleanup_target "$item" "$item_size_kb" 1 "$item_size_known" || continue
-                    fi
-                    if [[ "$item_size_known" == "true" ]]; then
-                        candidate_size_bytes=$((candidate_size_bytes + item_size_bytes))
-                    fi
-                    item_found=true
-                    candidate_item_count=$((candidate_item_count + 1))
-                    if ((candidate_item_count % 250 == 0)); then
-                        local current_time
-                        current_time=$(get_epoch_seconds)
-                        if [[ "$current_time" =~ ^[0-9]+$ ]] && ((current_time - last_progress_update >= 1)); then
-                            local container_label="$container"
-                            if [[ ${#container_label} -gt 24 ]]; then
-                                container_label="${container_label:0:21}..."
-                            fi
-                            stop_section_spinner
-                            start_section_spinner "Scanning Application Support... group [$container_label, $candidate_item_count items]"
-                            last_progress_update=$current_time
-                        fi
-                    fi
-                    if [[ "$DRY_RUN" != "true" ]]; then
-                        if [[ "$item_size_known" == "true" ]]; then
-                            safe_remove "$item" true "$item_size_kb" > /dev/null 2>&1 || true
-                        else
-                            safe_remove "$item" true > /dev/null 2>&1 || true
-                        fi
-                    fi
-                done < <(command find "$candidate" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
-                if [[ "$item_found" == "true" ]]; then
-                    total_size_bytes=$((total_size_bytes + candidate_size_bytes))
-                    [[ "$candidate_size_partial" == "true" ]] && total_size_partial=true
-                    cleaned_count=$((cleaned_count + 1))
-                    found_any=true
-                fi
-            fi
+            done
+            [[ $section_rc -ne 0 || "$_MOLE_APP_SUPPORT_BUDGET_SPENT" == "true" ]] && break
         done
-    done
-    # Restore pipefail if it was previously set
-    if [[ "$pipefail_was_set" == "true" ]]; then
-        set -o pipefail
     fi
-    # eval: restore shopt state captured by $(shopt -p)
-    eval "$_ng_state"
+    if [[ "$_MOLE_APP_SUPPORT_BUDGET_SPENT" == "true" ]]; then
+        debug_log "Application Support section time limit reached; kept remaining candidates"
+        total_size_partial=true
+        _MOLE_CLEAN_INVENTORY_PARTIAL=true
+    fi
     stop_section_spinner
     if [[ "$found_any" == "true" ]]; then
-        local size_human
+        local size_human total_size_kb=$(((total_size_bytes + 1023) / 1024)) count_note=""
         size_human=$(bytes_to_human "$total_size_bytes")
-        local total_size_kb=$(((total_size_bytes + 1023) / 1024))
+        [[ "$total_size_partial" == "true" ]] && count_note="at least "
         if [[ "$DRY_RUN" == "true" ]]; then
-            if [[ "$total_size_partial" == "true" ]]; then
-                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Application Support logs/caches${NC} · ${YELLOW}at least $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
-            else
-                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Application Support logs/caches${NC} · $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
-            fi
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Application Support logs/caches${NC} · ${YELLOW}${count_note}$(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size_kb")
-            if [[ "$total_size_partial" == "true" ]]; then
-                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Application Support logs/caches${NC} · ${line_color}at least $size_human${NC}"
-            else
-                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Application Support logs/caches${NC} · ${line_color}$size_human${NC}"
-            fi
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Application Support logs/caches${NC} · ${line_color}${count_note}$size_human${NC}"
         fi
-        files_cleaned=$((files_cleaned + cleaned_count))
-        total_size_cleaned=$((total_size_cleaned + total_size_kb))
-        total_items=$((total_items + 1))
+        mole_add_cleaned_row "$cleaned_count" "$total_size_kb"
         note_activity
     fi
+    _mole_record_clean_cancellation "$section_rc"
+    return "$section_rc"
 }
+# Bind each firmware file to its physical location and require a complete,
+# idle handle probe. Used before sizing, after preview sizing, and at the sink.
+_cached_device_firmware_delete_guard() {
+    local path="$1" ancestor="$1" probe_rc=0
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    while [[ "$ancestor" != "$HOME" ]]; do
+        [[ "$ancestor" == "$HOME/"* && ! -L "$ancestor" ]] || return 1
+        ancestor="${ancestor%/*}"
+    done
+    _mole_path_matches_identity "$path" "$_MOLE_FIRMWARE_PARENT" \
+        "$_MOLE_FIRMWARE_PARENT_ID" "$_MOLE_FIRMWARE_TARGET_ID" || return 1
+    _mole_paths_have_open_handle "$path" || probe_rc=$?
+    if mole_rc_signal "$probe_rc"; then
+        return "$probe_rc"
+    fi
+    # A read-only timeout is unknown, not cancellation of later cleanup.
+    [[ $probe_rc -eq 1 ]] || return 1
+    _mole_path_matches_identity "$path" "$_MOLE_FIRMWARE_PARENT" \
+        "$_MOLE_FIRMWARE_PARENT_ID" "$_MOLE_FIRMWARE_TARGET_ID"
+}
+
 # Remove cached device firmware (.ipsw) from iTunes, Finder, and Apple Configurator 2.
-# These are installers for firmware already applied (or superseded); macOS will
-# re-download them on demand. Typical size: 5-8GB per file. Never touches backups.
+# Cached restore installers can be downloaded again. Keep open or unverified
+# files, and never scan device backups or partial downloads.
 clean_cached_device_firmware() {
     local -a shallow_dirs=(
         "$HOME/Library/iTunes/iPhone Software Updates"
         "$HOME/Library/iTunes/iPad Software Updates"
         "$HOME/Library/iTunes/iPod Software Updates"
+        "$HOME/Library/iTunes/Apple TV Software Updates"
     )
 
     # Apple Configurator 2 nests firmware under per-team-id group containers.
@@ -2416,10 +2964,21 @@ clean_cached_device_firmware() {
 
     _process_ipsw_file() {
         local ipsw="$1"
-        [[ -f "$ipsw" ]] || return 0
-        if is_path_whitelisted "$ipsw"; then
+        [[ -f "$ipsw" && ! -L "$ipsw" ]] || return 0
+        if is_path_whitelisted "$ipsw" || should_protect_path "$ipsw"; then
             return 0
         fi
+        _mole_snapshot_path_identity "$ipsw" || return 0
+        local _MOLE_FIRMWARE_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+        local _MOLE_FIRMWARE_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+        local _MOLE_FIRMWARE_TARGET_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+        local guard_rc=0
+        _cached_device_firmware_delete_guard "$ipsw" || guard_rc=$?
+        if mole_rc_signal "$guard_rc"; then
+            _mole_record_clean_cancellation "$guard_rc"
+            return "$guard_rc"
+        fi
+        [[ $guard_rc -eq 0 ]] || return 0
         local size_kb=""
         local size_rc=0
         size_kb=$(get_path_size_kb "$ipsw") || size_rc=$?
@@ -2427,8 +2986,21 @@ clean_cached_device_firmware() {
         [[ $size_rc -eq 0 ]] || return "$size_rc"
         size_kb="${size_kb:-0}"
         if [[ "$DRY_RUN" == "true" ]]; then
+            guard_rc=0
+            _cached_device_firmware_delete_guard "$ipsw" || guard_rc=$?
+            if mole_rc_signal "$guard_rc"; then
+                _mole_record_clean_cancellation "$guard_rc"
+                return "$guard_rc"
+            fi
+            [[ $guard_rc -eq 0 ]] || return 0
             if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                record_dry_run_cleanup_target "$ipsw" "$size_kb" 1 true || return 0
+                local record_rc=0
+                record_dry_run_cleanup_target "$ipsw" "$size_kb" 1 true || record_rc=$?
+                if mole_rc_timeout_or_signal "$record_rc"; then
+                    _mole_record_clean_cancellation "$record_rc"
+                    return "$record_rc"
+                fi
+                [[ $record_rc -eq 0 ]] || return 0
             fi
             total_size_kb=$((total_size_kb + size_kb))
             cleaned_count=$((cleaned_count + 1))
@@ -2436,7 +3008,16 @@ clean_cached_device_firmware() {
             return 0
         fi
 
-        if safe_remove "$ipsw" true > /dev/null 2>&1; then
+        local _MOLE_SAFE_REMOVE_FINAL_GUARD=_cached_device_firmware_delete_guard
+        local remove_rc=0
+        safe_remove "$ipsw" true "$size_kb" "" \
+            "$_MOLE_FIRMWARE_PARENT" "$_MOLE_FIRMWARE_PARENT_ID" \
+            "$_MOLE_FIRMWARE_TARGET_ID" > /dev/null 2>&1 || remove_rc=$?
+        if mole_rc_timeout_or_signal "$remove_rc"; then
+            _mole_record_clean_cancellation "$remove_rc"
+            return "$remove_rc"
+        fi
+        if [[ $remove_rc -eq 0 ]]; then
             total_size_kb=$((total_size_kb + size_kb))
             cleaned_count=$((cleaned_count + 1))
             cleaned_any=true
@@ -2470,11 +3051,9 @@ clean_cached_device_firmware() {
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size_kb")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Cached device firmware${NC} · ${line_color}${cleaned_count} files, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Cached device firmware${NC} · ${line_color}${cleaned_count} files, $(colorize_human_size "${size_human}")"
         fi
-        files_cleaned=$((files_cleaned + cleaned_count))
-        total_size_cleaned=$((total_size_cleaned + total_size_kb))
-        total_items=$((total_items + 1))
+        mole_add_cleaned_row "$cleaned_count" "$total_size_kb"
         note_activity
     fi
 }
@@ -2508,46 +3087,377 @@ jetbrains_stale_version_dirs() {
         '
 }
 
-# AI coding agents (Claude Code and similar) create full checkouts under
-# <project>/.claude/worktrees/ that accumulate silently across repos. Report
-# only, same 1GB bar as other large candidates; removal stays a manual
-# `git worktree remove` decision because a worktree may hold agent work.
-report_agent_worktree_candidates() {
-    local threshold_kb=$((1024 * 1024)) # 1GB
+# List every agent worktree container once, NUL-separated: the Codex app's
+# fixed container first, then each `.claude/worktrees` under the project roots.
+agent_worktree_containers() {
     local -a roots=(
         "$HOME/code" "$HOME/Code" "$HOME/dev" "$HOME/Projects"
         "$HOME/GitHub" "$HOME/Workspace" "$HOME/Repos"
         "$HOME/Development" "$HOME/www" "$HOME/src"
     )
-    local root container size_kb size_rc
+    local container
+    # The Codex app keeps every worktree under one fixed container outside
+    # any project root, so the find below never reaches it.
+    container="$HOME/.codex/worktrees"
+    if [[ -d "$container" && ! -L "$container" ]]; then
+        printf '%s\0' "$container"
+    fi
+
+    # ~/code and ~/Code are one directory on case-insensitive APFS, and a root
+    # may be a symlink to another. Scan each physical root once, or every
+    # container is reported twice (same class as #590 and #1416). A root can
+    # also sit inside another one, so containers are deduplicated as well.
+    local -a scanned_roots=() listed_containers=()
+    local root physical_root scanned already_scanned
     for root in "${roots[@]}"; do
         [[ -d "$root" ]] || continue
+        physical_root=$(mole_purge_resolve_path_case "$root")
+        already_scanned=false
+        for scanned in "${scanned_roots[@]+"${scanned_roots[@]}"}"; do
+            if [[ "$scanned" == "$physical_root" ]]; then
+                already_scanned=true
+                break
+            fi
+        done
+        [[ "$already_scanned" == "false" ]] || continue
+        scanned_roots+=("$physical_root")
         while IFS= read -r -d '' container; do
-            size_rc=0
-            size_kb=$(get_path_size_kb "$container" 2> /dev/null) || size_rc=$?
-            [[ $size_rc -eq 0 ]] || _mole_record_clean_cancellation "$size_rc"
-            [[ $size_rc -eq 0 ]] || return "$size_rc"
-            [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
-            [[ "$size_kb" -ge "$threshold_kb" ]] || continue
-            echo -e "  ${YELLOW}${ICON_REVIEW}${NC} AI agent worktrees · ${GREEN}$(bytes_to_human "$((size_kb * 1024))")${NC} · ${GRAY}$(format_path_link "$container")${NC}"
-            note_activity
-        done < <(run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" command find "$root" -maxdepth 6 -type d -path "*/.claude/worktrees" -prune -print0 2> /dev/null)
+            already_scanned=false
+            for scanned in "${listed_containers[@]+"${listed_containers[@]}"}"; do
+                if [[ "$scanned" == "$container" ]]; then
+                    already_scanned=true
+                    break
+                fi
+            done
+            [[ "$already_scanned" == "false" ]] || continue
+            listed_containers+=("$container")
+            printf '%s\0' "$container"
+        done < <(run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" command find "$physical_root" -maxdepth 6 -type d -path "*/.claude/worktrees" -prune -print0 2> /dev/null)
     done
+}
+
+# AI coding agents create full checkouts that accumulate silently: Claude Code
+# under <project>/.claude/worktrees/, the Codex app under ~/.codex/worktrees/.
+# Report only, same 1GB bar as other large candidates; removal stays a manual
+# `git worktree remove` decision because a worktree may hold agent work.
+# $1 may name a container listing that Large files started ahead of time.
+report_agent_worktree_candidates() {
+    local listing_file="${1:-}"
+    local threshold_kb=$((1024 * 1024)) # 1GB
+
+    _report_agent_worktree_container() {
+        local container="$1"
+        local size_kb size_rc=0
+        size_kb=$(get_path_size_kb "$container" 2> /dev/null) || size_rc=$?
+        # Review rows never cancel the rest of clean on a size timeout (#1576):
+        # a container holding many full checkouts can outlast the size budget.
+        # Signals still stop the run so Ctrl-C stays sticky.
+        if [[ $size_rc -ge 128 ]]; then
+            _mole_record_clean_cancellation "$size_rc"
+            return "$size_rc"
+        fi
+        [[ $size_rc -eq 0 ]] || return 0
+        [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+        [[ "$size_kb" -ge "$threshold_kb" ]] || return 0
+        # The caller's "Scanning large files..." spinner is still running;
+        # printing over it glues the row onto the spinner frame.
+        stop_section_spinner
+        # The linked label no longer shows the path, so name whose they are:
+        # the project for <project>/.claude/worktrees, Codex for ~/.codex.
+        local owner="${container%/*}"
+        owner="${owner%/*}"
+        owner="${owner##*/}"
+        [[ "$container" == */.codex/worktrees ]] && owner="Codex"
+        mole_review_row "AI agent worktrees" "$container" "$(bytes_to_human "$((size_kb * 1024))")" "$owner"
+        note_activity
+        start_section_spinner "Scanning large files..."
+    }
+
+    local container rc=0
+    while IFS= read -r -d '' container; do
+        _report_agent_worktree_container "$container" || rc=$?
+        [[ $rc -eq 0 ]] || break
+    done < <(if [[ -n "$listing_file" && -f "$listing_file" ]]; then cat "$listing_file"; else agent_worktree_containers; fi)
+
+    unset -f _report_agent_worktree_container
+    return "$rc"
+}
+
+# One `docker system df` row for the Large files Docker line. Docker's
+# Reclaimable is swapped for the active/total count when it contradicts the
+# row's own counts: something reclaimable while every item is in use, or all
+# images reclaimable while a container still uses one. Engine 29.0 through
+# 29.3 reports in-use images as reclaimable (moby/moby#51775), and older
+# clients count shared layers of in-use images the same way. Rows whose
+# counts do not parse keep Docker's text.
+docker_df_review_segment() {
+    local type="$1"
+    local size="$2"
+    local reclaimable="$3"
+    local total="$4"
+    local active="$5"
+    local contradicts=false
+    if [[ "$total" =~ ^[0-9]+$ && "$active" =~ ^[0-9]+$ ]]; then
+        if [[ $total -gt 0 && $active -eq $total && "$reclaimable" != 0B* ]]; then
+            contradicts=true
+        elif [[ "$type" == "Images" && $active -gt 0 && "$reclaimable" == *"(100%)"* ]]; then
+            contradicts=true
+        fi
+    fi
+    if [[ "$contradicts" == "true" ]]; then
+        printf '%s %s (%s/%s in use)\n' "$type" "$size" "$active" "$total"
+    else
+        printf '%s %s (%s reclaimable)\n' "$type" "$size" "$reclaimable"
+    fi
+}
+
+# Large file candidates measure a few dozen folders with du, and two or three
+# of them (device backups, simulators, DerivedData) take seconds each. Measure
+# the fixed rows ahead of the report, a few at a time, so their times overlap
+# instead of adding up; rows still print one by one in their usual order.
+# The report takes a row's result from here when it was queued and measures
+# inline otherwise, so a row missing from this list is only slower.
+_large_prefetch_queue_rows() {
+    local android_avd_root="$HOME/.android/avd"
+    [[ "${ANDROID_AVD_HOME:-}" == /* ]] && android_avd_root="$ANDROID_AVD_HOME"
+    local android_sdk_root="$HOME/Library/Android/sdk"
+    if [[ "${ANDROID_HOME:-}" == /* ]]; then
+        android_sdk_root="$ANDROID_HOME"
+    elif [[ "${ANDROID_SDK_ROOT:-}" == /* ]]; then
+        android_sdk_root="$ANDROID_SDK_ROOT"
+    fi
+    local hf_root="$HOME/.cache/huggingface"
+    [[ "${HF_HOME:-}" == /* ]] && hf_root="$HF_HOME"
+    local mise_installs="$HOME/.local/share/mise/installs"
+    [[ "${MISE_DATA_DIR:-}" == /* ]] && mise_installs="$MISE_DATA_DIR/installs"
+    local fvm_versions="$HOME/fvm/versions"
+    [[ "${FVM_CACHE_PATH:-}" == /* ]] && fvm_versions="$FVM_CACHE_PATH/versions"
+    local deno_module_cache=""
+    deno_module_cache=$(mole_deno_cache_root 2> /dev/null) || deno_module_cache=""
+    local path
+    for path in \
+        "$HOME/Library/Developer/Xcode/DerivedData" \
+        "$HOME/Library/Developer/CoreSimulator/Devices" \
+        "$HOME/Library/Application Support/MobileSync/Backup" \
+        "$HOME/Library/Mail" \
+        "$HOME/Library/Mail Downloads" \
+        "$HOME/Conductor/workspaces" \
+        "$HOME/Conductor/archived-contexts" \
+        "$HOME/Library/Updates" \
+        "$HOME/Library/Developer/Xcode/Archives" \
+        "$HOME/Library/Containers/com.docker.docker/Data" \
+        "$HOME/.lmstudio/models" \
+        "$HOME"/Library/Group\ Containers/*dev.orbstack/data \
+        "$HOME/OrbStack" \
+        "$HOME/.lima" \
+        "$HOME/.m2/repository" \
+        "$HOME/.ivy2/cache" \
+        "$HOME/.nuget/packages" \
+        "$deno_module_cache" \
+        "$HOME/Library/pnpm/store" \
+        "$HOME/.conda/pkgs" \
+        "$HOME/anaconda3/pkgs" \
+        "$HOME/.gradle/caches" \
+        "$android_avd_root" \
+        "$android_sdk_root/system-images" \
+        "$hf_root" \
+        "$mise_installs"/* \
+        "$fvm_versions"; do
+        [[ -d "$path" && ! -L "$path" ]] || continue
+        printf '%s\n' "$path"
+    done
+}
+
+# Measure the queued rows before the report runs, at most four at a time,
+# all in this shell so the pool's bookkeeping never sits in a subshell. Each
+# worker writes "status\noutput" to its row's result file. Once the shared
+# deadline has passed no further row is started: the report measures those
+# inline with their usual per-row budget, so the worst case stays as before.
+_large_prefetch_run() {
+    local total=${#_lp_paths[@]} next=0 slot
+    local -a pids=() indexes=()
+    _large_prefetch_kill() {
+        local pid
+        for pid in "${pids[@]+"${pids[@]}"}"; do
+            # The timeout helper and du run under the worker; stop them too.
+            pkill -TERM -P "$pid" 2> /dev/null || true
+            kill "$pid" 2> /dev/null || true
+        done
+        for pid in "${pids[@]+"${pids[@]}"}"; do
+            wait "$pid" 2> /dev/null || true
+        done
+        pids=()
+        indexes=()
+    }
+    local previous_int_trap previous_term_trap
+    previous_int_trap=$(trap -p INT || true)
+    previous_term_trap=$(trap -p TERM || true)
+    trap '_lp_interrupted=130; _large_prefetch_kill' INT
+    trap '_lp_interrupted=143; _large_prefetch_kill' TERM
+
+    while [[ $_lp_interrupted -lt 128 ]]; do
+        while [[ $_lp_interrupted -lt 128 && ${#pids[@]} -lt $_lp_max && $next -lt $total ]]; do
+            local timeout_seconds=""
+            if ! timeout_seconds=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$_lp_deadline"); then
+                next=$total
+                break
+            fi
+            # A row the pool cannot give its usual budget is better measured
+            # inline later, where it gets that budget again.
+            if [[ ${timeout_seconds%%.*} -lt 3 ]]; then
+                next=$total
+                break
+            fi
+            local path="${_lp_paths[next]}" result="$_lp_dir/$next"
+            (
+                rc=0
+                run_with_timeout "$timeout_seconds" du -skP "$path" > "$result.out" 2> /dev/null || rc=$?
+                { printf '%s\n' "$rc" && head -n 1 "$result.out"; } > "$result.tmp" && mv "$result.tmp" "$result"
+            ) < /dev/null > /dev/null 2>&1 &
+            pids+=("$!")
+            indexes+=("$next")
+            next=$((next + 1))
+        done
+        [[ ${#pids[@]} -gt 0 ]] || break
+        local finished="" wait_rc=0
+        mole_wait_for_any_worker finished "${pids[@]}" || wait_rc=$?
+        if [[ -z "$finished" ]]; then
+            # The poll itself was interrupted.
+            [[ $wait_rc -ge 128 ]] && _lp_interrupted=$wait_rc
+            break
+        fi
+        # The trap already stopped and cleared every worker.
+        [[ $_lp_interrupted -lt 128 ]] || break
+        local -a kept_pids=() kept_indexes=()
+        for slot in "${!pids[@]}"; do
+            [[ "${pids[$slot]}" == "$finished" ]] && continue
+            kept_pids+=("${pids[$slot]}")
+            kept_indexes+=("${indexes[$slot]}")
+        done
+        pids=("${kept_pids[@]+"${kept_pids[@]}"}")
+        indexes=("${kept_indexes[@]+"${kept_indexes[@]}"}")
+    done
+    _large_prefetch_kill
+    unset -f _large_prefetch_kill
+    trap - INT TERM
+    # eval: restore caller traps captured by $(trap -p)
+    [[ -n "$previous_int_trap" ]] && eval "$previous_int_trap"
+    [[ -n "$previous_term_trap" ]] && eval "$previous_term_trap"
+    [[ $_lp_interrupted -lt 128 ]] || return "$_lp_interrupted"
     return 0
+}
+
+# A queued row's measurement, read-only so it also works inside $(...).
+# Returns 1 when the row has no result and must be measured inline.
+_large_prefetch_result() {
+    local path="$1"
+    local output_name="$2"
+    local status_name="$3"
+    [[ -n "${_lp_dir:-}" ]] || return 1
+    local i
+    for ((i = 0; i < ${#_lp_paths[@]}; i++)); do
+        [[ "${_lp_paths[i]}" == "$path" ]] || continue
+        [[ -f "$_lp_dir/$i" ]] || return 1
+        local measured_rc="" measured_output=""
+        { IFS= read -r measured_rc && IFS= read -r measured_output; } < "$_lp_dir/$i" || true
+        [[ "$measured_rc" =~ ^[0-9]+$ ]] || return 1
+        printf -v "$output_name" '%s' "$measured_output"
+        printf -v "$status_name" '%s' "$measured_rc"
+        return 0
+    done
+    return 1
+}
+
+# The worktree container search walks every project root (seconds on a large
+# ~/www) and only feeds the last rows, so it runs beside the size pool. Wait
+# for it here, in the report's own shell, and keep its listing only when it
+# finished cleanly.
+_large_prefetch_worktree_wait() {
+    _lp_worktree_listing=""
+    [[ -n "${_lp_dir:-}" && -n "${_lp_worktree_pid:-}" ]] || return 0
+    local wait_rc=0
+    wait "$_lp_worktree_pid" 2> /dev/null || wait_rc=$?
+    _lp_worktree_pid=""
+    if [[ $wait_rc -eq 0 && -f "$_lp_dir/worktrees" ]]; then
+        _lp_worktree_listing="$_lp_dir/worktrees"
+    fi
+}
+
+_large_prefetch_worktree_stop() {
+    [[ -n "${_lp_worktree_pid:-}" ]] || return 0
+    pkill -TERM -P "$_lp_worktree_pid" 2> /dev/null || true
+    kill "$_lp_worktree_pid" 2> /dev/null || true
+    wait "$_lp_worktree_pid" 2> /dev/null || true
+    _lp_worktree_pid=""
 }
 
 # Large file candidates (report only, no deletion).
 check_large_file_candidates() {
+    local -a _lp_paths=()
+    local _lp_dir="" _lp_max=4 _lp_interrupted=0 _lp_worktree_pid="" _lp_worktree_listing=""
+    local _lp_deadline=$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))
+    local _lp_path
+    if _lp_dir=$(create_temp_dir); then
+        while IFS= read -r _lp_path; do
+            [[ -n "$_lp_path" ]] && _lp_paths+=("$_lp_path")
+        done < <(_large_prefetch_queue_rows)
+        (agent_worktree_containers > "$_lp_dir/worktrees.tmp" && mv "$_lp_dir/worktrees.tmp" "$_lp_dir/worktrees") < /dev/null > /dev/null 2>&1 &
+        _lp_worktree_pid=$!
+    else
+        _lp_dir=""
+    fi
+
+    start_section_spinner "Scanning large files..."
+    local body_rc=0
+    if [[ -n "$_lp_dir" && ${#_lp_paths[@]} -gt 0 ]]; then
+        _large_prefetch_run || body_rc=$?
+    fi
+    if [[ $body_rc -ge 128 ]]; then
+        _mole_record_clean_cancellation "$body_rc"
+        stop_section_spinner
+    else
+        # While the report runs, a signal must still stop the background
+        # worktree search before the caller's own handler takes over.
+        local previous_int_trap previous_term_trap
+        previous_int_trap=$(trap -p INT || true)
+        previous_term_trap=$(trap -p TERM || true)
+        trap '_large_prefetch_worktree_stop; trap - INT; [[ -n "$previous_int_trap" ]] && eval "$previous_int_trap"; kill -INT $$' INT
+        trap '_large_prefetch_worktree_stop; trap - TERM; [[ -n "$previous_term_trap" ]] && eval "$previous_term_trap"; kill -TERM $$' TERM
+        _check_large_file_candidates_body || body_rc=$?
+        trap - INT TERM
+        # eval: restore caller traps captured by $(trap -p)
+        [[ -n "$previous_int_trap" ]] && eval "$previous_int_trap"
+        [[ -n "$previous_term_trap" ]] && eval "$previous_term_trap"
+    fi
+
+    _large_prefetch_worktree_stop
+    [[ -n "$_lp_dir" ]] && rm -rf "$_lp_dir" # SAFE: exact mktemp-created Large files measurement scratch directory
+    return "$body_rc"
+}
+
+_check_large_file_candidates_body() {
     local threshold_kb=$((1024 * 1024)) # 1GB
     local found_any=false
     local size_rc=0
 
     _large_candidate_size_kb() {
         local path="$1"
-        local timeout_seconds="${2:-${MOLE_LARGE_CANDIDATE_SIZE_TIMEOUT:-3}}"
+        local timeout_seconds="${2:-3}"
+        local exact="${3:-}"
         [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds=3
-        local du_output=""
-        du_output=$(run_with_timeout "$timeout_seconds" du -skP "$path" 2> /dev/null || true)
+        local du_output="" du_rc=0
+        if ! _large_prefetch_result "$path" du_output du_rc; then
+            du_output=$(run_with_timeout "$timeout_seconds" du -skP "$path" 2> /dev/null) || du_rc=$?
+        fi
+        # Review-only: a timed-out or failed du skips this row. Signals still
+        # cancel the run so Ctrl-C stays sticky. BSD du exits 1 when some
+        # entry is unreadable yet still prints the total of everything it
+        # read, a usable lower bound; a timeout's output is never a total.
+        # Rows passed "exact" (E5RT, #1631) never show a lower bound.
+        if [[ $du_rc -ge 128 ]]; then
+            return "$du_rc"
+        fi
+        [[ $du_rc -eq 0 || ($du_rc -eq 1 && "$exact" != "exact") ]] || return 1
         local size_kb="${du_output%%[^0-9]*}"
         [[ "$size_kb" =~ ^[0-9]+$ ]] || return 1
         printf '%s\n' "$size_kb"
@@ -2565,89 +3475,148 @@ check_large_file_candidates() {
         local path="$1"
         local mtimes="" newest=""
         mtimes=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" \
-            command find "$path" -mindepth 1 -maxdepth 1 -exec stat -f '%m' {} + 2> /dev/null) || return 1
+            command find "$path" -mindepth 1 -maxdepth 1 -exec "$STAT_BSD" -f '%m' {} + 2> /dev/null) || return 1
         [[ -n "$mtimes" ]] || return 1
         newest=$(printf '%s\n' "$mtimes" | sort -n | tail -1)
         [[ "$newest" =~ ^[0-9]+$ ]] || return 1
-        date -r "$newest" '+%Y-%m-%d' 2> /dev/null || return 1
+        "$_DATE_CMD" -r "$newest" '+%Y-%m-%d' 2> /dev/null || return 1
     }
 
-    # One row per large item: "label · size · path", with an optional date
-    # between size and path. Bare date, no leading word: it sits right after a
-    # short size field, so it lands in a stable column and reads as a date on
-    # its own. The review icon carries the review-only semantics;
-    # format_path_link keeps the path clickable even with spaces (OSC 8 link,
-    # not terminal auto-linking).
+    # Children of a review row named by one bounded find, materialized whole:
+    # a partial listing would undercount, so any failure yields no fact.
+    _large_dir_children() {
+        local path="$1" depth="$2" name="$3"
+        run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" \
+            command find "$path" -mindepth "$depth" -maxdepth "$depth" -name "$name" 2> /dev/null
+    }
+
+    # The short fact after a review row's size, worked out read-only so the
+    # row says what is inside without asking the user to run a command.
+    _large_dir_fact() {
+        local kind="$1" path="$2"
+        local listing="" count=0
+        case "$kind" in
+            date)
+                _large_dir_newest_date "$path"
+                ;;
+            projects)
+                listing=$(_large_dir_children "$path" 1 '*') || return 1
+                [[ -n "$listing" ]] || return 1
+                count=$(printf '%s\n' "$listing" | wc -l | tr -d ' ')
+                mole_count_label "$count" project
+                ;;
+            simulators)
+                listing=$(_large_dir_children "$path" 2 device.plist) || return 1
+                [[ -n "$listing" ]] || return 1
+                count=$(printf '%s\n' "$listing" | wc -l | tr -d ' ')
+                mole_count_label "$count" simulator
+                ;;
+            archives)
+                # Archives/<YYYY-MM-DD>/<name>.xcarchive, so the folder names
+                # give the month range without reading any bundle.
+                listing=$(_large_dir_children "$path" 2 '*.xcarchive') || return 1
+                [[ -n "$listing" ]] || return 1
+                count=$(printf '%s\n' "$listing" | wc -l | tr -d ' ')
+                local first="" last="" day
+                while IFS= read -r day; do
+                    [[ "$day" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+                    [[ -z "$first" || "$day" < "$first" ]] && first="$day"
+                    [[ -z "$last" || "$day" > "$last" ]] && last="$day"
+                done < <(printf '%s\n' "$listing" | sed -E 's#/[^/]*$##; s#.*/##')
+                local fact
+                fact=$(mole_count_label "$count" build)
+                if [[ -n "$first" ]]; then
+                    local -a months=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
+                    local from="${months[$((10#${first:5:2} - 1))]}"
+                    local to="${months[$((10#${last:5:2} - 1))]}"
+                    if [[ "${first:0:4}" != "${last:0:4}" ]]; then
+                        fact+=", $from ${first:0:4} to $to ${last:0:4}"
+                    elif [[ "${first:0:7}" != "${last:0:7}" ]]; then
+                        fact+=", $from to $to"
+                    else
+                        fact+=", $to"
+                    fi
+                fi
+                printf '%s' "$fact"
+                ;;
+            stores)
+                # pnpm keeps one store per major layout (v3, v10, v11); a
+                # second one is usually left from an older pnpm.
+                listing=$(_large_dir_children "$path" 1 'v[0-9]*') || return 1
+                local -a stores=()
+                local store
+                while IFS= read -r store; do
+                    [[ -n "$store" ]] && stores+=("${store##*/}")
+                done < <(printf '%s\n' "$listing" | sed 's#.*/##' | sort -t v -k 2 -n)
+                [[ ${#stores[@]} -gt 1 ]] || return 1
+                printf '%s stores' "$(mole_join_names "${stores[@]}")"
+                ;;
+            *) return 1 ;;
+        esac
+    }
+
+    # One row per large item through mole_review_row: the label links to the
+    # path, then the size, then an optional fact from _large_dir_fact.
     _report_large_review_row() {
         local label="$1"
         local size_human="$2"
         local path="$3"
-        local newest_date="${4:-}"
-        local date_part=""
-        [[ -n "$newest_date" ]] && date_part=" · ${GRAY}${newest_date}${NC}"
+        local fact="${4:-}"
         stop_section_spinner
-        echo -e "  ${YELLOW}${ICON_REVIEW}${NC} ${label} · ${GREEN}${size_human}${NC}${date_part} · ${GRAY}$(format_path_link "$path")${NC}"
+        mole_review_row "$label" "$path" "$size_human" "$fact"
         found_any=true
         start_section_spinner "Scanning large files..."
     }
 
-    # Pass "date" as $4 on rows where staleness decides the action. Rows left
-    # without it stay two fields wide.
+    # Pass a _large_dir_fact kind as $4 ("date" on rows where staleness
+    # decides the action). Pass "exact" as $5 to drop the row instead of
+    # showing a total that skipped unreadable entries.
     _report_large_review_dir() {
         local label="$1"
         local path="$2"
         local probe_timeout="${3:-}"
-        local want_date="${4:-}"
+        local fact_kind="${4:-}"
+        local exact="${5:-}"
         [[ -d "$path" ]] || return 0
-        local size_kb=""
-        size_kb=$(_large_candidate_size_kb "$path" "$probe_timeout") || return 0
+        local size_kb="" size_rc=0
+        size_kb=$(_large_candidate_size_kb "$path" "$probe_timeout" "$exact") || size_rc=$?
+        if [[ $size_rc -ge 128 ]]; then
+            return "$size_rc"
+        fi
+        [[ $size_rc -eq 0 ]] || return 0
         [[ "$size_kb" -ge "$threshold_kb" ]] || return 0
         local size_human
         size_human=$(bytes_to_human "$((size_kb * 1024))")
         local detail=""
-        if [[ "$want_date" == "date" ]]; then
-            detail=$(_large_dir_newest_date "$path") || detail=""
+        if [[ -n "$fact_kind" ]]; then
+            detail=$(_large_dir_fact "$fact_kind" "$path") || detail=""
         fi
         _report_large_review_row "$label" "$size_human" "$path" "$detail"
+    }
+
+    # Review rows never cancel the rest of clean on a size timeout. Signals
+    # still stop the function so Ctrl-C stays sticky.
+    _report_large_or_stop() {
+        _report_large_review_dir "$@" || {
+            local review_rc=$?
+            _mole_record_clean_cancellation "$review_rc"
+            stop_section_spinner
+            return "$review_rc"
+        }
     }
 
     # The du probes below (Mail, backups, package stores) take seconds in
     # total; keep loading feedback on screen between rows.
     start_section_spinner "Scanning large files..."
 
-    local mail_dir="$HOME/Library/Mail"
-    if [[ -d "$mail_dir" ]]; then
-        local mail_kb
-        size_rc=0
-        mail_kb=$(get_path_size_kb "$mail_dir") || size_rc=$?
-        if [[ $size_rc -ne 0 ]]; then
-            _mole_record_clean_cancellation "$size_rc"
-            stop_section_spinner
-            return "$size_rc"
-        fi
-        if [[ "$mail_kb" -ge "$threshold_kb" ]]; then
-            local mail_human
-            mail_human=$(bytes_to_human "$((mail_kb * 1024))")
-            _report_large_review_row "Mail data" "$mail_human" "$mail_dir"
-        fi
-    fi
+    _report_large_or_stop "Mail data" "$HOME/Library/Mail" || return $?
+    _report_large_or_stop "Mail downloads" "$HOME/Library/Mail Downloads" || return $?
 
-    local mail_downloads="$HOME/Library/Mail Downloads"
-    if [[ -d "$mail_downloads" ]]; then
-        local downloads_kb
-        size_rc=0
-        downloads_kb=$(get_path_size_kb "$mail_downloads") || size_rc=$?
-        if [[ $size_rc -ne 0 ]]; then
-            _mole_record_clean_cancellation "$size_rc"
-            stop_section_spinner
-            return "$size_rc"
-        fi
-        if [[ "$downloads_kb" -ge "$threshold_kb" ]]; then
-            local downloads_human
-            downloads_human=$(bytes_to_human "$((downloads_kb * 1024))")
-            _report_large_review_row "Mail downloads" "$downloads_human" "$mail_downloads"
-        fi
-    fi
+    # Conductor workspaces and archived chats are authored state, not caches.
+    # Report occupied space only; age or a missing worktree registration does
+    # not establish that local changes, commits, or context are disposable.
+    _report_large_or_stop "Conductor workspaces" "$HOME/Conductor/workspaces" || return $?
+    _report_large_or_stop "Conductor archived contexts" "$HOME/Conductor/archived-contexts" || return $?
 
     local installer_path
     for installer_path in /Applications/Install\ macOS*.app; do
@@ -2655,10 +3624,14 @@ check_large_file_candidates() {
             local installer_kb
             size_rc=0
             installer_kb=$(get_path_size_kb "$installer_path") || size_rc=$?
-            if [[ $size_rc -ne 0 ]]; then
+            if [[ $size_rc -ge 128 ]]; then
                 _mole_record_clean_cancellation "$size_rc"
                 stop_section_spinner
                 return "$size_rc"
+            fi
+            if [[ $size_rc -ne 0 ]]; then
+                debug_log "Large files: skip macOS installer (sizing rc=$size_rc)"
+                continue
             fi
             if [[ "$installer_kb" -gt 0 ]]; then
                 local installer_human
@@ -2668,22 +3641,7 @@ check_large_file_candidates() {
         fi
     done
 
-    local updates_dir="$HOME/Library/Updates"
-    if [[ -d "$updates_dir" ]]; then
-        local updates_kb
-        size_rc=0
-        updates_kb=$(get_path_size_kb "$updates_dir") || size_rc=$?
-        if [[ $size_rc -ne 0 ]]; then
-            _mole_record_clean_cancellation "$size_rc"
-            stop_section_spinner
-            return "$size_rc"
-        fi
-        if [[ "$updates_kb" -ge "$threshold_kb" ]]; then
-            local updates_human
-            updates_human=$(bytes_to_human "$((updates_kb * 1024))")
-            _report_large_review_row "macOS updates cache" "$updates_human" "$updates_dir"
-        fi
-    fi
+    _report_large_or_stop "macOS updates cache" "$HOME/Library/Updates" || return $?
 
     if [[ "${SYSTEM_CLEAN:-false}" != "true" ]] && command -v tmutil > /dev/null 2>&1 &&
         defaults read /Library/Preferences/com.apple.TimeMachine AutoBackup 2> /dev/null | grep -qE '^[01]$'; then
@@ -2693,7 +3651,7 @@ check_large_file_candidates() {
             snapshot_count=$(echo "$snapshot_list" | { grep -Eo 'com\.apple\.TimeMachine\.[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}' || true; } | wc -l | awk '{print $1}')
             if [[ "$snapshot_count" =~ ^[0-9]+$ && "$snapshot_count" -gt 0 ]]; then
                 stop_section_spinner
-                echo -e "  ${YELLOW}${ICON_REVIEW}${NC} Time Machine local snapshots · ${GREEN}${snapshot_count}${NC}"
+                mole_review_row "Time Machine local snapshots" "" "$snapshot_count" "macOS removes them when space runs low"
                 found_any=true
                 start_section_spinner "Scanning large files..."
             fi
@@ -2703,16 +3661,18 @@ check_large_file_candidates() {
     local docker_reported=false
     if command -v docker > /dev/null 2>&1; then
         local docker_output
-        docker_output=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2> /dev/null || true)
+        # The counts go last: tab is IFS whitespace, so an empty trailing
+        # field cannot shift Size or Reclaimable out of place.
+        docker_output=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}\t{{.TotalCount}}\t{{.Active}}' 2> /dev/null || true)
         if [[ -n "$docker_output" ]]; then
             local docker_detail=""
-            while IFS=$'\t' read -r dtype dsize dreclaim; do
+            while IFS=$'\t' read -r dtype dsize dreclaim dtotal dactive; do
                 [[ -z "$dtype" ]] && continue
-                docker_detail+="${docker_detail:+ · }${dtype} ${dsize} (${dreclaim} reclaimable)"
+                docker_detail+="${docker_detail:+ · }$(docker_df_review_segment "$dtype" "$dsize" "$dreclaim" "$dtotal" "$dactive")"
             done <<< "$docker_output"
             if [[ -n "$docker_detail" ]]; then
                 stop_section_spinner
-                echo -e "  ${YELLOW}${ICON_REVIEW}${NC} Docker storage · ${GRAY}${docker_detail}${NC}"
+                mole_review_row "Docker storage" "" "" "$docker_detail"
                 found_any=true
                 docker_reported=true
                 start_section_spinner "Scanning large files..."
@@ -2729,35 +3689,109 @@ check_large_file_candidates() {
         fi
     fi
 
-    _report_large_review_dir "Xcode DerivedData" "$HOME/Library/Developer/Xcode/DerivedData"
+    # Developer tools already cleaned or previewed every DerivedData project
+    # this run, so a second row here would count the same bytes twice.
+    if [[ "${_MOLE_DERIVED_DATA_COVERED:-false}" != "true" ]]; then
+        _report_large_or_stop "Xcode DerivedData" "$HOME/Library/Developer/Xcode/DerivedData" "" projects || return $?
+    fi
     # Archives hold the dSYMs that symbolicate crashes from shipped builds, so
-    # the newest date separates the releases still worth keeping from repeated
-    # export attempts left behind on one afternoon.
-    _report_large_review_dir "Xcode archives" "$HOME/Library/Developer/Xcode/Archives" "" "date"
-    _report_large_review_dir "Simulator data" "$HOME/Library/Developer/CoreSimulator/Devices"
+    # the build count and month range separate releases still worth keeping
+    # from repeated export attempts left behind on one afternoon.
+    _report_large_or_stop "Xcode archives" "$HOME/Library/Developer/Xcode/Archives" "" archives || return $?
+    _report_large_or_stop "Simulator data" "$HOME/Library/Developer/CoreSimulator/Devices" "" simulators || return $?
     if [[ "$docker_reported" != "true" ]]; then
-        _report_large_review_dir "Docker Desktop data" "$HOME/Library/Containers/com.docker.docker/Data"
+        _report_large_or_stop "Docker Desktop data" "$HOME/Library/Containers/com.docker.docker/Data" || return $?
     fi
     # Device backups reach 100GB+ with millions of small files; the default
     # 3s du budget times out cold and silently drops the most valuable row,
     # so give this probe the hint-scan budget instead.
-    _report_large_review_dir "iOS backups" "$HOME/Library/Application Support/MobileSync/Backup" "$MOLE_TIMEOUT_HINT_SCAN_SEC" "date"
-    _report_large_review_dir "LM Studio models" "$HOME/.lmstudio/models"
+    _report_large_or_stop "iOS backups" "$HOME/Library/Application Support/MobileSync/Backup" "$MOLE_TIMEOUT_HINT_SCAN_SEC" "date" || return $?
+    _report_large_or_stop "LM Studio models" "$HOME/.lmstudio/models" || return $?
     local orbstack_data
     for orbstack_data in "$HOME"/Library/Group\ Containers/*dev.orbstack/data "$HOME/OrbStack"; do
-        _report_large_review_dir "OrbStack data" "$orbstack_data"
+        _report_large_or_stop "OrbStack data" "$orbstack_data" || return $?
     done
-    _report_large_review_dir "Lima data" "$HOME/.lima"
-    _report_large_review_dir "Maven local repository" "$HOME/.m2/repository"
-    _report_large_review_dir "Ivy local repository" "$HOME/.ivy2/cache"
-    _report_large_review_dir "NuGet packages" "$HOME/.nuget/packages"
+    _report_large_or_stop "Lima data" "$HOME/.lima" || return $?
+    _report_large_or_stop "Maven local repository" "$HOME/.m2/repository" || return $?
+    _report_large_or_stop "Ivy local repository" "$HOME/.ivy2/cache" || return $?
+    _report_large_or_stop "NuGet packages" "$HOME/.nuget/packages" || return $?
     local deno_module_cache=""
     if deno_module_cache=$(mole_deno_cache_root 2> /dev/null); then
-        _report_large_review_dir "Deno module cache" "$deno_module_cache"
+        _report_large_or_stop "Deno module cache" "$deno_module_cache" || return $?
     fi
-    _report_large_review_dir "pnpm store" "$HOME/Library/pnpm/store"
-    _report_large_review_dir "Conda packages" "$HOME/.conda/pkgs"
-    _report_large_review_dir "Anaconda packages" "$HOME/anaconda3/pkgs"
+    _report_large_or_stop "pnpm store" "$HOME/Library/pnpm/store" "" stores || return $?
+    _report_large_or_stop "Conda packages" "$HOME/.conda/pkgs" || return $?
+    _report_large_or_stop "Anaconda packages" "$HOME/anaconda3/pkgs" || return $?
+    # ~/.gradle/caches holds modules-2, the dependency store builds resolve
+    # from, so it is surfaced for review like ~/.m2 rather than deleted. The
+    # row measures the whole folder, including the build-cache slices that
+    # clean_dev_jvm resets.
+    _report_large_or_stop "Gradle caches" "$HOME/.gradle/caches" || return $?
+
+    # E5RT caches stay protected. This row measures occupied space only;
+    # neither the current build nor older build subdirectories are deleted.
+    # Bound the complete listing and all measurements with one shared budget.
+    local cache_root="$HOME/Library/Caches"
+    local compiled_list=""
+    # Without a scratch listing only this row is skipped; the remaining rows
+    # and the section's activity still follow.
+    if [[ -d "$cache_root" && ! -L "$cache_root" ]] && compiled_list=$(create_temp_file); then
+        local compiled_rc=0 compiled_path compiled_owner compiled_timeout
+        local compiled_deadline=$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))
+        run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" find "$cache_root" -mindepth 1 -maxdepth 2 \
+            \( -name '.*' -prune \) -o \
+            \( -type d -name 'com.apple.e5rt.e5bundlecache' -print0 \) \
+            > "$compiled_list" 2> /dev/null < /dev/null || compiled_rc=$?
+        if [[ $compiled_rc -eq 0 ]]; then
+            while IFS= read -r -d '' compiled_path; do
+                [[ -d "$compiled_path" && ! -L "$compiled_path" && ! -L "${compiled_path%/*}" ]] || continue
+                compiled_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$compiled_deadline") || break
+                compiled_owner="${compiled_path%/*}"
+                _report_large_or_stop "Compiled model cache (${compiled_owner##*/})" "$compiled_path" "$compiled_timeout" "" exact || {
+                    compiled_rc=$?
+                    break
+                }
+            done < "$compiled_list"
+        else
+            debug_log "Compiled model cache listing incomplete (status $compiled_rc); review skipped"
+        fi
+        rm -f "$compiled_list" # SAFE: exact mktemp-created compiled cache listing
+        if [[ $compiled_rc -ge 128 ]]; then
+            _mole_record_clean_cancellation "$compiled_rc"
+            stop_section_spinner
+            return "$compiled_rc"
+        fi
+    fi
+
+    # Emulator images, SDK system images, downloaded models, and installed
+    # runtimes are user-chosen payloads, not caches. Size is shown so the
+    # owner tool (Device Manager, SDK Manager, huggingface-cli, mise, fvm) can
+    # remove what is unused; Mole never deletes them.
+    local android_avd_root="$HOME/.android/avd"
+    [[ "${ANDROID_AVD_HOME:-}" == /* ]] && android_avd_root="$ANDROID_AVD_HOME"
+    _report_large_or_stop "Android emulators" "$android_avd_root" "" "date" || return $?
+    local android_sdk_root="$HOME/Library/Android/sdk"
+    if [[ "${ANDROID_HOME:-}" == /* ]]; then
+        android_sdk_root="$ANDROID_HOME"
+    elif [[ "${ANDROID_SDK_ROOT:-}" == /* ]]; then
+        android_sdk_root="$ANDROID_SDK_ROOT"
+    fi
+    _report_large_or_stop "Android system images" "$android_sdk_root/system-images" || return $?
+    local hf_root="$HOME/.cache/huggingface"
+    [[ "${HF_HOME:-}" == /* ]] && hf_root="$HF_HOME"
+    _report_large_or_stop "Hugging Face cache" "$hf_root" || return $?
+    local mise_installs="$HOME/.local/share/mise/installs"
+    [[ "${MISE_DATA_DIR:-}" == /* ]] && mise_installs="$MISE_DATA_DIR/installs"
+    local mise_tool_dir
+    for mise_tool_dir in "$mise_installs"/*; do
+        [[ -d "$mise_tool_dir" && ! -L "$mise_tool_dir" ]] || continue
+        _report_large_or_stop "mise ${mise_tool_dir##*/} installs" "$mise_tool_dir" || return $?
+    done
+    # FVM keeps one full Flutter SDK per installed version; `fvm list` shows
+    # which ones projects still pin and `fvm remove` owns removal.
+    local fvm_versions="$HOME/fvm/versions"
+    [[ "${FVM_CACHE_PATH:-}" == /* ]] && fvm_versions="$FVM_CACHE_PATH/versions"
+    _report_large_or_stop "FVM Flutter SDKs" "$fvm_versions" || return $?
 
     # JetBrains keeps one data dir per IDE version (GoLand2025.1, ...). After
     # an upgrade the previous version's dir lingers forever with plugins and
@@ -2768,14 +3802,15 @@ check_large_file_candidates() {
     local jb_stale
     while IFS= read -r jb_stale; do
         [[ -n "$jb_stale" ]] || continue
-        _report_large_review_dir "JetBrains old version data" "$jetbrains_support/$jb_stale"
+        _report_large_or_stop "JetBrains old version data" "$jetbrains_support/$jb_stale" || return $?
     done < <(jetbrains_stale_version_dirs "$jetbrains_support")
 
-    report_agent_worktree_candidates
+    _large_prefetch_worktree_wait
+    report_agent_worktree_candidates "$_lp_worktree_listing"
 
     stop_section_spinner
 
-    unset -f _large_candidate_size_kb _large_dir_newest_date _report_large_review_dir _report_large_review_row
+    unset -f _large_candidate_size_kb _large_dir_newest_date _report_large_review_dir _report_large_review_row _report_large_or_stop
 
     # Only mark activity when something was reported so an empty section can
     # collapse instead of printing a reassurance row.

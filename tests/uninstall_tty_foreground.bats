@@ -1,16 +1,16 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-	export PROJECT_ROOT
+	mole_test_setup_project_root
 }
 
 @test "tty ownership helper distinguishes foreground and background processes" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect || ! -x /usr/bin/perl ]]; then
-		skip "macOS expect/perl required"
-	fi
-
-	run /usr/bin/expect "$PROJECT_ROOT/tests/uninstall_tty_foreground.exp" "$PROJECT_ROOT"
+	run /bin/bash -euo pipefail -c '
+        python3 -B "$1/tests/support/owned_pty.py" foreground "$1/tests/uninstall_tty_foreground_fixture.sh" "$1"
+        python3 -B "$1/tests/support/owned_pty.py" foreground "$1/tests/uninstall_tty_foreground_fixture.sh" "$1" background
+    ' _ "$PROJECT_ROOT"
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"TTY-STATE:foreground"* ]] || return 1

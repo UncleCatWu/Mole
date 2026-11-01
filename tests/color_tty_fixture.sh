@@ -3,7 +3,7 @@
 #
 # Sources lib/core/base.sh and prints the green/reset pair between markers, so
 # the bats caller can assert whether ANSI escapes were emitted. Run under a pty
-# by tests/color_tty.exp, stdout is a terminal; run directly, it is not.
+# by tests/support/tty_fixture.py, stdout is the exact owned terminal endpoint.
 #
 # Args: PROJECT_ROOT
 

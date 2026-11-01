@@ -1,5 +1,7 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup() {
     PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
     export PROJECT_ROOT
@@ -82,6 +84,65 @@ setup() {
     [[ $exit_code -eq 124 ]]
 }
 
+@test "run_with_timeout: timeout backend kills a command that ignores TERM (#1787)" {
+    if ! command -v gtimeout >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1; then
+        skip "gtimeout/timeout not available"
+    fi
+
+    start_time=$(date +%s)
+    set +e
+    /bin/bash -c "
+        set +e
+        source '$PROJECT_ROOT/lib/core/timeout.sh'
+        run_with_timeout 1 perl -e '\$SIG{TERM} = \"IGNORE\"; sleep 10'
+        exit \$?
+    "
+    exit_code=$?
+    set -e
+    duration=$(($(date +%s) - start_time))
+    [[ $exit_code -eq 124 ]] || return 1
+    [[ $duration -lt 7 ]]
+}
+
+@test "run_with_timeout: an early SIGKILL is not reported as a timeout" {
+    if ! command -v gtimeout >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1; then
+        skip "gtimeout/timeout not available"
+    fi
+
+    set +e
+    /bin/bash -c "
+        set +e
+        source '$PROJECT_ROOT/lib/core/timeout.sh'
+        run_with_timeout 5 perl -e 'kill 9, \$\$'
+        exit \$?
+    "
+    exit_code=$?
+    set -e
+    [[ $exit_code -eq 137 ]]
+}
+
+@test "run_with_timeout: fractional deadlines preserve an early SIGKILL" {
+    if ! command -v gtimeout >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1; then
+        skip "gtimeout/timeout not available"
+    fi
+
+    # Both a sub-second budget and a kill after its whole-second portion must
+    # retain the signal status rather than looking like timeout escalation.
+    run /bin/bash -c 'source "$1/lib/core/timeout.sh"; run_with_timeout 0.4 /bin/bash -c '\''kill -9 $$'\''' bash "$PROJECT_ROOT"
+    [[ $status -eq 137 ]] || return 1
+    run /bin/bash -c 'source "$1/lib/core/timeout.sh"; run_with_timeout 1.9 /bin/bash -c '\''sleep 1.1; kill -9 $$'\''' bash "$PROJECT_ROOT"
+    [[ $status -eq 137 ]]
+}
+
+@test "run_with_timeout: fractional deadlines still classify forced timeout escalation" {
+    if ! command -v gtimeout >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1; then
+        skip "gtimeout/timeout not available"
+    fi
+
+    run /bin/bash -c 'source "$1/lib/core/timeout.sh"; run_with_timeout 0.4 /bin/bash -c '\''trap "" TERM; sleep 10'\''' bash "$PROJECT_ROOT"
+    [[ $status -eq 124 ]]
+}
+
 @test "run_with_timeout: kills long-running command" {
     start_time=$(date +%s)
     set +e
@@ -148,13 +209,18 @@ setup() {
 }
 
 @test "run_with_timeout: debug logging when MO_DEBUG=1" {
-    output=$(/bin/bash -c "
-        set -euo pipefail
-        export MO_DEBUG=1
-        source '$PROJECT_ROOT/lib/core/timeout.sh'
-        run_with_timeout 5 echo 'test' 2>&1
-    ")
-    [[ "$output" =~ TIMEOUT ]]
+    # On a terminal the notice is still printed; captured output is covered by
+    # "run_with_timeout keeps its debug notice out of captured command output".
+    local fixture="$BATS_TEST_TMPDIR/timeout-debug.sh"
+    cat > "$fixture" <<EOF
+set -euo pipefail
+export MO_DEBUG=1
+source "$PROJECT_ROOT/lib/core/timeout.sh"
+run_with_timeout 5 echo test
+EOF
+    output=$(python3 "$PROJECT_ROOT/tests/support/owned_pty.py" run "$fixture")
+    # The per-call notice, not the one-time backend line printed at source.
+    [[ "$output" =~ \[TIMEOUT\]\ (Running\ with\ 5s\ timeout|Perl\ fallback,\ 5s|Shell\ fallback,\ 5s):\ echo\ test ]] || return 1
 }
 
 @test "run_with_timeout: no debug logging when MO_DEBUG=0" {
@@ -224,18 +290,21 @@ setup() {
     [[ $duration -lt 7 ]]
 }
 
-@test "run_with_timeout: perl fallback cleans child when its caller dies" {
+_assert_perl_owner_death() {
     if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
         skip "macOS perl required"
     fi
 
-    local child_pid_file="$BATS_TEST_TMPDIR/timeout-child.pid"
+    local death_signal="$1"
+    local child_pid_file="$BATS_TEST_TMPDIR/timeout-child-$death_signal.pid"
+    local perl_pid_file="$BATS_TEST_TMPDIR/timeout-perl-$death_signal.pid"
     local caller_pid=""
     local perl_pid=""
     local child_pid=""
+    local perl_ppid="" child_ppid="" caller_status=0
 
     /bin/bash "$PROJECT_ROOT/tests/timeout_parent_death_fixture.sh" \
-        "$PROJECT_ROOT" "$child_pid_file" > /dev/null 2>&1 &
+        "$PROJECT_ROOT" "$child_pid_file" "$perl_pid_file" > /dev/null 2>&1 &
     caller_pid=$!
 
     for _ in {1..50}; do
@@ -247,14 +316,17 @@ setup() {
         return 1
     }
 
-    child_pid=$(cat "$child_pid_file")
-    perl_pid=$(pgrep -P "$caller_pid" -x perl 2> /dev/null | head -1 || true)
+    read -r child_pid child_ppid < "$child_pid_file"
+    # The exec-only fixture launcher records its actual Perl PID; process-list
+    # discovery is unavailable under the private kernel policy.
+    read -r perl_pid perl_ppid < "$perl_pid_file"
     [[ "$child_pid" =~ ^[0-9]+$ && "$perl_pid" =~ ^[0-9]+$ ]] || {
         kill -KILL "$caller_pid" "$child_pid" 2> /dev/null || true
         return 1
     }
+    [[ "$perl_ppid" == "$caller_pid" && "$child_ppid" == "$perl_pid" ]] || return 1
 
-    kill -TERM "$caller_pid"
+    kill -"$death_signal" "$caller_pid"
     for _ in {1..50}; do
         if ! kill -0 "$perl_pid" 2> /dev/null && ! kill -0 "$child_pid" 2> /dev/null; then
             break
@@ -268,9 +340,16 @@ setup() {
         kill -KILL "$perl_pid" "$child_pid" 2> /dev/null || true
     fi
     kill -KILL "$caller_pid" 2> /dev/null || true
-    wait "$caller_pid" 2> /dev/null || true
+    wait "$caller_pid" 2> /dev/null || caller_status=$?
 
-    [ "$leaked" -eq 0 ]
+    [ "$leaked" -eq 0 ] || return 1
+    [ "$caller_status" -eq 143 ] || return 1
+    printf 'CALLER_SIGNAL=%s CALLER_PID=%s PERL_PID=%s TIMED_CHILD_PID=%s PPID_CHAIN=bound DESCENDANTS=gone\n' \
+        "$death_signal" "$caller_pid" "$perl_pid" "$child_pid"
+}
+
+@test "run_with_timeout: perl fallback cleans child when its caller dies" {
+    _assert_perl_owner_death TERM
 }
 
 # setsid() in the perl fallback strips the controlling terminal, which breaks
@@ -287,22 +366,22 @@ setup() {
 }
 
 @test "run_with_timeout: perl fallback keeps tty reads in foreground (#1201)" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect || ! -x /usr/bin/perl ]]; then
-		skip "macOS expect/perl required"
+	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
+		skip "macOS perl required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/timeout_tty_read.exp" "$PROJECT_ROOT"
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" read
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"READ:typed-value"* ]]
 }
 
 @test "run_with_timeout: perl fallback restores tty after timeout (#1201)" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect || ! -x /usr/bin/perl ]]; then
-		skip "macOS expect/perl required"
+	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
+		skip "macOS perl required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/timeout_tty_restore.exp" "$PROJECT_ROOT"
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" restore
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"TIMEOUT:124"* ]] || return 1
@@ -323,11 +402,11 @@ _tty_bg_field() {
 }
 
 @test "run_with_timeout: perl fallback hands tty to child when stdin is a tty (#1201/#1222)" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect || ! -x /usr/bin/perl ]]; then
-		skip "macOS expect/perl required"
+	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
+		skip "macOS perl required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/timeout_tty_background.exp" "$PROJECT_ROOT" tty
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" background tty
 
 	[ "$status" -eq 0 ] || return 1
 	local child fg caller
@@ -341,11 +420,11 @@ _tty_bg_field() {
 }
 
 @test "run_with_timeout: perl fallback keeps tty with caller when stdin is /dev/null (#1222)" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect || ! -x /usr/bin/perl ]]; then
-		skip "macOS expect/perl required"
+	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
+		skip "macOS perl required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/timeout_tty_background.exp" "$PROJECT_ROOT" devnull
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" background devnull
 
 	[ "$status" -eq 0 ] || return 1
 	local child fg caller
@@ -368,10 +447,16 @@ _tty_bg_field() {
 	# Parallel scan workers.
 	run grep -nE 'process_app_metadata[[:space:]].*<[[:space:]]*/dev/null[[:space:]]*&[[:space:]]*$' "$PROJECT_ROOT/bin/uninstall.sh"
 	[ "$status" -eq 0 ] || return 1
-	# Post-uninstall work: Homebrew autoremove and LaunchServices/Dock refresh.
-	run grep -cE '^[[:space:]]*\)[[:space:]]*>[[:space:]]*/dev/null[[:space:]]+2>&1[[:space:]]+<[[:space:]]*/dev/null[[:space:]]*&[[:space:]]*$' "$PROJECT_ROOT/lib/uninstall/batch.sh"
+	# The remaining post-uninstall timeout family is LaunchServices/Dock;
+	# dependency autoremove was removed from uninstall's authorization scope.
+	run awk '
+        /^[[:space:]]*#/ { next }
+        /refresh_launch_services_after_uninstall > \/dev\/null/ { in_worker = 1; remaining = 8 }
+        in_worker && /\) > \/dev\/null 2>&1 < \/dev\/null &/ { found = 1; exit }
+        in_worker && --remaining <= 0 { exit }
+        END { exit(found ? 0 : 1) }
+    ' "$PROJECT_ROOT/lib/uninstall/batch.sh"
 	[ "$status" -eq 0 ] || return 1
-	[ "$output" -ge 2 ] || return 1
 }
 
 @test "run_with_timeout: shell fallback preserves caller INT trap" {
@@ -388,23 +473,10 @@ _tty_bg_field() {
 }
 
 @test "run_with_timeout: shell fallback cleans up watchdog sleep" {
-    /bin/bash -c "
-        set -euo pipefail
-        source '$PROJECT_ROOT/lib/core/timeout.sh'
-        MO_TIMEOUT_BIN=''
-        MO_TIMEOUT_PERL_BIN=''
-        run_with_timeout 287 true
-        sleep 0.1
-        leaked=''
-        for pid in \$(pgrep -x sleep 2>/dev/null || true); do
-            command_line=\$(ps -p \"\$pid\" -o command= 2>/dev/null || true)
-            if [[ \"\$command_line\" == 'sleep 287' ]]; then
-                leaked=\"\$pid\"
-                kill \"\$pid\" 2>/dev/null || true
-            fi
-        done
-        [[ -z \"\$leaked\" ]] || return 1
-    "
+    run /bin/bash "$PROJECT_ROOT/tests/support/timeout_watchdog_fixture.sh" \
+        "$PROJECT_ROOT" "$BATS_TEST_TMPDIR/watchdog"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WATCHDOG_CLEANUP=production-kill"* && "$output" == *"CHILD=gone UNKNOWN_ARGS=2"* ]] || return 1
 }
 
 # A directory-sizing `du` on a stalled network mount or a huge tree wedges the
@@ -429,4 +501,175 @@ _tty_bg_field() {
         echo "$unbounded" >&2
         return 1
     fi
+}
+
+@test "timeout status predicates name the two questions callers ask" {
+    run /bin/bash --noprofile --norc -c '
+        set -euo pipefail
+        source "$1/lib/core/timeout.sh"
+        for rc in 0 1 2 123 124 125 127 128 130 143 ""; do
+            a=no
+            b=no
+            mole_rc_timeout "$rc" && a=yes
+            mole_rc_timeout_or_signal "$rc" && b=yes
+            printf "%s:%s:%s " "${rc:-empty}" "$a" "$b"
+        done
+    ' _ "${BATS_TEST_DIRNAME}/.."
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "0:no:no 1:no:no 2:no:no 123:no:no 124:yes:yes 125:no:no 127:no:no 128:no:yes 130:no:yes 143:no:yes empty:no:no " ]]
+}
+
+@test "mole_rc_signal accepts only statuses that name a real signal" {
+    # An owner command may exit with an errno-derived status above 127 (npm's
+    # 243, for one). That is an ordinary failure, and a timeout is not a signal.
+    run /bin/bash --noprofile --norc -c '
+        set -euo pipefail
+        source "$1/lib/core/timeout.sh"
+        for rc in 0 1 124 127 128 129 130 143 159 160 192 243 255 ""; do
+            a=no
+            mole_rc_signal "$rc" && a=yes
+            printf "%s:%s " "${rc:-empty}" "$a"
+        done
+    ' _ "${BATS_TEST_DIRNAME}/.."
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "0:no 1:no 124:no 127:no 128:no 129:yes 130:yes 143:yes 159:yes 160:no 192:no 243:no 255:no empty:no " ]]
+}
+
+@test "run_with_timeout keeps its debug notice out of captured command output" {
+    # Callers parse `$(run_with_timeout ... cmd 2>&1)`; under --debug the
+    # wrapper's own notice used to arrive inside that capture, and purge read
+    # it as an lsof warning.
+    mkdir -p "$HOME/fake-timeout"
+    cat > "$HOME/fake-timeout/timeout" <<'SCRIPT'
+#!/bin/bash
+shift 3
+exec "$@"
+SCRIPT
+    chmod +x "$HOME/fake-timeout/timeout"
+    run env HOME="$HOME" PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." MO_DEBUG=1 FAKE_TIMEOUT="$HOME/fake-timeout/timeout" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+for backend in binary perl shell; do
+    case "$backend" in
+        binary) MO_TIMEOUT_BIN="$FAKE_TIMEOUT" MO_TIMEOUT_PERL_BIN="" ;;
+        perl) MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN="$(command -v perl)" ;;
+        shell) MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN="" ;;
+    esac
+    : > "$DEBUG_LOG_FILE"
+    out=$(run_with_timeout 5 /bin/sh -c 'echo OUT; echo ERR >&2' 2>&1)
+    [[ "$out" == $'OUT\nERR' ]] || { printf 'CAPTURED:%s:%s\n' "$backend" "$out"; exit 1; }
+    grep -q '^\[TIMEOUT\] ' "$DEBUG_LOG_FILE" || { echo "NOT_LOGGED:$backend"; exit 1; }
+    # An unwritable debug log must not put its write error in the capture.
+    chmod 444 "$DEBUG_LOG_FILE"
+    out=$(run_with_timeout 5 /bin/sh -c 'echo OUT' 2>&1)
+    chmod 644 "$DEBUG_LOG_FILE"
+    [[ "$out" == OUT ]] || { printf 'UNWRITABLE:%s:%s\n' "$backend" "$out"; exit 1; }
+done
+echo CLEAN
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *CLEAN* ]] || { echo "$output"; return 1; }
+}
+
+@test "run_with_timeout shell fallback stops the command when interrupted" {
+    # A background command ignores SIGINT without job control, so forwarding
+    # INT left it running with no deadline after Ctrl-C. The double case runs
+    # under an exiting caller trap like bin/clean.sh's and presses Ctrl-C again
+    # inside the grace period, which used to skip the KILL.
+    cat > "$HOME/interrupt.sh" <<'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN=""
+rc_file="$1"
+caller_trap="$2"
+shift 2
+[[ "$caller_trap" == exit ]] && trap 'exit 130' INT
+rc=0
+run_with_timeout 40 "$@" || rc=$?
+echo "$rc" > "$rc_file"
+EOF
+    local mode pid_file rc_file runner_pid cmd_pid ticks caller_trap
+    for mode in plain ignores-term double-interrupt; do
+        pid_file="$HOME/cmd-$mode.pid"
+        rc_file="$HOME/cmd-$mode.rc"
+        rm -f "$pid_file" "$rc_file" # SAFE: test-owned scratch files
+        caller_trap=none
+        [[ "$mode" == double-interrupt ]] && caller_trap="exit"
+        if [[ "$mode" == plain ]]; then
+            # shellcheck disable=SC2016 # $$ and $1 belong to the inner sh.
+            /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' \
+                env PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." /bin/bash "$HOME/interrupt.sh" "$rc_file" "$caller_trap" \
+                /bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 39' sh "$pid_file" > /dev/null 2>&1 3>&- &
+        else
+            # shellcheck disable=SC2016 # Perl variables, not Bash.
+            /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' \
+                env PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." /bin/bash "$HOME/interrupt.sh" "$rc_file" "$caller_trap" \
+                /usr/bin/perl -e 'open(my $f, ">", $ARGV[0]) or die; print $f $$; close $f; $SIG{TERM} = "IGNORE"; sleep 39' "$pid_file" > /dev/null 2>&1 3>&- &
+        fi
+        runner_pid=$!
+        ticks=0
+        while [[ ! -s "$pid_file" && $ticks -lt 50 ]]; do
+            sleep 0.1
+            ticks=$((ticks + 1))
+        done
+        cmd_pid=$(cat "$pid_file")
+        [[ "$cmd_pid" =~ ^[0-9]+$ ]] || { echo "NO_PID:$mode"; return 1; }
+        kill -INT "$runner_pid"
+        if [[ "$mode" == double-interrupt ]]; then
+            sleep 0.5
+            kill -INT "$runner_pid" 2> /dev/null || true
+        fi
+        ticks=0
+        while kill -0 "$cmd_pid" 2> /dev/null && [[ $ticks -lt 40 ]]; do
+            sleep 0.1
+            ticks=$((ticks + 1))
+        done
+        if kill -0 "$cmd_pid" 2> /dev/null; then
+            kill -KILL "$cmd_pid" 2> /dev/null || true
+            echo "ORPHANED:$mode"
+            return 1
+        fi
+        wait "$runner_pid" 2> /dev/null || true
+        [[ "$(cat "$rc_file" 2> /dev/null)" == 130 ]] || { echo "RC:$mode:$(cat "$rc_file" 2> /dev/null)"; return 1; }
+    done
+}
+
+@test "run_with_timeout passes the caller's stdin through every backend" {
+    # The simulator metadata check feeds awk and the Finder and login item
+    # paths feed osascript through stdin; the shell backend used to hand them
+    # /dev/null, which read every simulator as running.
+    mkdir -p "$HOME/fake-timeout"
+    cat > "$HOME/fake-timeout/timeout" <<'SCRIPT'
+#!/bin/bash
+shift 3
+exec "$@"
+SCRIPT
+    chmod +x "$HOME/fake-timeout/timeout"
+    run env HOME="$HOME" PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." FAKE_TIMEOUT="$HOME/fake-timeout/timeout" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+for backend in binary perl shell; do
+    case "$backend" in
+        binary) MO_TIMEOUT_BIN="$FAKE_TIMEOUT" MO_TIMEOUT_PERL_BIN="" ;;
+        perl) MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN="$(command -v perl)" ;;
+        shell) MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN="" ;;
+    esac
+    out=$(run_with_timeout 5 /usr/bin/awk '{ print "GOT:" $0 }' <<< "hello")
+    [[ "$out" == "GOT:hello" ]] || { printf 'HERESTRING:%s:%s\n' "$backend" "$out"; exit 1; }
+    out=$(run_with_timeout 5 /bin/cat << 'DOC'
+line one
+line two
+DOC
+    )
+    [[ "$out" == $'line one\nline two' ]] || { printf 'HEREDOC:%s:%s\n' "$backend" "$out"; exit 1; }
+done
+echo CLEAN
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *CLEAN* ]] || { echo "$output"; return 1; }
 }

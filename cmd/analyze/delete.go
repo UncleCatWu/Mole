@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,24 +36,77 @@ const trashTimeout = 30 * time.Second
 // Finder fallback.
 const trashBinary = "/usr/bin/trash"
 
-func deletePathCmd(path string, counter *int64) tea.Cmd {
+var errTrashBinaryUnavailable = errors.New("trash binary unavailable")
+var errTrashFilesystemUnavailable = errors.New("filesystem Trash unavailable")
+var errTrashOutcomeUnknown = errors.New("trash command outcome unknown")
+
+var trashBinaryProbe = func() error {
+	_, err := os.Stat(trashBinary)
+	return err
+}
+
+var trashBinaryRunner = func(ctx context.Context, path string) ([]byte, error) {
+	return exec.CommandContext(ctx, trashBinary, path).CombinedOutput()
+}
+var trashFinderRunner = func(ctx context.Context, script string) ([]byte, error) {
+	return exec.CommandContext(ctx, "osascript", "-e", script).CombinedOutput()
+}
+var trashFilesystemRunner = moveToTrashViaFilesystem
+
+func deleteContext(contexts []context.Context) context.Context {
+	if len(contexts) > 0 && contexts[0] != nil {
+		return contexts[0]
+	}
+	return context.Background()
+}
+
+type deleteRequest struct {
+	id         int64
+	parentPath string
+	ctx        context.Context
+}
+
+func deletePathCmd(path string, counter *int64, audit *deleteAudit, requests ...deleteRequest) tea.Cmd {
+	var request deleteRequest
+	if len(requests) > 0 {
+		request = requests[0]
+	}
 	return func() tea.Msg {
-		count, err := trashPathWithProgress(path, counter)
+		if err := deleteContext([]context.Context{request.ctx}).Err(); err != nil {
+			return deleteProgressMsg{operationID: request.id, parentPath: request.parentPath, done: true, path: path, err: err}
+		}
+		audit.begin()
+		count, err := trashPathWithProgress(path, counter, request.ctx)
+		audit.record(path, err)
+		audit.end()
 		return deleteProgressMsg{
-			done:  true,
-			err:   err,
-			count: count,
-			path:  path,
+			operationID: request.id,
+			parentPath:  request.parentPath,
+			done:        true,
+			err:         err,
+			count:       count,
+			path:        path,
+			logWarning:  audit.warning(),
 		}
 	}
 }
 
 // deleteMultiplePathsCmd moves paths to Trash and aggregates results.
-func deleteMultiplePathsCmd(paths []string, counter *int64) tea.Cmd {
+func deleteMultiplePathsCmd(paths []string, counter *int64, audit *deleteAudit, requests ...deleteRequest) tea.Cmd {
+	var request deleteRequest
+	if len(requests) > 0 {
+		request = requests[0]
+	}
+	ctx := deleteContext([]context.Context{request.ctx})
 	return func() tea.Msg {
 		var totalCount int64
 		var errors []string
 		var removedPaths []string
+		var stopErr error
+		if err := ctx.Err(); err != nil {
+			return deleteProgressMsg{operationID: request.id, parentPath: request.parentPath, done: true, err: err}
+		}
+		audit.begin()
 
 		// Process deeper paths first to avoid parent/child conflicts.
 		pathsToDelete := append([]string(nil), paths...)
@@ -61,7 +115,12 @@ func deleteMultiplePathsCmd(paths []string, counter *int64) tea.Cmd {
 		})
 
 		for _, path := range pathsToDelete {
-			count, err := trashPathWithProgress(path, counter)
+			if err := ctx.Err(); err != nil {
+				stopErr = err
+				break
+			}
+			count, err := trashPathWithProgress(path, counter, request.ctx)
+			audit.record(path, err)
 			totalCount += count
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -69,6 +128,10 @@ func deleteMultiplePathsCmd(paths []string, counter *int64) tea.Cmd {
 					continue
 				}
 				errors = append(errors, err.Error())
+				if isTerminalDeleteError(err) {
+					stopErr = err
+					break
+				}
 				continue
 			}
 			removedPaths = append(removedPaths, path)
@@ -78,13 +141,20 @@ func deleteMultiplePathsCmd(paths []string, counter *int64) tea.Cmd {
 		if len(errors) > 0 {
 			resultErr = &multiDeleteError{errors: errors}
 		}
+		if stopErr != nil {
+			resultErr = stopErr
+		}
+		audit.end()
 
 		return deleteProgressMsg{
+			operationID:  request.id,
+			parentPath:   request.parentPath,
 			done:         true,
 			err:          resultErr,
 			count:        totalCount,
 			path:         "",
 			removedPaths: removedPaths,
+			logWarning:   audit.warning(),
 		}
 	}
 }
@@ -102,7 +172,11 @@ func (e *multiDeleteError) Error() string {
 }
 
 // trashPathWithProgress moves one selected path to Trash and reports completion.
-func trashPathWithProgress(root string, counter *int64) (int64, error) {
+func trashPathWithProgress(root string, counter *int64, contexts ...context.Context) (int64, error) {
+	ctx := deleteContext(contexts)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	// Verify path exists (use Lstat to handle broken symlinks).
 	_, err := os.Lstat(root)
 	if err != nil {
@@ -114,7 +188,7 @@ func trashPathWithProgress(root string, counter *int64) (int64, error) {
 	const count int64 = 1
 
 	// Move through a headless Trash route, with Finder as the last compatibility fallback.
-	if err := moveToTrash(root); err != nil {
+	if err := moveToTrash(root, ctx); err != nil {
 		return 0, err
 	}
 	if counter != nil {
@@ -127,7 +201,11 @@ func trashPathWithProgress(root string, counter *int64) (int64, error) {
 // moveToTrash moves a file/directory to the user Trash. macOS 15+ ships
 // trash(8); older supported systems use an atomic, no-overwrite move into the
 // correct per-volume Trash. Finder is only the final compatibility fallback.
-func moveToTrash(path string) error {
+func moveToTrash(path string, contexts ...context.Context) error {
+	ctx := deleteContext(contexts)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Validate raw input before Abs resolves ".." components away.
 	if err := validateTrashTarget(path); err != nil {
 		return err
@@ -143,33 +221,55 @@ func moveToTrash(path string) error {
 		return err
 	}
 
-	if trashErr := moveToTrashViaBinary(absPath); trashErr == nil {
+	trashErr := moveToTrashViaBinary(absPath, ctx)
+	if trashErr == nil {
 		return nil
 	}
-	if filesystemErr := moveToTrashViaFilesystem(absPath); filesystemErr == nil {
+	// A launched command's failure may mean it moved the item before failing.
+	// Only absence of the binary proves that no first mutation was attempted.
+	if !errors.Is(trashErr, errTrashBinaryUnavailable) {
+		return trashErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	filesystemErr := trashFilesystemRunner(absPath, ctx)
+	if filesystemErr == nil {
 		return nil
+	}
+	if !errors.Is(filesystemErr, errTrashFilesystemUnavailable) {
+		return filesystemErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
-	return moveToTrashViaFinder(absPath)
+	return moveToTrashViaFinder(absPath, ctx)
+}
+
+func isTerminalDeleteError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errTrashOutcomeUnknown)
 }
 
 // moveToTrashViaBinary moves absPath to Trash using trash(8). Returns an error
 // when the binary is missing so callers fall back to Finder.
-func moveToTrashViaBinary(absPath string) error {
-	if _, err := os.Stat(trashBinary); err != nil {
+func moveToTrashViaBinary(absPath string, contexts ...context.Context) error {
+	if err := trashBinaryProbe(); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: %v", errTrashBinaryUnavailable, err)
+		}
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), trashTimeout)
+	ctx, cancel := context.WithTimeout(deleteContext(contexts), trashTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, trashBinary, absPath)
-	output, err := cmd.CombinedOutput()
+	output, err := trashBinaryRunner(ctx, absPath)
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("timeout moving to Trash")
+		if ctx.Err() != nil {
+			return fmt.Errorf("moving to Trash stopped: %w", ctx.Err())
 		}
-		return fmt.Errorf("failed to move to Trash: %s", strings.TrimSpace(string(output)))
+		return fmt.Errorf("%w: %s: %w", errTrashOutcomeUnknown, strings.TrimSpace(string(output)), err)
 	}
 
 	return nil
@@ -178,7 +278,11 @@ func moveToTrashViaBinary(absPath string) error {
 // moveToTrashViaFilesystem provides a headless path for macOS versions before
 // trash(8). It uses renameatx_np(RENAME_EXCL), so a concurrent name collision
 // can never overwrite an existing Trash item.
-func moveToTrashViaFilesystem(absPath string) error {
+func moveToTrashViaFilesystem(absPath string, contexts ...context.Context) error {
+	ctx := deleteContext(contexts)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	trashDir, err := trashDirectoryForPath(absPath)
 	if err != nil {
 		return err
@@ -191,6 +295,9 @@ func moveToTrashViaFilesystem(absPath string) error {
 
 	stamp := time.Now().UnixNano()
 	for attempt := range 100 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		name := base
 		if attempt > 0 {
 			name = fmt.Sprintf("%s.%d.%d.%d", base, stamp, os.Getpid(), attempt)
@@ -201,6 +308,9 @@ func moveToTrashViaFilesystem(absPath string) error {
 			return nil
 		}
 		if err != syscall.EEXIST {
+			if err == syscall.EXDEV || err == syscall.ENOTSUP {
+				return fmt.Errorf("%w: %v", errTrashFilesystemUnavailable, err)
+			}
 			return fmt.Errorf("failed to move to Trash: %w", err)
 		}
 	}
@@ -237,6 +347,9 @@ func trashDirectoryForPath(absPath string) (string, error) {
 	trashRoot := filepath.Join(mountPoint, ".Trashes")
 	rootInfo, err := os.Lstat(trashRoot)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("%w: %v", errTrashFilesystemUnavailable, err)
+		}
 		return "", fmt.Errorf("volume Trash is unavailable: %w", err)
 	}
 	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
@@ -276,23 +389,22 @@ func ensureOwnedTrashDirectory(path string, create bool) error {
 }
 
 // moveToTrashViaFinder remains as a last fallback for unusual volume layouts.
-func moveToTrashViaFinder(absPath string) error {
+func moveToTrashViaFinder(absPath string, contexts ...context.Context) error {
 	// Escape path for AppleScript (handle quotes and backslashes).
 	escapedPath := strings.ReplaceAll(absPath, "\\", "\\\\")
 	escapedPath = strings.ReplaceAll(escapedPath, "\"", "\\\"")
 
 	script := fmt.Sprintf(`tell application "Finder" to delete POSIX file "%s"`, escapedPath)
 
-	ctx, cancel := context.WithTimeout(context.Background(), trashTimeout)
+	ctx, cancel := context.WithTimeout(deleteContext(contexts), trashTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
-	output, err := cmd.CombinedOutput()
+	output, err := trashFinderRunner(ctx, script)
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("timeout moving to Trash")
+		if ctx.Err() != nil {
+			return fmt.Errorf("moving to Trash stopped: %w", ctx.Err())
 		}
-		return fmt.Errorf("failed to move to Trash: %s", strings.TrimSpace(string(output)))
+		return fmt.Errorf("%w: %s: %w", errTrashOutcomeUnknown, strings.TrimSpace(string(output)), err)
 	}
 
 	return nil
@@ -342,7 +454,8 @@ func isProtectedAnalyzeDeletePath(path string) bool {
 		if cleanPath == dockerDesktopState || strings.HasPrefix(cleanPath, dockerDesktopState+string(filepath.Separator)) {
 			return true
 		}
-		if isPathWithinExistingRoot(cleanPath, dockerDesktopState) {
+		if isPathWithinExistingRoot(cleanPath, dockerDesktopState) ||
+			containsProtectedRoot(cleanPath, dockerDesktopState) {
 			return true
 		}
 
@@ -350,7 +463,8 @@ func isProtectedAnalyzeDeletePath(path string) bool {
 		if cleanPath == orbstackState || strings.HasPrefix(cleanPath, orbstackState+string(filepath.Separator)) {
 			return true
 		}
-		if isPathWithinExistingRoot(cleanPath, orbstackState) {
+		if isPathWithinExistingRoot(cleanPath, orbstackState) ||
+			containsProtectedRoot(cleanPath, orbstackState) {
 			return true
 		}
 
@@ -360,7 +474,9 @@ func isProtectedAnalyzeDeletePath(path string) bool {
 				if !strings.HasSuffix(strings.ToLower(entry.Name()), "dev.orbstack") {
 					continue
 				}
-				if isPathWithinExistingRoot(cleanPath, filepath.Join(groupContainers, entry.Name())) {
+				stateRoot := filepath.Join(groupContainers, entry.Name())
+				if isPathWithinExistingRoot(cleanPath, stateRoot) ||
+					containsProtectedRoot(cleanPath, stateRoot) {
 					return true
 				}
 			}
@@ -484,6 +600,19 @@ func protectedAnalyzeHomeRoots() []string {
 	return homeRoots
 }
 
+func containsProtectedRoot(path, protectedRoot string) bool {
+	// An absent runtime must not make an otherwise empty container directory
+	// undeletable. Unknown visibility still keeps its structural ancestors.
+	if _, err := os.Lstat(protectedRoot); os.IsNotExist(err) {
+		return false
+	}
+	if resolved, err := filepath.EvalSymlinks(protectedRoot); err == nil &&
+		isPathWithinExistingRoot(resolved, path) {
+		return true
+	}
+	return isPathWithinExistingRoot(protectedRoot, path)
+}
+
 func isPathWithinExistingRoot(path, protectedRoot string) bool {
 	protectedInfo, err := os.Stat(protectedRoot)
 	if err != nil {
@@ -528,6 +657,7 @@ var endpointSecurityBundlePrefixes = []string{
 	"com.paloaltonetworks.",
 	"com.cisco.anyconnect",
 	"com.cisco.secureclient",
+	"com.alibaba.security.",
 }
 
 // isEndpointSecurityCachePath reports whether path is an endpoint-security / EDR
@@ -538,6 +668,13 @@ func isEndpointSecurityCachePath(path string) bool {
 	lowerPath := strings.ToLower(path)
 	if !strings.HasPrefix(lowerPath, "/private/var/folders/") && !strings.HasPrefix(lowerPath, "/var/folders/") {
 		return false
+	}
+	// A whole Darwin user/cache container also moves any protected agent
+	// below it. Keep the structural ancestors; ordinary app cache leaves stay
+	// eligible without an unbounded recursive scan of the shared container.
+	rel := strings.TrimPrefix(strings.TrimPrefix(lowerPath, "/private"), "/var/folders/")
+	if len(strings.Split(rel, string(filepath.Separator))) <= 3 {
+		return true
 	}
 	for _, prefix := range endpointSecurityBundlePrefixes {
 		if strings.Contains(lowerPath, prefix) {

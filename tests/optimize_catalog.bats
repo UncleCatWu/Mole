@@ -1,8 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_project_root
 }
 
 @test "optimize exposes no manual memory purge task (#1309)" {
@@ -29,12 +30,37 @@ EOF
 	[ "$status" -eq 0 ] || return 1
 }
 
+@test "default optimize never rebuilds LaunchServices" {
+    # `lsregister -r -f` re-registered every app and extension on each run:
+    # a running Network Extension VPN (Karing, Shadowrocket) was read as
+    # reinstalled and its tunnel dropped, and Siri / Apple Intelligence
+    # re-indexed every app at high CPU. `-gc` alone prunes nothing on
+    # current macOS, so the task was removed rather than reduced.
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/optimize/catalog.sh"
+
+optimize_catalog_handler_for cache_refresh >/dev/null
+if optimize_catalog_handler_for launch_services_rebuild >/dev/null 2>&1; then
+    echo "LaunchServices rebuild is still registered"
+    exit 1
+fi
+matched=$(grep -rnE '"\$lsregister"[^#]*[[:space:]]-r[[:space:]]' "$PROJECT_ROOT/lib" "$PROJECT_ROOT/bin" || true)
+if [[ -n "$matched" ]]; then
+    echo "a code path still passes lsregister -r: $matched"
+    exit 1
+fi
+EOF
+
+    [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+}
+
 @test "default optimize catalog never restarts Dock (#1300)" {
     run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/optimize/catalog.sh"
 
-optimize_catalog_handler_for system_maintenance >/dev/null
+optimize_catalog_handler_for cache_refresh >/dev/null
 if optimize_catalog_handler_for dock_refresh >/dev/null 2>&1; then
     echo "Dock refresh is still registered"
     exit 1
@@ -54,13 +80,11 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/optimize/catalog.sh"
 
 expected=$(cat <<'CONTRACT'
-system_maintenance|opt_system_maintenance|DNS & Spotlight Check|DNS & Spotlight Check|Refresh DNS cache & verify Spotlight status|true
 cache_refresh|opt_cache_refresh|Finder Cache Refresh|Finder Cache Refresh|Refresh QuickLook thumbnails & icon services cache|true
 saved_state_cleanup|opt_saved_state_cleanup|App State Cleanup|App State Cleanup|Remove old saved application states (30+ days)|true
 fix_broken_configs|opt_fix_broken_configs|Broken Config Repair|Broken Config Repair|Fix corrupted preferences files|true
-network_optimization|opt_network_optimization|Network Cache Refresh|Network Cache Refresh|Optimize DNS cache & restart mDNSResponder|true
+network_optimization|opt_network_optimization|Network Cache Refresh|Network Cache Refresh|Refresh DNS cache|true
 sqlite_vacuum|opt_sqlite_vacuum|Database Optimization|Database Optimization|Compress SQLite databases for Mail, Safari & Messages (skips if apps are running)|true
-launch_services_rebuild|opt_launch_services_rebuild|LaunchServices Repair|LaunchServices Repair|Repair "Open with" menu & file associations|true
 prevent_network_dsstore|opt_prevent_network_dsstore|Prevent Finder .DS_Store|Prevent Finder .DS_Store|Set a persistent Finder preference to stop writing .DS_Store on SMB/AFP/NFS and USB volumes|true
 legacy_overrides_audit|opt_legacy_overrides_audit|Legacy Overrides|Legacy Overrides|Remove hidden App Nap and disk-image verification overrides left by old tweak tools|true
 network_stack_optimize|opt_network_stack_optimize|Network Stack Refresh|Network Stack Refresh|Flush routing table and ARP cache to resolve network issues|true
@@ -72,7 +96,7 @@ shared_file_list_repair|opt_shared_file_list_repair|Shared File Lists|Shared Fil
 disk_verify|opt_disk_verify|Disk Health|Disk Health|Verify filesystem integrity|true
 login_items_audit|opt_login_items_audit|Login Items|Login Items Audit|Audit login items for broken entries|true
 quarantine_cleanup|opt_quarantine_cleanup|Quarantine Database Cleanup|Quarantine Database Cleanup|Clear Gatekeeper download tracking history|true
-launch_agents_cleanup|opt_launch_agents_cleanup|Launch Agents Cleanup|Launch Agents Cleanup|Remove broken LaunchAgents whose binaries no longer exist|true
+launch_agents_cleanup|opt_launch_agents_cleanup|Launch Agents Cleanup|Launch Agents Cleanup|Report LaunchAgents whose binaries no longer exist|true
 notification_cleanup|opt_notification_cleanup|Notifications|Notifications|Clean old delivered notifications to reduce database bloat|true
 coreduet_cleanup|opt_coreduet_cleanup|Usage Data|Usage Data|Clean old usage tracking data|true
 CONTRACT
@@ -123,7 +147,7 @@ contract_hash=$(
         shasum -a 256 |
         awk '{print $1}'
 )
-expected_hash="8896e6dedcab9ab76accb1ea7502c59b711da912473923b089451222ddc61c2c"
+expected_hash="64978fdbfa1b27e520e48a8d5c26d0e9caa35e581c878fa5ace09b96490bd9ec"
 if [[ "$contract_hash" != "$expected_hash" ]]; then
     echo "health optimization contract hash: expected $expected_hash, got $contract_hash"
     exit 1
@@ -139,7 +163,7 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/manage/whitelist.sh"
 
 contract_hash=$(get_optimize_whitelist_items | shasum -a 256 | awk '{print $1}')
-expected_hash="04376c036db32e504cac07b054532446465c2fd83a19c0e05a7710fa87f92078"
+expected_hash="6d2b6ab6b447fb01a7406f1bcaf3e929a39c95bfd1aa9880d64dd3b8608cf283"
 if [[ "$contract_hash" != "$expected_hash" ]]; then
     echo "optimize whitelist contract hash: expected $expected_hash, got $contract_hash"
     exit 1
@@ -154,7 +178,7 @@ EOF
 set -euo pipefail
 
 if /bin/bash --noprofile --norc < <(
-    awk '!changed && /opt_cache_refresh/ {sub(/opt_cache_refresh/, "opt_system_maintenance"); changed=1} {print}' \
+    awk '!changed && /opt_cache_refresh/ {sub(/opt_cache_refresh/, "opt_saved_state_cleanup"); changed=1} {print}' \
         "$PROJECT_ROOT/lib/optimize/catalog.sh"
 ); then
     echo "duplicate handler passed validation"
@@ -171,8 +195,8 @@ fi
 EOF
 
     [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-    [[ "$output" == *"Duplicate optimize task handler: opt_system_maintenance"* ]] || return 1
-    [[ "$output" == *"Optimize task is not safe for automatic execution: system_maintenance"* ]] || return 1
+    [[ "$output" == *"Duplicate optimize task handler: opt_saved_state_cleanup"* ]] || return 1
+    [[ "$output" == *"Optimize task is not safe for automatic execution: cache_refresh"* ]] || return 1
 }
 
 @test "optimize catalog resolves handlers by exact action id" {
@@ -200,7 +224,7 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 
-[[ ${#MOLE_OPTIMIZE_ACTIONS[@]} -eq 21 ]] || exit 1
+[[ ${#MOLE_OPTIMIZE_ACTIONS[@]} -eq 19 ]] || exit 1
 for handler in "${MOLE_OPTIMIZE_HANDLERS[@]}"; do
     if ! declare -F "$handler" >/dev/null; then
         echo "missing handler: $handler"

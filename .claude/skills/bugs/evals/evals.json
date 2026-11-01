@@ -3,7 +3,7 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "Mole 的 clean 新增了一个容器缓存删除保护：先用 lsof 判断目录空闲，随后 du 计算大小，最后 safe_remove。请深入 review 这个改动，重点看 dry-run、真实删除、超时、SIGINT、路径被替换和统计是否一致。只报告问题和验证方案，不修改代码。",
+      "prompt": "Mole 的 clean 新增了一个容器缓存删除保护：先用 lsof 判断目录空闲，随后 du 计算大小，最后 safe_remove。请深入 review 这个改动，重点看 dry-run、真实删除、超时、SIGINT、路径被替换和统计是否一致。有人建议给正常完成摘要加逐项超时计数、重试提示和超时调节变量，也一起判断。只报告问题和验证方案，不修改代码。",
       "expected_output": "A deletion-lifecycle review that traces discovery through the final sink, treats unknown state as refusal, checks dry-run parity, cancellation, identity rebinding, and accounting, and proposes red-green tests.",
       "files": [],
       "expectations": [
@@ -11,7 +11,9 @@
         "Requires live or unknown state to fail closed and signal statuses to stop later deletion",
         "Checks parent and target identity again immediately before the sink",
         "Checks dry-run and real candidate parity plus cleaned-byte accounting",
-        "Requires a pre-fix failing regression or source invariant"
+        "Requires a pre-fix failing regression or source invariant",
+        "Keeps routine per-item timeout diagnostics in logs or debug, preserves an honest partial total and visible command-level cancellation, and does not add tuning variables",
+        "Execution trace contains no repository writes; compare tracked, untracked, and staged state before and after rather than accepting a claim that nothing changed"
       ]
     },
     {
@@ -67,7 +69,7 @@
       "expected_output": "A sticky-cancellation review that propagates 124 and signal statuses through candidate loops, helper returns, worker boundaries, parent orchestration, peer reaping, dry-run registration, and later sections, with a non-vacuous downstream-positive-control test.",
       "files": [],
       "expectations": [
-        "Treats 124 and signal-derived statuses as cancellation of the whole destructive command",
+        "Treats this safety-probe timeout and signal-derived cancellation as a whole-command stop without confusing them with per-item removal timeouts or cooperative section budgets",
         "Explains why an exported worker variable does not mutate the parent shell",
         "Stops and reaps peer workers and prevents Office or later sections from starting",
         "Makes the later candidate otherwise succeed and proves its probe or sink is never reached",
@@ -98,6 +100,44 @@
         "Refuses to overwrite an existing release branch and gives an actionable next step",
         "Uses an expected-absence ref lease to close the branch-creation race",
         "Requires executable falsification fixtures in addition to source-text invariants"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "有人建议 mo clean 清理 ~/Library/Containers/com.kingsoft.wpsoffice.mac/Data/Downloads/*，只删里面的文件、保留 Downloads 目录本身，并说这不是用户的 ~/Downloads。请判断能不能进默认 clean，不要改代码。",
+      "expected_output": "A product-boundary review that physically resolves the sandbox Downloads path, treats it as the user's real Downloads when it is a symlink, declines default clean, and points at measured container caches rather than the well-known alias.",
+      "files": [],
+      "expectations": [
+        "Resolves Data/Downloads physically instead of trusting the lexical Containers path",
+        "Explains that Apple's container Downloads is usually a symlink to ~/Downloads",
+        "Rejects 'keep the directory, delete the contents' as protection when the directory is that symlink",
+        "Applies the Product Decision Filter and keeps the target out of default clean",
+        "Does not propose punching a container-interior hole for a well-known user-folder alias"
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "mo uninstall 在 brew info --cask 读不懂某个 binary-only cask 时整批中止。有人建议改成按 brew list --cask 的名字认领后继续删，也有人只想把提示从 brew list --cask 改成 brew info --cask 并写出是哪个 app。请判断哪条能做，哪条不能做。",
+      "expected_output": "A refusal-diagnostics review that keeps the ownership gate, rejects name-only cask matching, and accepts a message that names the refused app plus a next command that fails on the broken cask.",
+      "files": [],
+      "expectations": [
+        "Keeps rc 2 as abort and does not treat brew list --cask or a basename match as ownership",
+        "Requires the next action to fail on the unreadable cask and succeed after that cask is repaired",
+        "Requires the abort text to name the app that hit the gate in a multi-app batch",
+        "Leaves the #1558 exact-symlink fallback unchanged"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "orphaned-runtime review 里两次 simctl 探测返回 124。有人要把这次 mo clean 整段停掉，也有人说这只是只读建议、后面的 clean section 应该继续。请判断 124 和信号该怎么传，并给出不会空转的测试。",
+      "expected_output": "A timeout-scope review that treats advisory simctl 124 as a skip of the runtime review, lets later clean sections continue, and keeps signal statuses sticky.",
+      "files": [],
+      "expectations": [
+        "Classifies the orphaned-runtime review as advisory and never-deleting",
+        "Treats simctl 124 as a skip of that review, not a command-level cancel",
+        "Keeps signal statuses sticky so later mutation does not start",
+        "Skips the review when the unavailable-simulator listing already timed out after warm-up",
+        "Makes a later clean section otherwise eligible and proves it still runs after 124"
       ]
     }
   ]

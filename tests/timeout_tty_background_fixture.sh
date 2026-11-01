@@ -29,7 +29,7 @@ source "$PROJECT_ROOT/lib/core/timeout.sh"
 MO_TIMEOUT_BIN=""
 MO_TIMEOUT_PERL_BIN="/usr/bin/perl"
 
-caller_pgrp=$(ps -o pgid= -p $$ | tr -d ' ')
+caller_pgrp=$(/usr/bin/perl -e 'print getpgrp()')
 
 export MOLE_TTY_PROBE_MODE="$MODE"
 
@@ -43,7 +43,7 @@ export MOLE_TTY_PROBE_MODE="$MODE"
 child_probe='
     use POSIX qw(tcgetpgrp);
     my $pgrp = getpgrp();
-    open(my $tty, "<", "/dev/tty") or exit 3;
+    open(my $tty, "<", $ENV{MOLE_TEST_TTY_PATH}) or exit 3;
     my $fg = tcgetpgrp(fileno($tty));
     if (($ENV{MOLE_TTY_PROBE_MODE} || "") eq "tty") {
         for (1 .. 200) {

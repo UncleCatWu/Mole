@@ -737,6 +737,22 @@ func TestFormatDiskLine(t *testing.T) {
 			wantFree:     "0 free",
 			wantNoSubstr: "%",
 		},
+		{
+			name:         "purgeable space is excluded from immediate free space",
+			label:        "INTR",
+			disk:         DiskStatus{UsedPercent: 64.9, Used: 1226 << 30, Total: 1860 << 30, Purgeable: 141 << 30},
+			wantUsed:     "1T used",
+			wantFree:     "493G free",
+			wantNoSubstr: "%",
+		},
+		{
+			name:         "purgeable exceeds available space clamps free to zero",
+			label:        "INTR",
+			disk:         DiskStatus{UsedPercent: 90, Used: 90 << 30, Total: 100 << 30, Purgeable: 20 << 30},
+			wantUsed:     "90G used",
+			wantFree:     "0 free",
+			wantNoSubstr: "%",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1254,34 +1270,28 @@ func TestBuildCardsDistinguishesEmptyProcessSampleStates(t *testing.T) {
 	}
 }
 
-func TestRenderProcessCardShowsBoundedZombieGuidance(t *testing.T) {
-	card := renderProcessCardWithZombies(
+func TestRenderProcessCardKeepsThreeProcessRowsWithZombiesPresent(t *testing.T) {
+	// The zombie row used to take one of the three slots and spend it on
+	// kernel vocabulary. The count stays in `status --json`; the card shows
+	// processes.
+	card := renderProcessCard(
 		[]ProcessInfo{
 			{Name: "Chrome", CPU: 12, MemoryBytes: 512 << 20},
 			{Name: "WindowServer", CPU: 8, MemoryBytes: 256 << 20},
 			{Name: "Xcode", CPU: 4, MemoryBytes: 128 << 20},
 		},
-		94,
-		[]ZombieParent{{PID: 42, Name: "Chrome", Count: 6}},
 		colWidth,
 	)
 
 	if len(card.lines) != 3 {
-		t.Fatalf("renderProcessCardWithZombies() lines = %d, want 3", len(card.lines))
-	}
-	plain := stripANSI(card.lines[0])
-	if !strings.Contains(plain, "Zombies 94") || !strings.Contains(plain, "Chrome (42)") {
-		t.Fatalf("zombie summary missing count or parent: %q", plain)
-	}
-	if strings.Contains(strings.ToLower(plain), "restart") || strings.Contains(strings.ToLower(plain), "quit") {
-		t.Fatalf("zombie summary should attribute without indiscriminate process advice: %q", plain)
-	}
-	if lipgloss.Width(plain) > colWidth {
-		t.Fatalf("zombie summary exceeds card width: %q", plain)
+		t.Fatalf("renderProcessCard() lines = %d, want 3", len(card.lines))
 	}
 	joined := stripANSI(strings.Join(card.lines, "\n"))
-	if strings.Contains(joined, "Xcode") {
-		t.Fatalf("zombie guidance should keep card at three rows, got %q", joined)
+	if !strings.Contains(joined, "Xcode") {
+		t.Fatalf("third process row should be rendered, got %q", joined)
+	}
+	if strings.Contains(strings.ToLower(joined), "zombie") {
+		t.Fatalf("the card must not carry zombie vocabulary: %q", joined)
 	}
 }
 
@@ -1570,7 +1580,7 @@ func TestViewShrinksCPUCardToFitHeight(t *testing.T) {
 		cpu.PerCore = append(cpu.PerCore, float64(i))
 	}
 	m := model{
-		ready:    true,
+		schedule: collectionSchedule{hasSnapshot: true},
 		width:    120,
 		metrics:  MetricsSnapshot{CPU: cpu},
 		cpuCores: 0, // "all"
@@ -1792,10 +1802,10 @@ func TestModelViewPadsToTerminalHeight(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := model{
-				width:   tt.width,
-				height:  tt.height,
-				ready:   true,
-				metrics: MetricsSnapshot{},
+				width:    tt.width,
+				height:   tt.height,
+				schedule: collectionSchedule{hasSnapshot: true},
+				metrics:  MetricsSnapshot{},
 			}
 
 			view := m.View()
@@ -1811,7 +1821,7 @@ func TestModelViewErrorRendersSingleMole(t *testing.T) {
 	m := model{
 		width:      120,
 		height:     40,
-		ready:      true,
+		schedule:   collectionSchedule{hasSnapshot: true},
 		metrics:    MetricsSnapshot{},
 		errMessage: "boom",
 		animFrame:  0,
@@ -1842,4 +1852,39 @@ func stripANSI(s string) string {
 		}
 	}
 	return result.String()
+}
+
+func TestBatteryCardUnknownCapacityPreservesCycles(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		capacity, cycles int
+		want             string
+	}{
+		{"capacity unavailable", 0, 100, "100 cycles"},
+		{"known healthy capacity", 98, 100, "Healthy"},
+		{"known worn capacity", 20, 50, "Service Soon"},
+		{"known cycle warning", 0, 950, "Service Soon"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			card := renderBatteryCard([]BatteryStatus{{Percent: 50, Capacity: tc.capacity, CycleCount: tc.cycles, Status: "Discharging"}}, ThermalStatus{}, true)
+			rendered := strings.Join(card.lines, "\n")
+			if !strings.Contains(rendered, tc.want) {
+				t.Fatalf("missing %q in %q", tc.want, rendered)
+			}
+			if tc.capacity == 0 && strings.Contains(rendered, "Healthy") {
+				t.Fatalf("unknown capacity rendered healthy: %q", rendered)
+			}
+			if strings.Contains(rendered, "·  ·") || strings.Contains(rendered, "· ·") {
+				t.Fatalf("empty health label left a separator: %q", rendered)
+			}
+		})
+	}
+}
+
+func TestBatteryCardUnknownCapacityKeepsSystemCondition(t *testing.T) {
+	card := renderBatteryCard([]BatteryStatus{{Percent: 50, CycleCount: 100, Health: "Service Recommended", Status: "Discharging"}}, ThermalStatus{}, true)
+	rendered := strings.Join(card.lines, "\n")
+	if !strings.Contains(rendered, "Service Recommended") || !strings.Contains(rendered, "100 cycles") || strings.Contains(rendered, "Healthy") {
+		t.Fatalf("independent system condition or cycles lost: %q", rendered)
+	}
 }

@@ -1,12 +1,13 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 # Tests for safe_remove_symlink in lib/core/file_ops.sh.
 # The helper removes a symlink itself (never its target), refuses anything
 # that is not a symlink, runs the deletion validator, and honours dry-run.
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_project_root
 }
 
 setup() {

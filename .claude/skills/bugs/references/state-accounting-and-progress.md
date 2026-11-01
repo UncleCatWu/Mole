@@ -31,10 +31,13 @@ Accounting rules:
 - Filtered, refused, timed-out, failed, or disappeared candidates add neither cleaned items nor reclaimed bytes.
 - Dry-run and real mode use the same eligible candidates; only the action differs.
 - A size timeout may produce an explicit unknown or partial total, never a fabricated zero presented as complete.
+- Normal clean summaries omit per-item timeout counts, retry instructions, and environment-variable tuning advice. Keep those details in operation logs and `--debug`; mark an incompletely measured amount in place. Command-level cancellation and required-step failures still need visible status.
 - Large candidate fast paths may skip precise per-item sizing only when the output says the total is partial or not scanned.
 - Hardlinks are counted according to one named policy across subtree and summary paths.
 
 `tests/clean_core.bats` contains the preview-versus-summary pattern. Sub-megabyte rounding to zero and per-link hardlink counting belong to this family too.
+
+A section that prints its own result row adds it with `mole_add_cleaned_row <count> <kb>` in `lib/core/file_ops.sh`, which adds the item count, the KB, and one category and treats non-numeric input as zero. Do not write `files_cleaned`, `total_size_cleaned`, or `total_items` directly outside the summary reset and the dry-run ledger render, and never merge the three intentional `start_section` implementations to get there.
 
 ## 10. Silence is read as a freeze
 
@@ -49,7 +52,9 @@ content
 one trailing blank line
 ```
 
-The spinner stops immediately before output that would otherwise be overwritten, then restarts if more silent work follows. A timeout warning is not a substitute for progress during a healthy slow scan.
+Keep a live spinner across adjacent silent stages and update its message through `update_inline_spinner_message`; stopping and starting just to change text inserts a blank frame. Stop immediately before printing content that would otherwise be overwritten, and restart only if more silent work follows. A function that starts a spinner stops it on every exit, including early returns, deferrals, and rows it echoes itself: callers do not, and the next step's `start_section_spinner` only swaps the text, so the stale label rides into later steps and later rows print on its line (`clean_dev_jvm` Gradle scan, `319b9b8f`). `tests/clean_dev_caches.bats` stubs the spinner pair and asserts its state at each row and at return. Use the shared `mo_load_spinner_frames` array: slicing one multibyte string under `LC_ALL=C` emits broken UTF-8. Clean, purge, and uninstall consume the same frame source. A timeout warning is not a substitute for progress during a healthy slow scan.
+
+Check complete UTF-8 frames, in-place message changes, narrow-terminal output, section spacing, and redirected output separately. Do not time one full animation cycle in a loaded test runner. `tests/core_common.bats` and `tests/clean_core.bats` pin the frame, message, and section behavior.
 
 Performance work needs two receipts:
 

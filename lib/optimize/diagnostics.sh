@@ -6,22 +6,6 @@ set -euo pipefail
 readonly MOLE_OPTIMIZE_DIAG_CPU_THRESHOLD_DEFAULT=25
 readonly MOLE_OPTIMIZE_DIAG_SAMPLE_DELAY_DEFAULT=1
 
-opt_diag_cpu_threshold() {
-    local threshold="${MOLE_OPTIMIZE_DIAG_CPU_THRESHOLD:-$MOLE_OPTIMIZE_DIAG_CPU_THRESHOLD_DEFAULT}"
-    if ! [[ "$threshold" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        threshold="$MOLE_OPTIMIZE_DIAG_CPU_THRESHOLD_DEFAULT"
-    fi
-    printf '%s\n' "$threshold"
-}
-
-opt_diag_sample_delay() {
-    local delay="${MOLE_OPTIMIZE_DIAG_SAMPLE_DELAY:-$MOLE_OPTIMIZE_DIAG_SAMPLE_DELAY_DEFAULT}"
-    if ! [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        delay="$MOLE_OPTIMIZE_DIAG_SAMPLE_DELAY_DEFAULT"
-    fi
-    printf '%s\n' "$delay"
-}
-
 opt_diag_float_ge() {
     local left="${1:-0}"
     local right="${2:-0}"
@@ -358,17 +342,17 @@ opt_diag_offer_detach_candidates() {
 run_optimize_diagnostics() {
     local sample1 sample2 totals1 totals2 threshold delay
     sample1=$(opt_diag_get_ps_sample 1)
-    delay=$(opt_diag_sample_delay)
+    delay=$MOLE_OPTIMIZE_DIAG_SAMPLE_DELAY_DEFAULT
     if [[ -z "${MOLE_OPTIMIZE_PS_SAMPLE_1:-}" || -z "${MOLE_OPTIMIZE_PS_SAMPLE_2:-}" ]]; then
         sleep "$delay"
     fi
     sample2=$(opt_diag_get_ps_sample 2)
     totals1=$(opt_diag_family_totals "$sample1")
     totals2=$(opt_diag_family_totals "$sample2")
-    threshold=$(opt_diag_cpu_threshold)
+    threshold=$MOLE_OPTIMIZE_DIAG_CPU_THRESHOLD_DEFAULT
 
     echo ""
-    echo -e "${BLUE}PERFORMANCE DIAGNOSIS${NC}"
+    echo -e "${BLUE}Performance diagnosis${NC}"
 
     local families="cloudshell syspolicyd windowserver spotlight coresim_disk_images"
     local sustained_count=0
@@ -442,7 +426,7 @@ run_optimize_diagnostics() {
             echo -e "  ${GRAY}${ICON_LIST}${NC} Gatekeeper status: ${spctl_status}"
         fi
         if [[ "$managed_count" -gt 0 && "$managed_count" == "$coresim_count" && "$detach_count" -eq 0 ]]; then
-            echo -e "  ${GRAY}${ICON_INFO}${NC} Only system-managed CoreSimulator images are mounted, informational only, not a detach target"
+            echo -e "  ${GRAY}${ICON_ADMIN}${NC} Only system-managed CoreSimulator images are mounted, informational only, not a detach target"
         fi
 
         opt_diag_offer_detach_candidates "$detach_candidates"
@@ -474,12 +458,12 @@ opt_diag_get_swapusage() {
         printf '%s\n' "$MOLE_OPTIMIZE_SWAPUSAGE"
         return 0
     fi
-    sysctl -n vm.swapusage 2> /dev/null || true
+    "$SYSCTL_CMD" -n vm.swapusage 2> /dev/null || true
 }
 
 opt_diag_get_mem_free_pct() {
-    if [[ -n "${MOLE_OPTIMIZE_MEM_FREE_PCT:-}" ]]; then
-        printf '%s\n' "$MOLE_OPTIMIZE_MEM_FREE_PCT"
+    if [[ -n "${MOLE_OPTIMIZE_MEM_FREE_SAMPLE:-}" ]]; then
+        printf '%s\n' "$MOLE_OPTIMIZE_MEM_FREE_SAMPLE"
         return 0
     fi
     memory_pressure 2> /dev/null | awk -F': ' '/free percentage/ {gsub(/%/,"",$2); print int($2)}' | tail -1
@@ -512,12 +496,6 @@ opt_diag_get_vm_sample() {
     ps -Ao rss,command 2> /dev/null | tail -n +2 | grep -v CoreSimulator || true
 }
 
-opt_diag_int_env() {
-    local value="${1:-}" fallback="${2:-0}"
-    [[ "$value" =~ ^[0-9]+$ ]] || value="$fallback"
-    printf '%s\n' "$value"
-}
-
 # Convert ps time/etime ([[dd-]hh:]mm:ss) to seconds. Returns 0 on garbage so a
 # malformed row can never inflate a ratio into a false runaway report. Shared
 # as awk source rather than a shell function because the runaway scan reads
@@ -537,16 +515,12 @@ function opt_secs(t,   n, a, p, d, first, h, m, s) {
 }
 '
 
-opt_diag_time_to_seconds() {
-    printf '%s\n' "${1:-}" | awk "$MOLE_OPT_DIAG_TIME_AWK"'{ printf "%d\n", opt_secs($0) }'
-}
-
 # Swap pressure, and the processes actually responsible for it. Silent when
 # memory is healthy.
 opt_diag_memory_pressure() {
     local swap_line swap_total swap_used swap_pct free_pct warn_swap warn_free
-    warn_swap=$(opt_diag_int_env "${MOLE_OPTIMIZE_SWAP_PCT:-}" "$MOLE_OPTIMIZE_SWAP_PCT_DEFAULT")
-    warn_free=$(opt_diag_int_env "${MOLE_OPTIMIZE_FREE_PCT:-}" "$MOLE_OPTIMIZE_FREE_PCT_DEFAULT")
+    warn_swap=$MOLE_OPTIMIZE_SWAP_PCT_DEFAULT
+    warn_free=$MOLE_OPTIMIZE_FREE_PCT_DEFAULT
 
     swap_line=$(opt_diag_get_swapusage)
     [[ -n "$swap_line" ]] || return 0
@@ -566,7 +540,6 @@ opt_diag_memory_pressure() {
     # bytes_to_human, not integer GB: sysctl reports megabytes, so "used / 1024"
     # printed "swap 0GB of 1GB used (88%)" on a machine with a small swap file.
     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Memory pressure: swap $(bytes_to_human_kb "$((swap_used * 1024))") of $(bytes_to_human_kb "$((swap_total * 1024))") used (${swap_pct}%), ${free_pct}% free"
-    echo -e "  ${GRAY}${ICON_REVIEW}${NC} High load with little CPU activity is usually this, not compute"
 
     # Name the actual holders. Simulator runtimes ship duplicate daemons whose
     # rows would otherwise crowd out the real offenders.
@@ -620,7 +593,7 @@ opt_diag_memory_pressure() {
 # zero containers running, which is invisible to disk-oriented checks.
 opt_diag_idle_vm() {
     local min_gb vm_kb vm_gb
-    min_gb=$(opt_diag_int_env "${MOLE_OPTIMIZE_IDLE_VM_GB:-}" "$MOLE_OPTIMIZE_IDLE_VM_GB_DEFAULT")
+    min_gb=$MOLE_OPTIMIZE_IDLE_VM_GB_DEFAULT
 
     vm_kb=$(opt_diag_get_vm_sample |
         awk '/Virtualization.framework.*VirtualMachine/ {s += $1} END {print s + 0}')
@@ -660,8 +633,8 @@ opt_diag_idle_vm() {
 # trip this, and neither can a short-lived process.
 opt_diag_runaway_process() {
     local pct_floor min_hours
-    pct_floor=$(opt_diag_int_env "${MOLE_OPTIMIZE_RUNAWAY_PCT:-}" "$MOLE_OPTIMIZE_RUNAWAY_PCT_DEFAULT")
-    min_hours=$(opt_diag_int_env "${MOLE_OPTIMIZE_RUNAWAY_MIN_HOURS:-}" "$MOLE_OPTIMIZE_RUNAWAY_MIN_HOURS_DEFAULT")
+    pct_floor=$MOLE_OPTIMIZE_RUNAWAY_PCT_DEFAULT
+    min_hours=$MOLE_OPTIMIZE_RUNAWAY_MIN_HOURS_DEFAULT
 
     # The whole scan is one awk pass. Splitting fields and converting two
     # timestamps per row in the shell cost six forks for each of 400 rows,
@@ -671,7 +644,7 @@ opt_diag_runaway_process() {
     while IFS=$'\t' read -r pid comm cpu_hours run_hours pct; do
         [[ -n "$pid" ]] || continue
         echo -e "  ${YELLOW}${ICON_WARNING}${NC} ${comm} has burned ${cpu_hours}h CPU over ${run_hours}h of runtime (~${pct}% sustained)"
-        echo -e "  ${GRAY}${ICON_REVIEW}${NC} A stuck run loop. Restarting it usually clears it: ${NC}kill -TERM ${pid}${GRAY} (launchd respawns system daemons)${NC}"
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Sustained for its whole lifetime; if it is not doing real work: ${NC}kill -TERM ${pid}${NC}"
         found=0
     done < <(opt_diag_get_proctime_sample | head -400 |
         awk -v floor="$pct_floor" -v minh="$min_hours" "$MOLE_OPT_DIAG_TIME_AWK"'

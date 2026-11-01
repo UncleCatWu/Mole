@@ -1,15 +1,11 @@
 #!/usr/bin/env bats
+
+load helpers/common
+
 # Test naming variant detection for find_app_files (Issue #377)
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-naming.XXXXXX")"
-    export HOME
+    mole_test_setup_home naming
 
     source "$PROJECT_ROOT/lib/core/base.sh"
     source "$PROJECT_ROOT/lib/core/log.sh"
@@ -17,10 +13,7 @@ setup_file() {
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    export HOME="$ORIGINAL_HOME"
+    mole_test_teardown_home
 }
 
 setup() {
@@ -62,7 +55,7 @@ setup() {
     [[ "$result" =~ .mobiledev ]]
 }
 
-@test "find_app_files extracts base name from version suffix (Zed Nightly -> zed)" {
+@test "find_app_files preserves shared Zed name roots when uninstalling a channel" {
     mkdir -p "$HOME/.config/zed"
     mkdir -p "$HOME/Library/Application Support/Zed"
     echo "test" > "$HOME/.config/zed/settings.json"
@@ -70,20 +63,78 @@ setup() {
 
     result=$(find_app_files "dev.zed.Zed-Nightly" "Zed Nightly")
 
-    [[ "$result" =~ .config/zed ]] || return 1
-    [[ "$result" =~ "Library/Application Support/Zed" ]]
+    [[ "$result" != *"/.config/zed"* ]] || return 1
+    [[ "$result" != *"Library/Application Support/Zed"* ]] || return 1
+    [[ -f "$HOME/.config/zed/settings.json" && -f "$HOME/Library/Application Support/Zed/cache.db" ]]
 }
 
-@test "find_app_files detects Zed channel variants in HTTPStorages only" {
-    mkdir -p "$HOME/Library/HTTPStorages/dev.zed.Zed-Preview"
+@test "find_app_files keeps another installed Zed channel while collecting its own exact state" {
+    mkdir -p "$HOME/Library/HTTPStorages/dev.zed.Zed-Preview" \
+        "$HOME/Library/HTTPStorages/dev.zed.Zed-Nightly" \
+        "$HOME/Applications/Zed Preview.app/Contents"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string dev.zed.Zed-Preview' \
+        "$HOME/Applications/Zed Preview.app/Contents/Info.plist" >/dev/null 2>&1
     mkdir -p "$HOME/Library/Application Support/Firefox/Profiles/default/storage/default/https+++zed.dev"
     echo "test" > "$HOME/Library/HTTPStorages/dev.zed.Zed-Preview/data"
     echo "test" > "$HOME/Library/Application Support/Firefox/Profiles/default/storage/default/https+++zed.dev/data"
 
     result=$(find_app_files "dev.zed.Zed-Nightly" "Zed Nightly")
 
-    [[ "$result" =~ Library/HTTPStorages/dev\.zed\.Zed-Preview ]] || return 1
+    [[ "$result" != *"Library/HTTPStorages/dev.zed.Zed-Preview"* ]] || return 1
+    [[ "$result" == *"Library/HTTPStorages/dev.zed.Zed-Nightly"* ]] || return 1
+    [[ -f "$HOME/Library/HTTPStorages/dev.zed.Zed-Preview/data" ]] || return 1
     [[ ! "$result" =~ storage/default/https\+\+\+zed\.dev ]]
+}
+
+@test "Zed channel leftovers never enter vendor or LaunchAgent name fallbacks" {
+    mkdir -p "$HOME/Library/Application Support/zed/Zed-Nightly-shared" \
+        "$HOME/Library/LaunchAgents" "$HOME/Library/HTTPStorages/dev.zed.Zed-Nightly"
+    printf shared > "$HOME/Library/LaunchAgents/com.shared.Zed Nightly.plist"
+    printf owned > "$HOME/Library/LaunchAgents/dev.zed.Zed-Nightly.plist"
+    result=$(find_app_files "dev.zed.Zed-Nightly" "Zed Nightly")
+    [[ "$result" == *"HTTPStorages/dev.zed.Zed-Nightly"* ]] || return 1
+    [[ "$result" == *"LaunchAgents/dev.zed.Zed-Nightly.plist"* ]] || return 1
+    [[ "$result" != *"zed/Zed-Nightly-shared"* ]] || return 1
+    [[ "$result" != *"com.shared.Zed Nightly.plist"* ]]
+}
+
+@test "Zed system name paths stay excluded while exact channel and other app paths remain" {
+    run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+fixture_source="${ZED_SYSTEM_BASELINE:-$PROJECT_ROOT/lib/core/app_protection.sh}"
+body=$(sed -n '/^find_app_system_files() {/,/^}/p' "$fixture_source")
+[[ -n "$body" ]] || exit 1
+system_root="$HOME/system"
+# Avoid Bash 3.2's slow global replacements with long private fixture paths.
+body=$(printf '%s\n' "$body" | python3 -c '
+import sys
+body = sys.stdin.read()
+root = sys.argv[1]
+body = body.replace("/Library", root + "/Library")
+body = body.replace("/Users/Shared", root + "/Shared")
+body = body.replace("/private/var/db/receipts", root + "/receipts")
+sys.stdout.write(body)
+' "$system_root")
+eval "$body"
+find_app_receipt_files() { return 0; }
+mkdir -p "$system_root/Library/Application Support/Zed Nightly" \
+    "$system_root/Library/Application Support/dev.zed.Zed-Nightly" \
+    "$system_root/Library/Application Support/TestStudio" \
+    "$system_root/Library/LaunchAgents" "$system_root/Library/PrivilegedHelperTools"
+printf shared > "$system_root/Library/LaunchAgents/com.shared.Zed Nightly.plist"
+printf owned > "$system_root/Library/LaunchAgents/dev.zed.Zed-Nightly.plist"
+printf shared > "$system_root/Library/PrivilegedHelperTools/Zed Nightly-helper"
+result=$(find_app_system_files dev.zed.Zed-Nightly 'Zed Nightly')
+[[ "$result" == *"Application Support/dev.zed.Zed-Nightly"* ]] || { printf 'EXACT_SUPPORT_MISSING:%s\n' "$result"; exit 1; }
+[[ "$result" == *"LaunchAgents/dev.zed.Zed-Nightly.plist"* ]] || { printf 'EXACT_AGENT_MISSING:%s\n' "$result"; exit 1; }
+[[ "$result" != *"Zed Nightly"* ]] || { printf 'NAME_PATH_COLLECTED:%s\n' "$result"; exit 1; }
+control=$(find_app_system_files com.example.TestStudio TestStudio)
+[[ "$control" == *"Application Support/TestStudio"* ]] || exit 1
+printf 'EXACT_CHANNEL_PRESENT; ALL_NAME_PATHS_EXCLUDED; NON_ZED_CONTROL_PRESENT\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == *"EXACT_CHANNEL_PRESENT; ALL_NAME_PATHS_EXCLUDED; NON_ZED_CONTROL_PRESENT"* ]]
 }
 
 @test "find_app_files detects multiple naming variants simultaneously" {
@@ -182,6 +233,31 @@ EOF
     [ "$(printf '%s\n' "$result" | awk -v path="$container" '$0 == path { count++ } END { print count + 0 }')" -eq 1 ]
 }
 
+@test "embedded bundle discovery folds extension case without forking tr" {
+    local app="$HOME/Applications/Folding.app"
+    local id
+    for id in Widget.APPEX Service.Xpc Ignored.Bundle; do
+        mkdir -p "$app/Contents/PlugIns/$id/Contents"
+        printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.folding.%s</string></dict></plist>\n' \
+            "${id%%.*}" > "$app/Contents/PlugIns/$id/Contents/Info.plist"
+    done
+
+    run env HOME="$HOME" APP="$app" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+tr() { printf 'tr\n' >> "$HOME/embedded-tr.trace"; command tr "$@"; }
+rm -f "$HOME/embedded-tr.trace"
+_mole_uninstall_embedded_bundle_ids "$APP" "com.example.folding" | LC_ALL=C sort
+[[ ! -e "$HOME/embedded-tr.trace" ]] || echo "tr forked"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"com.example.folding.Widget"* ]] || return 1
+    [[ "$output" == *"com.example.folding.Service"* ]] || return 1
+    [[ "$output" != *"com.example.folding.Ignored"* ]] || return 1
+    [[ "$output" != *"tr forked"* ]]
+}
+
 @test "find_app_files detects vendor-nested Application Support directories" {
     mkdir -p "$HOME/Library/Application Support/Avid/Sibelius"
     mkdir -p "$HOME/Library/Application Support/OtherVendor/Sibelius"
@@ -231,7 +307,7 @@ find_app_files 'invalid_bundle' ''"
 
     result=$(find_app_files "com.microsoft.VSCode" "Visual Studio Code")
 
-    [[ "$result" =~ Library/Application\ Support/Code$'\n' ]] || [[ "$result" == *"Library/Application Support/Code"* ]]
+    [[ "$result" =~ Library/Application\ Support/Code$'\n' ]] || [[ "$result" == *"Library/Application Support/Code"* ]] || return 1
     [[ "$result" == *"/.vscode"* ]] || return 1
     [[ "$result" != *"Code - Insiders"* ]]
 }
@@ -256,6 +332,24 @@ find_app_files 'invalid_bundle' ''"
 
     [[ "$result" != *"Library/Application Support/Anki2"* ]] || return 1
     [[ "$result" == *"Library/Application Support/AnkiProgramFiles"* ]]
+}
+
+@test "find_app_files detects Claude Desktop third-party provider folders" {
+    mkdir -p "$HOME/Library/Application Support/Claude-3p/claude-code"
+    mkdir -p "$HOME/Library/Logs/Claude-3p"
+    mkdir -p "$HOME/.local/share/claude"
+
+    result=$(find_app_files "com.anthropic.claudefordesktop" "Claude")
+
+    [[ "$result" == *"Library/Application Support/Claude-3p"* ]] || return 1
+    [[ "$result" == *"Library/Logs/Claude-3p"* ]] || return 1
+    [[ "$result" != *".local/share/claude"* ]] || return 1
+
+    other=$(find_app_files "com.example.other" "Other")
+    [[ "$other" != *"Claude-3p"* ]] || return 1
+
+    sibling=$(MOLE_UNINSTALL_SIBLING_SURVIVES=1 find_app_files "com.anthropic.claudefordesktop" "Claude")
+    [[ "$sibling" != *"Claude-3p"* ]]
 }
 
 # Independent CLI dotdir protection, issue #993.
@@ -300,16 +394,16 @@ find_app_files 'invalid_bundle' ''"
     [[ "$result" != *".config/codex"* ]]
 }
 
-@test "find_app_files still removes Zed XDG state (independent-CLI list must not over-protect)" {
+@test "find_app_files preserves channel-shared Zed XDG state" {
     # Sanity check that the deny-list does not break legitimate GUI-app XDG
-    # cleanup added for #377. Zed is a GUI app that owns ~/.config/zed and
-    # ~/.local/share/zed and must still be picked up on uninstall.
+    # Channels share these roots, so a single channel's removal is not
+    # ownership evidence for their settings and databases.
     mkdir -p "$HOME/.config/zed"
     mkdir -p "$HOME/.local/share/zed"
 
     result=$(find_app_files "dev.zed.Zed-Nightly" "Zed Nightly")
 
-    [[ "$result" == *".config/zed"* ]] || [[ "$result" == *".local/share/zed"* ]]
+    [[ "$result" != *".config/zed"* && "$result" != *".local/share/zed"* ]]
 }
 
 @test "find_app_files keeps Raycast v2 data when uninstalling Raycast v1 (#1202)" {
@@ -409,4 +503,104 @@ find_app_files 'invalid_bundle' ''"
     # display name still derives, so the negatives above are not vacuous.
     result=$(find_app_files "one.ayugram.AyuGramDesktop" "AyuGram")
     [[ "$result" =~ "Application Support/AyuGram Desktop" ]] || return 1
+}
+
+@test "find_app_files adds PlayCover's exact per-app files and alias, never PlayChain (#1715)" {
+    local root="$HOME/Library/Containers/io.playcover.PlayCover"
+    local bundle="$root/Applications/fit.mole.probe.app"
+    mkdir -p "$bundle" "$root/App Settings" "$root/Keymapping" "$root/Entitlements" \
+        "$root/PlayChain" "$HOME/Applications/PlayCover/Mole Probe.app" \
+        "$HOME/Applications/PlayCover/Other.app"
+    printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>fit.mole.probe</string></dict></plist>' > "$bundle/Info.plist"
+    : > "$bundle/MoleProbe"
+    ln -s "$bundle/Info.plist" "$HOME/Applications/PlayCover/Mole Probe.app/Info.plist"
+    ln -s "$bundle/MoleProbe" "$HOME/Applications/PlayCover/Mole Probe.app/MoleProbe"
+    # Points at the bundle, but holds a real file too: not a PlayCover alias.
+    ln -s "$bundle/Info.plist" "$HOME/Applications/PlayCover/Other.app/Info.plist"
+    : > "$HOME/Applications/PlayCover/Other.app/Notes.txt"
+    local f
+    for f in "App Settings/fit.mole.probe.plist" "Keymapping/fit.mole.probe.plist" \
+        "Entitlements/fit.mole.probe.plist" "PlayChain/fit.mole.probe" \
+        "PlayChain/fit.mole.probe.keyCover" "App Settings/fit.mole.probe.other.plist"; do
+        : > "$root/$f"
+    done
+
+    mkdir -p "$root/Keymapping/fit.mole.probe" "$root/Keymapping/fit.mole.probex"
+    : > "$root/Keymapping/fit.mole.probe/default.plist"
+    # Since PlayCover's macOS 27 change the alias holds a copy of Info.plist.
+    mkdir -p "$HOME/Applications/PlayCover/Mole Probe Copy.app" "$HOME/Applications/PlayCover/Forged.app"
+    cp "$bundle/Info.plist" "$HOME/Applications/PlayCover/Mole Probe Copy.app/Info.plist"
+    ln -s "$bundle/MoleProbe" "$HOME/Applications/PlayCover/Mole Probe Copy.app/MoleProbe"
+    # A copied plist naming another app is not this bundle's alias.
+    printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>fit.mole.other</string></dict></plist>' \
+        > "$HOME/Applications/PlayCover/Forged.app/Info.plist"
+    ln -s "$bundle/MoleProbe" "$HOME/Applications/PlayCover/Forged.app/MoleProbe"
+
+    result=$(find_app_files "fit.mole.probe" "Mole Probe" "$bundle")
+
+    [[ "$result" == *"$root/Keymapping/fit.mole.probe"$'\n'* || "$result" == *"$root/Keymapping/fit.mole.probe" ]] || return 1
+    [[ "$result" != *"fit.mole.probex"* ]] || return 1
+    [[ "$result" == *"$HOME/Applications/PlayCover/Mole Probe Copy.app"* ]] || return 1
+    [[ "$result" != *"Forged.app"* ]] || return 1
+    [[ "$result" == *"$root/App Settings/fit.mole.probe.plist"* ]] || return 1
+    [[ "$result" == *"$root/Keymapping/fit.mole.probe.plist"* ]] || return 1
+    [[ "$result" == *"$root/Entitlements/fit.mole.probe.plist"* ]] || return 1
+    [[ "$result" == *"$HOME/Applications/PlayCover/Mole Probe.app"* ]] || return 1
+    [[ "$result" != *"PlayChain"* ]] || return 1
+    [[ "$result" != *"fit.mole.probe.other.plist"* ]] || return 1
+    [[ "$result" != *"Other.app"* ]] || return 1
+
+    # The same bundle id from any other app path gets none of these.
+    result=$(find_app_files "fit.mole.probe" "Mole Probe" "$HOME/Applications/Mole Probe.app")
+    [[ "$result" != *"io.playcover.PlayCover"* ]] || return 1
+    [[ "$result" != *"Applications/PlayCover"* ]]
+}
+
+@test "force_kill_app matches a PlayCover bundle by its executable, not its display name (#1715)" {
+    local bundle="$HOME/Library/Containers/io.playcover.PlayCover/Applications/fit.mole.probe.app"
+    mkdir -p "$bundle"
+    printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>fit.mole.probe</string><key>CFBundleExecutable</key><string>MoleProbe</string></dict></plist>' > "$bundle/Info.plist"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/base.sh"
+source "$PROJECT_ROOT/lib/core/log.sh"
+source "$PROJECT_ROOT/lib/core/app_protection.sh"
+# force_kill_app silences pgrep, so the stub records its arguments in a file.
+pgrep() { echo "PGREP:$*" >> "$HOME/pgrep.log"; return 1; }
+force_kill_app "Mole Probe" "$HOME/Library/Containers/io.playcover.PlayCover/Applications/fit.mole.probe.app"
+cat "$HOME/pgrep.log"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"PGREP:-x MoleProbe"* ]] || return 1
+    [[ "$output" != *"PGREP:-x Mole Probe"* ]]
+}
+
+@test "find_app_files finds the crash reporter and Darwin cache folders named by the exact bundle id (#1736)" {
+    local id="com.example.starry.proplus.8.osx"
+    local reporter="$HOME/Library/Caches/com.plausiblelabs.crashreporter.data"
+    mkdir -p "$reporter/$id" "$reporter/com.example.other" "$HOME/darwin-cache/C/$id" "$HOME/darwin-cache/C/com.example.other"
+    echo x > "$reporter/$id/report"
+    echo x > "$HOME/darwin-cache/C/$id/data"
+    mole_darwin_user_cache_root() { printf '%s\n' "$HOME/darwin-cache/C"; }
+
+    result=$(find_app_files "$id" "Starry Night")
+
+    [[ "$result" == *"$reporter/$id"* ]] || return 1
+    [[ "$result" == *"$HOME/darwin-cache/C/$id"* ]] || return 1
+    # Exact id only: a neighbor of the same vendor and the shared roots stay.
+    [[ "$result" != *"com.example.other"* ]] || return 1
+    [[ "$result" != *"$reporter"$'\n'* ]] || return 1
+    [[ "$result" != *"darwin-cache/C"$'\n'* ]] || return 1
+}
+
+@test "find_app_files skips the Darwin cache folder when its root cannot be resolved (#1736)" {
+    local id="com.example.starry.proplus.8.osx"
+    mkdir -p "$HOME/darwin-cache/C/$id"
+    mole_darwin_user_cache_root() { return 1; }
+
+    result=$(find_app_files "$id" "Starry Night")
+
+    [[ "$result" != *"darwin-cache"* ]] || return 1
 }

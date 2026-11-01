@@ -1,8 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-	export PROJECT_ROOT
+	mole_test_setup_project_root
 
 	TEST_HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-optimize-removals.XXXXXX")"
 	export TEST_HOME
@@ -73,26 +74,6 @@ EOF
 	[[ "$output" != *"App saved states optimized"* ]] || return 1
 }
 
-@test "launch agent cleanup reports a failed removal" {
-	run env HOME="$TEST_HOME/launch-agent" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
-set -euo pipefail
-source "$PROJECT_ROOT/lib/core/common.sh"
-source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-
-plist="$HOME/Library/LaunchAgents/com.test.broken.plist"
-mkdir -p "$(dirname "$plist")"
-/usr/libexec/PlistBuddy -c "Add :Program string /missing/test-agent" "$plist" > /dev/null 2>&1
-safe_remove() { return 1; }
-launchctl() { return 0; }
-
-execute_optimization launch_agents_cleanup
-[[ "$(optimize_outcome_count failed)" == "1" ]] || exit 1
-EOF
-
-	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-	[[ "$output" == *"Failed to remove 1 broken Launch Agent(s)"* ]] || return 1
-}
-
 @test "shared file list repair reports a failed removal" {
 	run env HOME="$TEST_HOME/shared-list" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -113,7 +94,31 @@ EOF
 	[[ "$output" == *"Failed to repair 1 corrupted shared file list(s)"* ]] || return 1
 }
 
-@test "CoreDuet cleanup reports a failed sidecar removal" {
+@test "shared file list repair inspects and removes corrupted .sfl4 files" {
+	run env HOME="$TEST_HOME/shared-list-sfl4" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+
+sfl_dir="$HOME/Library/Application Support/com.apple.sharedfilelist"
+mkdir -p "$sfl_dir"
+touch "$sfl_dir/com.test.invalid.sfl4"
+plutil() { return 1; }
+safe_remove() {
+	printf '%s\n' "$1" >> "$HOME/removed.trace"
+	return 0
+}
+
+execute_optimization shared_file_list_repair
+[[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
+[[ "$(cat "$HOME/removed.trace")" == "$sfl_dir/com.test.invalid.sfl4" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"Repaired 1 corrupted shared file list(s)"* ]] || return 1
+}
+
+@test "CoreDuet cleanup leaves sidecars to SQLite even when pruning fails" {
 	run env HOME="$TEST_HOME/coreduet" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -121,17 +126,25 @@ source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 
 knowledge_dir="$HOME/Library/Application Support/Knowledge"
 mkdir -p "$knowledge_dir"
-touch "$knowledge_dir/knowledgeC.db" "$knowledge_dir/knowledgeC.db-wal"
+printf 'database' > "$knowledge_dir/knowledgeC.db"
+printf 'committed recovery data' > "$knowledge_dir/knowledgeC.db-wal"
+printf 'shared state' > "$knowledge_dir/knowledgeC.db-shm"
 run_with_timeout() { echo "112640 total"; }
-safe_remove() { return 1; }
-sqlite3() { return 0; }
+# Task call sites send safe_remove output to /dev/null, so a printed marker
+# would never reach $output. Record the call in a file the checks below read.
+safe_remove() { printf '%s\n' "$1" >> "$HOME/unexpected-removals"; return 1; }
+sqlite3() { echo 'SQL_ATTEMPT'; return 1; }
 
 execute_optimization coreduet_cleanup
 [[ "$(optimize_outcome_count failed)" == "1" ]] || exit 1
+[[ "$(cat "$knowledge_dir/knowledgeC.db-wal")" == "committed recovery data" ]] || exit 1
+[[ "$(cat "$knowledge_dir/knowledgeC.db-shm")" == "shared state" ]] || exit 1
+[[ ! -e "$HOME/unexpected-removals" ]] || { cat "$HOME/unexpected-removals"; exit 1; }
 EOF
 
 	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-	[[ "$output" == *"Knowledge database cleanup incomplete"* ]] || return 1
+	[[ "$output" == *"busy or locked"* ]] || return 1
+	[[ "$output" == *"SQL_ATTEMPT"* ]]
 }
 
 @test "CoreDuet cleanup preserves sidecars when sqlite3 is unavailable" {
@@ -145,7 +158,8 @@ wal_file="$knowledge_dir/knowledgeC.db-wal"
 mkdir -p "$knowledge_dir"
 touch "$knowledge_dir/knowledgeC.db" "$wal_file"
 run_with_timeout() { echo "112640 total"; }
-awk() { echo "112640"; }
+# Drain the producer under pipefail even though PATH hides sqlite3 below.
+awk() { /usr/bin/awk "$@"; }
 safe_remove() {
     echo "UNEXPECTED_REMOVE:$1"
     return 0

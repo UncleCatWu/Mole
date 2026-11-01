@@ -8,13 +8,14 @@ import (
 	"time"
 )
 
-func collectHardware(totalRAM uint64, disks []DiskStatus) HardwareInfo {
+// collectHardwareStatic runs the slow subprocess half of the hardware card.
+// collectFull schedules it inside its concurrent burst; finishHardware fills
+// the fields that depend on that burst's memory and disk results.
+func collectHardwareStatic() HardwareInfo {
 	if runtime.GOOS != "darwin" {
 		return HardwareInfo{
 			Model:       "Unknown",
 			CPUModel:    runtime.GOARCH,
-			TotalRAM:    humanBytes(totalRAM),
-			DiskSize:    "Unknown",
 			OSVersion:   runtime.GOOS,
 			RefreshRate: "",
 		}
@@ -67,19 +68,21 @@ func collectHardware(totalRAM uint64, disks []DiskStatus) HardwareInfo {
 		refreshRate = parseRefreshRate(out3)
 	}
 
-	diskSize := "Unknown"
-	if len(disks) > 0 {
-		diskSize = humanBytes(disks[0].Total)
-	}
-
 	return HardwareInfo{
 		Model:       model,
 		CPUModel:    cpuModel,
-		TotalRAM:    humanBytes(totalRAM),
-		DiskSize:    diskSize,
 		OSVersion:   osVersion,
 		RefreshRate: refreshRate,
 	}
+}
+
+func finishHardware(hw HardwareInfo, totalRAM uint64, disks []DiskStatus) HardwareInfo {
+	hw.TotalRAM = humanBytes(totalRAM)
+	hw.DiskSize = "Unknown"
+	if runtime.GOOS == "darwin" && len(disks) > 0 {
+		hw.DiskSize = humanBytes(disks[0].Total)
+	}
+	return hw
 }
 
 // parseRefreshRate extracts the highest refresh rate from system_profiler display output.

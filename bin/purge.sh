@@ -5,6 +5,13 @@
 
 set -euo pipefail
 
+# User state and installed tools must never run with inherited root privileges.
+# Individual maintenance operations request administrator access themselves.
+if [[ "$EUID" -eq 0 ]]; then
+    printf '%s\n' 'Run Mole without sudo; it requests administrator access when needed.' >&2
+    exit 1
+fi
+
 # Fix locale issues (avoid Perl warnings on non-English systems)
 export LC_ALL=C
 export LANG=C
@@ -25,7 +32,7 @@ source "$SCRIPT_DIR/../lib/clean/project.sh"
 
 # Purge ends at safe_remove just like clean, so initialize the invoking user's
 # whitelist before project discovery or the interactive selection begins.
-load_mole_whitelist
+load_mole_whitelist || exit 1
 
 # Configuration
 CURRENT_SECTION=""
@@ -112,20 +119,13 @@ start_purge() {
         printf '\033[2J\033[H'
     fi
 
-    # Initialize stats file in user cache directory
-    local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
-    ensure_user_dir "$stats_dir"
-    ensure_user_file "$stats_dir/purge_stats"
-    ensure_user_file "$stats_dir/purge_count"
-    ensure_user_file "$stats_dir/purge_scanning"
-    echo "0" > "$stats_dir/purge_stats"
-    echo "0" > "$stats_dir/purge_count"
-    echo "" > "$stats_dir/purge_scanning"
 }
 
 # Perform the purge
 perform_purge() {
-    local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+    local _MOLE_PURGE_STATE_DIR=""
+    mole_purge_init_run_state || return 1
+    local stats_dir="$_MOLE_PURGE_STATE_DIR"
     local monitor_pid=""
 
     # Cleanup function - use flag to prevent duplicate execution
@@ -176,7 +176,7 @@ perform_purge() {
 
         # Start background monitor: writes directly to /dev/tty to avoid stdout state issues
         (
-            local spinner_chars="|/-\\"
+            mo_load_spinner_frames
             local spinner_idx=0
             local last_path=""
             # Use parent-captured width; never refresh inside the loop (avoids unreliable tput in bg)
@@ -203,8 +203,8 @@ perform_purge() {
                     last_path="$display_path"
                 fi
 
-                local spin_char="${spinner_chars:$spinner_idx:1}"
-                spinner_idx=$(((spinner_idx + 1) % ${#spinner_chars}))
+                local spin_char="${MO_SPINNER_FRAMES[$spinner_idx]}"
+                spinner_idx=$(((spinner_idx + 1) % ${#MO_SPINNER_FRAMES[@]}))
 
                 # Write directly to /dev/tty: \033[2K clears entire current line, \r goes to start
                 if [[ -n "$last_path" ]]; then
@@ -310,8 +310,9 @@ show_help() {
     echo "  --paths         Edit custom scan directories"
     echo "  --dry-run       Preview purge actions without making changes"
     echo "  --include-empty Show zero-size project artifact directories"
+    echo "  --yes           Confirm unattended cleanup of eligible artifacts"
     echo "  --debug         Enable debug logging"
-    echo "  --help          Show this help message"
+    echo "  -h, --help      Show this help message"
     echo ""
     echo -e "${YELLOW}Default Paths:${NC}"
     for path in "${DEFAULT_PURGE_SEARCH_PATHS[@]}"; do
@@ -329,7 +330,7 @@ main() {
                 manage_purge_paths
                 exit 0
                 ;;
-            "--help")
+            "--help" | "-h")
                 show_help
                 exit 0
                 ;;
@@ -338,6 +339,9 @@ main() {
                 ;;
             "--dry-run" | "-n")
                 export MOLE_DRY_RUN=1
+                ;;
+            "--yes")
+                export MOLE_PURGE_YES=1
                 ;;
             "--include-empty")
                 export MOLE_PURGE_INCLUDE_EMPTY=1

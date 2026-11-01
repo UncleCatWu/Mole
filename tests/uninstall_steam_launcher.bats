@@ -1,12 +1,13 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 # Steam's macOS shortcut for a game is a tiny shell launcher whose bundle
 # size is not the installed game size. Mole should label these bundles as
 # Steam-managed instead of presenting the shortcut size as the app size.
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_project_root
 }
 
 setup() {
@@ -178,16 +179,15 @@ EOF
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
-source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/uninstall.sh"
 source "$PROJECT_ROOT/lib/uninstall/steam.sh"
-eval "$(sed -n '/^uninstall_normalize_size_display()/,/^}/p' "$PROJECT_ROOT/bin/uninstall.sh")"
 printf '%s\n' "$(uninstall_normalize_size_display "93KB" "$HOME/Applications/SteamGame.app")"
 printf '%s\n' "$(uninstall_normalize_size_display "--" "$HOME/Applications/SteamGame.app")"
 printf '%s\n' "$(uninstall_normalize_size_display "420MB" "$HOME/Applications/RegularApp.app")"
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"N/A (Steam-managed)"* ]]
+    [[ "$output" == *"N/A (Steam-managed)"* ]] || return 1
     [[ "$output" != *"93KB"* ]]
 }
 
@@ -197,10 +197,9 @@ EOF
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TERM="dumb" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
-source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/uninstall.sh"
 source "$PROJECT_ROOT/lib/uninstall/steam.sh"
 source "$PROJECT_ROOT/lib/ui/app_selector.sh"
-eval "$(sed -n '/^uninstall_normalize_size_display()/,/^}/p' "$PROJECT_ROOT/bin/uninstall.sh")"
 
 apps_data=("1700000000|$HOME/Applications/SteamGame.app|SteamGame|com.example.steamgame|93KB|Today|95")
 selected_apps=()
@@ -215,8 +214,19 @@ select_apps_for_uninstall
 EOF
 
     [ "$status" -ne 0 ]
-    [[ "$output" == *"N/A (Steam-managed)"* ]]
-    [[ "$output" != *"93KB"* ]]
+    # Selector column is 9 wide; the list/json label is kept off this row.
+    [[ "$output" == *"    Steam |"* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"N/A (Steam-managed)"* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"93KB"* ]] || {
+        echo "$output"
+        return 1
+    }
 }
 
 @test "uninstall --list reports Steam launchers as Steam-managed" {
@@ -281,10 +291,58 @@ sudo_apps=()
 brew_cask_apps=()
 total_estimated_size=8
 
-printf '\n' | _batch_preview_and_confirm
+printf '\n' | MOLE_TEST_MODE=1 _batch_preview_and_confirm
 EOF
 
     [ "$status" -eq 0 ] || return 1
     [[ "$output" == *"N/A (Steam-managed)"* ]] || return 1
     [[ "$output" == *"Steam launcher only; game files managed by Steam are not included"* ]]
+}
+
+@test "uninstall_steam_launcher_appid still checks a launcher inside a MacOS subdirectory" {
+    app="$HOME/Applications/NestedGame.app"
+    create_steam_launcher_app "$app" "570"
+    mkdir -p "$app/Contents/MacOS/bin"
+    mv "$app/Contents/MacOS/SteamGame" "$app/Contents/MacOS/bin/SteamGame"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable bin/SteamGame' "$app/Contents/Info.plist"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/steam.sh"
+uninstall_steam_launcher_appid "$HOME/Applications/NestedGame.app"
+SCRIPT
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == "570" ]]
+}
+
+@test "uninstall_steam_launcher_appid rules out a bundle with no script executable" {
+    app="$HOME/Applications/NativeApp.app"
+    create_regular_app "$app"
+    printf '\xcf\xfa\xed\xfe binary' > "$app/Contents/MacOS/RegularApp"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/steam.sh"
+uninstall_steam_launcher_appid "$HOME/Applications/NativeApp.app"
+SCRIPT
+
+    [ "$status" -eq 1 ]
+    [ -z "$output" ]
+}
+
+@test "uninstall_steam_launcher_appid still checks a hidden launcher executable" {
+    app="$HOME/Applications/HiddenGame.app"
+    create_steam_launcher_app "$app" "730"
+    mv "$app/Contents/MacOS/SteamGame" "$app/Contents/MacOS/.SteamGame"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable .SteamGame' "$app/Contents/Info.plist"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/steam.sh"
+uninstall_steam_launcher_appid "$HOME/Applications/HiddenGame.app"
+SCRIPT
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == "730" ]]
 }

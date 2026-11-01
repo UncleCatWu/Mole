@@ -1,10 +1,12 @@
 #!/usr/bin/env bats
+
+load helpers/common
+
 # Verify color detection: NO_COLOR per https://no-color.org, TERM=dumb, and
 # stdout that is not a terminal.
 
 setup_file() {
-	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-	export PROJECT_ROOT
+	mole_test_setup_project_root
 }
 
 setup() {
@@ -62,21 +64,21 @@ _color_payload() {
 }
 
 @test "a terminal keeps ANSI escapes" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect ]]; then
-		skip "macOS expect required"
+	if [[ "$(uname -s)" != "Darwin" ]]; then
+		skip "macOS owned PTY required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/color_tty.exp" "$PROJECT_ROOT" xterm-256color
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" color xterm-256color
 	[ "$status" -eq 0 ]
 	[ "$(_color_payload "$output")" = $'\033[0;32mx\033[0m' ]
 }
 
 @test "TERM=dumb drops ANSI escapes on a terminal" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect ]]; then
-		skip "macOS expect required"
+	if [[ "$(uname -s)" != "Darwin" ]]; then
+		skip "macOS owned PTY required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/color_tty.exp" "$PROJECT_ROOT" dumb
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" color dumb
 	[ "$status" -eq 0 ]
 	[ "$(_color_payload "$output")" = "x" ]
 }

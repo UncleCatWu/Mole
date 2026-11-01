@@ -27,6 +27,28 @@ Run tests:
 ./scripts/test.sh
 ```
 
+Run a focused Bats selection through the same test-only boundary:
+
+```bash
+./scripts/test_sandbox.sh bats tests/clean_user_core.bats
+```
+
+The runner copies current source files into a private directory and uses
+macOS `sandbox-exec` to deny writes outside that run, external network access,
+and real authorization/system-control executables. Test fixtures can still be
+removed inside that directory. `MOLE_TEST_NO_AUTH=1` and a fixture `HOME` alone
+are not filesystem isolation; direct Bats calls are not a supported substitute.
+Supported Bats file/run fields also trigger the library boundary when explicit
+test flags are forgotten. A subprocess that clears its environment can erase
+that context; the wrapper's inherited kernel sandbox remains the protection.
+Missing sandbox support fails closed. Failed runs print their retained artifact
+directory; successful runs remove only the directory they created. Historical
+`tests/tmp-*` directories in the original checkout are never swept. Reports and
+caches stay inside the run; an external `MOLE_TEST_REPORT_DIR` is refused.
+The final installation stage checks entrypoint syntax only and performs no
+installation. Installation/update behavior is covered by the private mocked
+Bats regressions; syntax success alone is not installation acceptance.
+
 ## Code Style
 
 ### Basic Rules
@@ -130,10 +152,10 @@ Format: `[MODULE_NAME] message` output to stderr.
 
 ## Requirements
 
-- macOS 10.14 or newer, works on Intel and Apple Silicon
-- Default macOS Bash 3.2+ plus administrator privileges for cleanup tasks
-- Install Command Line Tools with `xcode-select --install` for curl, tar, and related utilities
-- Go 1.24+ is required to build the `mo status` or `mo analyze` TUI binaries locally.
+- macOS 12 or newer, works on Intel and Apple Silicon
+- Default macOS Bash 3.2+; administrator privileges are required for system-level cleanup tasks
+- Command Line Tools (`xcode-select --install`) for curl, tar, and standard utilities
+- Go 1.26+ is required to build the `mo status` or `mo analyze` TUI binaries locally.
 
 ## Go Components
 
@@ -141,13 +163,13 @@ Format: `[MODULE_NAME] message` output to stderr.
 
 **Code organization:**
 
-- Each module split into focused files by responsibility
-- `cmd/analyze/` - Disk analyzer with 7 files under 500 lines each
-- `cmd/status/` - System monitor with metrics split into 11 domain files
+- Each module is split into focused files by responsibility.
+- `cmd/analyze/` owns disk traversal, caching, deletion, navigation, and rendering.
+- `cmd/status/` keeps collection, automation output, preferences, and rendering separate.
 
 **Development workflow:**
 
-- Format code with `gofmt -w ./cmd/...`
+- Format code with `./scripts/check.sh --format`
 - Run `go vet ./cmd/...` to check for issues
 - Build with `go build ./...` to verify all packages compile
 
@@ -168,10 +190,10 @@ For releases, GitHub Actions builds architecture-specific binaries automatically
 
 **Guidelines:**
 
-- Keep files focused on single responsibility
-- Extract constants instead of magic numbers
+- Keep files focused on a single responsibility
+- Use named constants instead of magic numbers
 - Use context for timeout control on external commands
-- Add comments explaining **why** something is done, not just **what** is being done.
+- Add comments explaining the **why** behind non-obvious logic, not just what the code does
 
 ## Pull Requests
 
@@ -182,3 +204,9 @@ For releases, GitHub Actions builds architecture-specific binaries automatically
 5. Open PR targeting `main`
 
 CI will verify formatting, linting, and tests.
+
+## Licensing
+
+Mole is GPL-3.0, and that is the licence your contribution carries. There is no CLA. You keep your copyright and I get only what the licence gives me, which means I cannot put your code under a different one.
+
+I also sell a closed-source Mac app at [mole.fit](https://mole.fit). It is a separate codebase rather than a build of this one, and neither program calls the other. What the two share is what anyone can observe about macOS: where a cache lives, what an app leaves behind. If you would rather not contribute alongside a paid product, that is a fair call, and I would rather you made it now than later.

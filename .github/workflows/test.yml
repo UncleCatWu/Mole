@@ -5,6 +5,7 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,23 +23,29 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
-        run: brew install bats-core shellcheck coreutils parallel
+        # fd keeps tests/installer_fd.bats in the run: scripts/test.sh drops the
+        # whole file when fd is missing, which silently hid its 25 cases.
+        run: brew install bats-core shellcheck coreutils parallel fd
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
+      - name: Provision Go modules for offline tests
+        run: go mod download
+
       - name: Run test script
         env:
-          MOLE_PERF_BYTES_TO_HUMAN_LIMIT_MS: "6000"
-          MOLE_PERF_GET_FILE_SIZE_LIMIT_MS: "3000"
+          # The perf cases now time a plain child shell, not the Bats DEBUG
+          # trap, so these budgets can be tight enough to catch a new fork per
+          # call while still leaving several times the local measurement.
+          MOLE_PERF_BYTES_TO_HUMAN_LIMIT_MS: "1000"
           MOLE_PERF_NORMALIZE_PATHS_LIMIT_MS: "10000"
           MOLE_TEST_JOBS: "6"
           # Emits a "Slowest test files" table at the end of the run. Parallel
           # TAP output cannot be attributed to a file, so without this a single
           # slow file that sets the whole job's wall clock stays invisible.
-          MOLE_TEST_REPORT_DIR: ${{ runner.temp }}/bats-report
           BATS_FORMATTER: tap
           LANG: en_US.UTF-8
           LC_ALL: en_US.UTF-8
@@ -46,9 +53,13 @@ jobs:
 
   compatibility:
     name: macOS
+    # Hosted runtime coverage is macOS 15 and 26, not macOS 14. macOS 26 is
+    # pinned so it stays a distinct lane after macos-latest, which the full
+    # test job uses, moves on. Release builds separately enforce an
+    # LC_BUILD_VERSION minimum of macOS 12 in check_release_minos.sh.
     strategy:
       matrix:
-        os: [macos-14, macos-15]
+        os: [macos-15, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -62,12 +73,14 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Provision Go modules for offline tests
+        run: go mod download
+
       - name: Smoke load on ${{ matrix.os }}
         run: |
-          echo "Testing on ${{ matrix.os }}..."
-          bash -n mole
-          source lib/core/common.sh
-          echo "✓ Successfully loaded on ${{ matrix.os }}"
+          /bin/bash scripts/test_sandbox.sh /bin/bash -c '
+            bash -n mole && source lib/core/common.sh && echo "✓ Successfully loaded"
+          '
 
       - name: Run core bats subset
         env:
@@ -76,12 +89,19 @@ jobs:
           BATS_FORMATTER: tap
           LANG: en_US.UTF-8
           LC_ALL: en_US.UTF-8
+        # clean_app_caches.bats is here because it is the suite that reads
+        # system tool output whose format varies by macOS version, which the
+        # full run on macos-latest cannot see. tw93/Mole#1512 was reported on
+        # macOS 15, fixed, then silently regressed for eight days with CI green
+        # the whole time, because that file was not in this subset. It adds
+        # about 16s to a job that runs in 90s under a 30 minute budget.
         run: |
-          bats tests/core_safe_functions.bats \
+          /bin/bash scripts/test_sandbox.sh bats tests/core_safe_functions.bats \
                tests/core_common.bats \
                tests/core_timeout.bats \
                tests/regression.bats \
-               tests/cli.bats
+               tests/cli.bats \
+               tests/clean_app_caches.bats
 
   security:
     name: Security Checks
@@ -96,18 +116,12 @@ jobs:
         run: brew install bats-core coreutils
 
       - name: Check for unsafe rm usage
-        run: |
-          echo "Checking for unsafe rm patterns..."
-          # Filters in order:
-          #   safe_remove / validate_path: known safe wrapper helpers in file_ops.sh
-          #   # SAFE: explicit annotation that a direct rm is gated by narrow checks
-          #   ^path:line:[ws]#: pure comment lines that mention rm -rf in docs
-          #   echo : help text or messages that print rm -rf as documentation
-          if grep -rn "rm -rf" lib/ bin/ install.sh mole 2>/dev/null | grep -v -E "safe_remove|validate_path|# SAFE|^[^:]+:[0-9]+:[[:space:]]*#|echo "; then
-            echo "✗ Unsafe rm -rf usage found (annotate gated calls with '# SAFE: <reason>' or route through safe_remove)"
-            exit 1
-          fi
-          echo "✓ No unsafe rm usage found"
+        run: python3 scripts/audit_destructive_sinks.py
+
+      # The only job with full history, so the ledger's commits are resolved
+      # here; check.sh in the shallow Check job only shape-checks them.
+      - name: Check the incident ledger
+        run: python3 scripts/audit_incidents.py
 
       - name: Verify app protection
         run: |
@@ -134,4 +148,4 @@ jobs:
           BATS_FORMATTER: tap
           LANG: en_US.UTF-8
           LC_ALL: en_US.UTF-8
-        run: bats tests/core_safe_functions.bats tests/purge.bats tests/installer.bats
+        run: /bin/bash scripts/test_sandbox.sh bats tests/core_safe_functions.bats tests/purge.bats tests/installer.bats

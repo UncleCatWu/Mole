@@ -22,6 +22,13 @@ _preference_plist_is_protected() {
     return 1
 }
 
+# Lint through the system binary by absolute path: a PATH shim must never
+# decide whether a user preference file is corrupt. Tests replace this
+# function to count probes.
+_mole_plutil_lint() {
+    /usr/bin/plutil -lint "$@"
+}
+
 _repair_preference_plists_in_dir() {
     local search_dir="$1"
     local maxdepth="$2"
@@ -66,13 +73,22 @@ _repair_preference_plists_in_dir() {
         fi
         local -a batch=("${candidates[@]:start:batch_size}")
         start=$((start + batch_size))
-        if plutil -lint "${batch[@]}" > /dev/null 2>&1; then
+        if _mole_plutil_lint "${batch[@]}" > /dev/null 2>&1; then
             continue
         fi
         local candidate=""
         for candidate in "${batch[@]}"; do
             [[ -f "$candidate" ]] || continue
-            plutil -lint "$candidate" > /dev/null 2>&1 && continue
+            # A file the current user cannot read is unknown, never corrupt.
+            # Deleting it would destroy settings that may be perfectly valid.
+            if [[ ! -r "$candidate" ]]; then
+                debug_log "Kept unreadable preference plist: $candidate"
+                if declare -f log_operation > /dev/null 2>&1; then
+                    log_operation "optimize" "SKIPPED" "$candidate" "unreadable preference"
+                fi
+                continue
+            fi
+            _mole_plutil_lint "$candidate" > /dev/null 2>&1 && continue
             if declare -f should_protect_path > /dev/null 2>&1 && should_protect_path "$candidate"; then
                 continue
             fi

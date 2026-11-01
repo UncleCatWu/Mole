@@ -14,8 +14,6 @@ source "$_MOLE_OPTIMIZE_TASKS_DIR/catalog.sh"
 source "$_MOLE_OPTIMIZE_TASKS_DIR/outcomes.sh"
 
 # Config constants (override via env).
-readonly MOLE_TM_THIN_TIMEOUT=180
-readonly MOLE_TM_THIN_VALUE=9999999999
 readonly MOLE_SQLITE_MAX_SIZE=104857600 # 100MB
 
 # Dry-run aware output.
@@ -55,7 +53,7 @@ opt_existing_path_size_kb() {
     local size_kb=0
     local size_rc=0
     size_kb=$(get_path_size_kb "$path" 2> /dev/null) || size_rc=$?
-    [[ $size_rc -eq 124 || $size_rc -ge 128 ]] && return "$size_rc"
+    mole_rc_timeout_or_signal "$size_rc" && return "$size_rc"
     [[ $size_rc -eq 0 ]] || size_kb=0
     opt_numeric_kb "$size_kb"
 }
@@ -66,33 +64,6 @@ opt_existing_file_size_kb_strict() {
     bytes=$($STAT_BSD -f%z "$path" 2> /dev/null) || return 1
     [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
     echo "$(((bytes + 1023) / 1024))"
-}
-
-run_launchctl_unload() {
-    local plist_file="$1"
-    local need_sudo="${2:-false}"
-
-    if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
-        return 0
-    fi
-
-    if [[ "$need_sudo" == "true" ]]; then
-        if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
-            return 0
-        fi
-        if ! optimize_sudo_available; then
-            return 0
-        fi
-        local unload_rc=0
-        run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" sudo launchctl \
-            unload "$plist_file" 2> /dev/null || unload_rc=$?
-    else
-        local unload_rc=0
-        run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" launchctl \
-            unload "$plist_file" 2> /dev/null || unload_rc=$?
-    fi
-    [[ $unload_rc -eq 124 || $unload_rc -ge 128 ]] && return "$unload_rc"
-    return 0
 }
 
 needs_permissions_repair() {
@@ -164,8 +135,13 @@ has_active_vpn_interface() {
     fi
     local route_output=""
     local route_status=0
-    route_output=$(LC_ALL=C run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" route -n get default 2> /dev/null) || route_status=$?
+    route_output=$(LC_ALL=C run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" route -n get default 2>&1) || route_status=$?
     if [[ $route_status -ne 0 ]]; then
+        # No default route at all (offline): no full-tunnel VPN can be
+        # routing traffic, so that is a known "none", not an unknown state.
+        if [[ "$route_output" == *"not in table"* ]]; then
+            return 1
+        fi
         return 2
     fi
     local default_iface
@@ -178,9 +154,23 @@ has_active_vpn_interface() {
     return 1
 }
 
+# Return 0 when the DNS cache was flushed (or would be in dry-run), 1 when the
+# flush failed or admin access is missing, 2 when an active VPN skipped it, 3
+# when the VPN state is unknown, and 4 when the directory cache was flushed but
+# macOS refused the mDNSResponder signal. SIGHUP makes mDNSResponder drop its cache,
+# and VPN clients that watch DNS configuration (WireGuard and similar) treat
+# that as a network change and reconnect. An unknown state also skips, like
+# opt_network_stack_optimize, because the probe could not rule a VPN out.
 flush_dns_cache() {
+    local vpn_status=0
+    has_active_vpn_interface || vpn_status=$?
+    case "$vpn_status" in
+        0) return 2 ;;
+        1) ;;
+        *) return 3 ;;
+    esac
+
     if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
-        MOLE_DNS_FLUSHED=1
         return 0
     fi
 
@@ -188,42 +178,25 @@ flush_dns_cache() {
         return 1
     fi
 
-    if sudo dscacheutil -flushcache 2> /dev/null && sudo killall -HUP mDNSResponder 2> /dev/null; then
-        MOLE_DNS_FLUSHED=1
-        return 0
-    fi
+    # Newer macOS keeps the same system plist but names the service .reloaded.
+    # Read only that SIP-protected plist; never discover a target by process name or PID.
+    local service_label=""
+    service_label=$(/usr/bin/plutil -extract Label raw -o - \
+        /System/Library/LaunchDaemons/com.apple.mDNSResponder.plist 2> /dev/null) || return 1
+    case "$service_label" in
+        com.apple.mDNSResponder | com.apple.mDNSResponder.reloaded) ;;
+        *) return 1 ;;
+    esac
+
+    sudo dscacheutil -flushcache 2> /dev/null || return 1
+    local signal_error="" signal_status=0
+    { signal_error=$(sudo /bin/launchctl kill SIGHUP "system/$service_label" 2>&1 >&3); } 3>&1 || signal_status=$?
+    [[ $signal_status -eq 0 ]] && return 0
+    # macOS 27 refuses this signal to every caller, root included (#1867).
+    # That is the OS withholding the action, not a failed refresh, and the
+    # name-based killall it would take to get past it is still refused above.
+    [[ "$signal_error" == *"Not privileged to signal service"* ]] && return 4
     return 1
-}
-
-# Basic system maintenance.
-opt_system_maintenance() {
-    if [[ "${MOLE_DRY_RUN:-0}" != "1" ]] && ! optimize_sudo_available; then
-        opt_msg "DNS & Spotlight check skipped (admin access required)"
-        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_SKIPPED"
-        return 0
-    fi
-
-    local dns_flushed="false"
-    if flush_dns_cache; then
-        opt_msg "DNS cache flushed"
-        dns_flushed="true"
-    fi
-
-    local spotlight_status=""
-    local spotlight_failed=0
-    if ! spotlight_status=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" mdutil -s / 2> /dev/null); then
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to verify Spotlight index"
-        spotlight_failed=1
-    elif echo "$spotlight_status" | grep -qi "Indexing disabled"; then
-        echo -e "  ${GRAY}${ICON_EMPTY}${NC} Spotlight indexing disabled"
-    else
-        opt_msg "Spotlight index verified"
-    fi
-
-    local applied=0
-    local failed="$spotlight_failed"
-    [[ "$dns_flushed" == "true" ]] && applied=1 || failed=$((failed + 1))
-    optimize_task_result_from_counts "$applied" "$failed"
 }
 
 # Refresh Finder caches (QuickLook/icon services).
@@ -274,7 +247,7 @@ opt_cache_refresh() {
         local size_kb=0
         local size_rc=0
         size_kb=$(opt_existing_path_size_kb "$target_path") || size_rc=$?
-        [[ $size_rc -eq 124 || $size_rc -ge 128 ]] && return "$size_rc"
+        mole_rc_timeout_or_signal "$size_rc" && return "$size_rc"
         [[ $size_rc -eq 0 ]] || size_kb=0
         removable_targets+=("$target_path")
         removable_sizes+=("$size_kb")
@@ -301,7 +274,7 @@ opt_cache_refresh() {
         local remove_rc=0
         safe_remove "${removable_targets[$index]}" true \
             "${removable_sizes[$index]}" > /dev/null 2>&1 || remove_rc=$?
-        if [[ $remove_rc -eq 124 || $remove_rc -ge 128 ]]; then
+        if mole_rc_timeout_or_signal "$remove_rc"; then
             return "$remove_rc"
         elif [[ $remove_rc -eq 0 ]]; then
             removed_count=$((removed_count + 1))
@@ -362,7 +335,7 @@ opt_saved_state_cleanup() {
             > "$scan_file" 2> /dev/null || scan_rc=$?
         if [[ $scan_rc -ne 0 ]]; then
             : > "$scan_file" || true
-            [[ $scan_rc -eq 124 || $scan_rc -ge 128 ]] && return "$scan_rc"
+            mole_rc_timeout_or_signal "$scan_rc" && return "$scan_rc"
             echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to scan old saved states"
             scan_failed=1
         fi
@@ -372,7 +345,7 @@ opt_saved_state_cleanup() {
             fi
             local remove_rc=0
             safe_remove "$state_path" true > /dev/null 2>&1 || remove_rc=$?
-            if [[ $remove_rc -eq 124 || $remove_rc -ge 128 ]]; then
+            if mole_rc_timeout_or_signal "$remove_rc"; then
                 return "$remove_rc"
             elif [[ $remove_rc -eq 0 ]]; then
                 removed=$((removed + 1))
@@ -444,17 +417,10 @@ opt_fix_broken_configs() {
 # DNS cache refresh.
 opt_network_optimization() {
     if [[ "${MO_DEBUG:-}" == "1" ]]; then
-        debug_operation_start "Network Optimization" "Refresh DNS cache and restart mDNSResponder"
-        debug_operation_detail "Method" "Flush DNS cache via dscacheutil and killall mDNSResponder"
+        debug_operation_start "Network Optimization" "Refresh DNS cache"
+        debug_operation_detail "Method" "dscacheutil -flushcache, then SIGHUP to mDNSResponder (skipped under an active VPN)"
         debug_operation_detail "Expected outcome" "Faster DNS resolution, fixed network connectivity issues"
         debug_risk_level "LOW" "DNS cache is automatically rebuilt"
-    fi
-
-    if [[ "${MOLE_DNS_FLUSHED:-0}" == "1" ]]; then
-        opt_msg "DNS cache already refreshed"
-        opt_msg "mDNSResponder already restarted"
-        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNCHANGED"
-        return 0
     fi
 
     if [[ "${MOLE_DRY_RUN:-0}" != "1" ]] && ! optimize_sudo_available; then
@@ -463,14 +429,30 @@ opt_network_optimization() {
         return 0
     fi
 
-    if flush_dns_cache; then
-        opt_msg "DNS cache refreshed"
-        opt_msg "mDNSResponder restarted"
-        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_APPLIED"
-    else
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to refresh DNS cache"
-        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
-    fi
+    local dns_status=0
+    flush_dns_cache || dns_status=$?
+    case "$dns_status" in
+        0)
+            opt_msg "DNS cache refreshed"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_APPLIED"
+            ;;
+        2)
+            opt_msg "DNS cache refresh skipped, active VPN detected"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_SKIPPED"
+            ;;
+        3)
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to inspect active VPN state"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+            ;;
+        4)
+            opt_msg "DNS cache refresh skipped, macOS does not allow signaling mDNSResponder"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_SKIPPED"
+            ;;
+        *)
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to refresh DNS cache"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+            ;;
+    esac
 }
 
 # Quarantine database cleanup (Gatekeeper download history).
@@ -663,7 +645,7 @@ opt_sqlite_vacuum() {
 
                 if [[ $exit_code -eq 0 ]]; then
                     vacuumed=$((vacuumed + 1))
-                elif [[ $exit_code -eq 124 ]]; then
+                elif mole_rc_timeout "$exit_code"; then
                     timed_out=$((timed_out + 1))
                 else
                     failed=$((failed + 1))
@@ -723,58 +705,6 @@ opt_sqlite_vacuum() {
     optimize_task_result_from_counts "$vacuumed" "$((timed_out + failed))" "$policy_skipped"
 }
 
-# LaunchServices rebuild ("Open with" issues).
-opt_launch_services_rebuild() {
-    if [[ "${MO_DEBUG:-}" == "1" ]]; then
-        debug_operation_start "LaunchServices Rebuild" "Rebuild LaunchServices database"
-        debug_operation_detail "Method" "Run lsregister -gc then force rescan with -r -f on local, user, and system domains"
-        debug_operation_detail "Purpose" "Fix \"Open with\" menu issues, file associations, and stale app metadata"
-        debug_operation_detail "Expected outcome" "Correct app associations, fixed duplicate entries, fewer stale app listings"
-        debug_risk_level "LOW" "Database is automatically rebuilt"
-    fi
-
-    if [[ -t 1 ]]; then
-        MOLE_SPINNER_PREFIX="  " start_inline_spinner "Repairing LaunchServices..."
-    fi
-
-    local lsregister
-    lsregister=$(get_lsregister_path)
-
-    if [[ -n "$lsregister" ]]; then
-        local success=0
-
-        if [[ "${MOLE_DRY_RUN:-0}" != "1" ]]; then
-            "$lsregister" -gc > /dev/null 2>&1 || true
-            "$lsregister" -r -f -domain local -domain user -domain system > /dev/null 2>&1 || success=$?
-            if [[ $success -ne 0 ]]; then
-                success=0
-                "$lsregister" -r -f -domain local -domain user > /dev/null 2>&1 || success=$?
-            fi
-        else
-            success=0
-        fi
-
-        if [[ -t 1 ]]; then
-            stop_inline_spinner
-        fi
-
-        if [[ $success -eq 0 ]]; then
-            opt_msg "LaunchServices repaired"
-            opt_msg "File associations refreshed"
-            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_APPLIED"
-        else
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to rebuild LaunchServices"
-            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
-        fi
-    else
-        if [[ -t 1 ]]; then
-            stop_inline_spinner
-        fi
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} lsregister not found"
-        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNAVAILABLE"
-    fi
-}
-
 # Removed high-risk optimizations:
 # - opt_startup_items_cleanup: Risk of deleting legitimate app helpers
 # - opt_dyld_cache_update: Low benefit, time-consuming, auto-managed by macOS
@@ -821,7 +751,7 @@ opt_network_stack_optimize() {
         dns_status=$?
     fi
 
-    if [[ $route_status -eq 124 || $dns_status -eq 124 ]]; then
+    if mole_rc_timeout "$route_status" || mole_rc_timeout "$dns_status"; then
         echo -e "  ${YELLOW}${ICON_WARNING}${NC} Network health check timed out"
         optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
         return 0
@@ -988,7 +918,7 @@ opt_spotlight_index_optimize() {
             run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemFSName == 'Applications'" > /dev/null 2>&1 || probe_status=$?
             test_end=$(get_epoch_seconds)
             test_duration=$((test_end - test_start))
-            if [[ $probe_status -eq 124 ]]; then
+            if mole_rc_timeout "$probe_status"; then
                 slow_count=$((slow_count + 1))
             elif [[ $probe_status -ne 0 ]]; then
                 probe_failed=$((probe_failed + 1))
@@ -1017,7 +947,7 @@ opt_spotlight_index_optimize() {
                     optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_SKIPPED"
                     return 0
                 fi
-                echo -e "  ${BLUE}${ICON_INFO}${NC} Spotlight search is slow, rebuilding index, may take 1-2 hours"
+                echo -e "  ${BLUE}${ICON_ADMIN}${NC} Spotlight search is slow, rebuilding index, may take 1-2 hours"
                 if sudo mdutil -E / > /dev/null 2>&1; then
                     opt_msg "Spotlight index rebuild started"
                     echo -e "  ${GRAY}Indexing will continue in background${NC}"
@@ -1055,9 +985,32 @@ opt_prune_spotlight_orphan_rules() {
         return 0
     fi
 
-    local -a keep=() removed=()
-    local i=0 entry
-    while entry=$(/usr/libexec/PlistBuddy -c "Print :EnabledPreferenceRules:$i" "$plist" 2> /dev/null); do
+    # Parse one complete immutable snapshot before resolving any apps. An
+    # indexed read failure against the live file is not an end-of-array marker.
+    local snapshot="" count="" entry="" i=0
+    local -a rules=() keep=() removed=()
+    if ! snapshot=$(/usr/bin/plutil -convert xml1 -o - "$plist" 2> /dev/null) ||
+        ! count=$(printf '%s' "$snapshot" | /usr/bin/plutil -extract EnabledPreferenceRules raw -expect array -o - - 2> /dev/null) ||
+        [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to inspect Spotlight search rules"
+        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+        return 0
+    fi
+    for ((i = 0; i < count; i++)); do
+        # The sentinel preserves trailing newlines in a stored string.
+        if ! entry=$(
+            printf '%s' "$snapshot" | /usr/bin/plutil -extract "EnabledPreferenceRules.$i" raw -expect string -o - - 2> /dev/null || exit $?
+            printf '\001'
+        ); then
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to inspect Spotlight search rules"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+            return 0
+        fi
+        entry="${entry%$'\001'}"
+        entry="${entry%$'\n'}" # plutil's terminating newline, not string content.
+        rules+=("$entry")
+    done
+    for entry in "${rules[@]+"${rules[@]}"}"; do
         case "$entry" in
             # Never touch system or Apple rules (e.g. System.iphoneApps); these
             # pass the reverse-DNS shape check but are not removable app bundles.
@@ -1068,7 +1021,13 @@ opt_prune_spotlight_orphan_rules() {
                 # Only act on well-formed bundle ids; bundle_has_installed_app
                 # double-checks with mdfind and a filesystem scan, so a return of
                 # 1 means the app is genuinely gone. Anything else is kept.
-                if ! mole_is_reverse_dns_bundle_id "$entry"; then
+                # Spotlight stores its own switches here too, such as
+                # Custom.relatedContents (Show Related Content), which pass the
+                # reverse-DNS shape but name no app; removing one flips the
+                # switch back on (#1878). Only a lowercase first label, the
+                # shape Mole Mac's spotlightRuleNamesAnApp accepts, can be an app.
+                if ! mole_is_reverse_dns_bundle_id "$entry" ||
+                    [[ ! "${entry%%.*}" =~ ^[a-z0-9]+$ ]]; then
                     keep+=("$entry")
                 else
                     local resolver_rc=0
@@ -1084,7 +1043,6 @@ opt_prune_spotlight_orphan_rules() {
                 fi
                 ;;
         esac
-        i=$((i + 1))
     done
 
     if [[ ${#removed[@]} -eq 0 ]]; then
@@ -1102,6 +1060,13 @@ opt_prune_spotlight_orphan_rules() {
     # Rewrite the filtered array through cfprefsd (defaults), not by deleting
     # plist indices in place: this avoids the cfprefsd cache overwriting a direct
     # file edit, and ensures System Settings reflects the change and it persists.
+    local current_snapshot=""
+    if ! current_snapshot=$(/usr/bin/plutil -convert xml1 -o - "$plist" 2> /dev/null) ||
+        [[ "$current_snapshot" != "$snapshot" ]]; then
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Spotlight search rules changed or could not be read; kept"
+        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+        return 0
+    fi
     local write_status=0
     if [[ ${#keep[@]} -gt 0 ]]; then
         defaults write "$domain" EnabledPreferenceRules -array "${keep[@]}" 2> /dev/null || write_status=$?
@@ -1253,7 +1218,11 @@ launch_agent_volume_mounted() {
     esac
 }
 
-# Broken LaunchAgent cleanup.
+# Broken LaunchAgent audit (#1617). Reports each agent whose absolute program
+# is missing and leaves it alone: a missing executable does not prove the
+# service is unwanted, and the plist is the configuration the user would have
+# to rebuild once the program is back. No launchctl unload either, since that
+# acts on the label and can stop a live job loaded from another file.
 opt_launch_agents_cleanup() {
     local agents_dir="$HOME/Library/LaunchAgents"
 
@@ -1264,7 +1233,6 @@ opt_launch_agents_cleanup() {
     fi
 
     local broken_count=0
-    local -a broken_plists=()
 
     for plist in "$agents_dir"/*.plist; do
         [[ -f "$plist" ]] || continue
@@ -1272,15 +1240,15 @@ opt_launch_agents_cleanup() {
         local binary=""
         local plist_rc=0
         binary=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
-            /usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" \
+            /usr/libexec/PlistBuddy -c "Print :Program" \
             "$plist" 2> /dev/null) || plist_rc=$?
-        [[ $plist_rc -eq 124 || $plist_rc -ge 128 ]] && return "$plist_rc"
+        mole_rc_timeout_or_signal "$plist_rc" && return "$plist_rc"
         if [[ -z "$binary" ]]; then
             plist_rc=0
             binary=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
-                /usr/libexec/PlistBuddy -c "Print :Program" \
+                /usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" \
                 "$plist" 2> /dev/null) || plist_rc=$?
-            [[ $plist_rc -eq 124 || $plist_rc -ge 128 ]] && return "$plist_rc"
+            mole_rc_timeout_or_signal "$plist_rc" && return "$plist_rc"
         fi
 
         # Only an absolute path that is genuinely missing counts as broken.
@@ -1289,8 +1257,18 @@ opt_launch_agents_cleanup() {
         # unplugged -- neither is a broken agent.
         if [[ -n "$binary" && "$binary" == /* && ! -e "$binary" ]] &&
             launch_agent_volume_mounted "$binary"; then
+            local label=""
+            plist_rc=0
+            label=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+                /usr/libexec/PlistBuddy -c "Print :Label" \
+                "$plist" 2> /dev/null) || plist_rc=$?
+            mole_rc_timeout_or_signal "$plist_rc" && return "$plist_rc"
+            [[ -n "$label" ]] || label="$(basename "$plist" .plist)"
+            # Label and Program come from a third-party plist, so escape
+            # sequences in them must not reach the terminal.
+            printf '  %b %s\n' "${YELLOW}${ICON_WARNING}${NC}" \
+                "Launch Agent $(mole_terminal_safe_text "$label"): program missing at $(mole_terminal_safe_text "${binary/#$HOME/~}")"
             broken_count=$((broken_count + 1))
-            broken_plists+=("$plist")
         fi
     done
 
@@ -1300,30 +1278,8 @@ opt_launch_agents_cleanup() {
         return 0
     fi
 
-    local removed_count=0
-    local failed=0
-    for plist in "${broken_plists[@]}"; do
-        local unload_rc=0
-        run_launchctl_unload "$plist" || unload_rc=$?
-        [[ $unload_rc -eq 124 || $unload_rc -ge 128 ]] && return "$unload_rc"
-        local remove_rc=0
-        safe_remove "$plist" true > /dev/null 2>&1 || remove_rc=$?
-        if [[ $remove_rc -eq 124 || $remove_rc -ge 128 ]]; then
-            return "$remove_rc"
-        elif [[ $remove_rc -eq 0 ]]; then
-            removed_count=$((removed_count + 1))
-        else
-            failed=$((failed + 1))
-        fi
-    done
-
-    if [[ $removed_count -gt 0 ]]; then
-        opt_msg "Cleaned $removed_count broken Launch Agent(s)"
-    fi
-    if [[ $failed -gt 0 ]]; then
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to remove $failed broken Launch Agent(s)"
-    fi
-    optimize_task_result_from_counts "$removed_count" "$failed"
+    echo -e "  ${YELLOW}${ICON_WARNING}${NC} $broken_count Launch Agent(s) point at a missing program · left in ~/Library/LaunchAgents"
+    optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_ATTENTION"
 }
 
 # macOS periodic maintenance scripts (daily/weekly/monthly).
@@ -1398,13 +1354,33 @@ opt_shared_file_list_repair() {
         return 0
     fi
     local scan_rc=0
+    local scan_err_file=""
+    scan_err_file=$(mktemp_file "optimize-shared-file-lists-errors" 2> /dev/null) || scan_err_file=""
     run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" find "$sfl_dir" \
-        \( -name "*.sfl2" -o -name "*.sfl3" \) -type f \
+        \( -name "*.sfl2" -o -name "*.sfl3" -o -name "*.sfl4" \) -type f \
         ! -path "*ApplicationRecentDocuments*" -print0 \
-        > "$scan_file" 2> /dev/null || scan_rc=$?
+        > "$scan_file" 2> "${scan_err_file:-/dev/null}" || scan_rc=$?
     if [[ $scan_rc -ne 0 ]]; then
         : > "$scan_file" || true
-        [[ $scan_rc -eq 124 || $scan_rc -ge 128 ]] && return "$scan_rc"
+        mole_rc_timeout_or_signal "$scan_rc" && return "$scan_rc"
+        # Permission-only errors make the scan unavailable. Mixed errors or
+        # an unreadable diagnostic keep the ordinary failed outcome.
+        local permission_only=false
+        if [[ -n "$scan_err_file" && -s "$scan_err_file" ]]; then
+            local permission_pattern='(Permission denied|Operation not permitted)( \(os error [0-9]+\))?\.?$'
+            local permission_scan_rc=0
+            grep -Ev -e "$permission_pattern" -e '^$' "$scan_err_file" \
+                > /dev/null || permission_scan_rc=$?
+            if [[ $permission_scan_rc -eq 1 ]] &&
+                grep -Eq "$permission_pattern" "$scan_err_file"; then
+                permission_only=true
+            fi
+        fi
+        if [[ "$permission_only" == "true" ]]; then
+            echo -e "  ${GRAY}-${NC} Shared file lists not readable (check directory permissions and Full Disk Access)"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNAVAILABLE"
+            return 0
+        fi
         echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to scan shared file lists"
         scan_failed=1
     fi
@@ -1417,7 +1393,7 @@ opt_shared_file_list_repair() {
             if [[ "${MOLE_DRY_RUN:-0}" != "1" ]]; then
                 safe_remove "$sfl_file" true > /dev/null 2>&1 || remove_rc=$?
             fi
-            if [[ $remove_rc -eq 124 || $remove_rc -ge 128 ]]; then
+            if mole_rc_timeout_or_signal "$remove_rc"; then
                 return "$remove_rc"
             elif [[ $remove_rc -eq 0 ]]; then
                 repaired=$((repaired + 1))
@@ -1494,7 +1470,9 @@ opt_notification_cleanup() {
                 "DELETE FROM record WHERE delivered_date < strftime('%s','now','-30 days'); VACUUM;" \
                 2> /dev/null || sql_ok=$?
             if [[ $sql_ok -eq 0 ]]; then
-                killall NotificationCenter 2> /dev/null || true
+                # Let launchd signal its own service instance, never every process with this name.
+                run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" /bin/launchctl kill SIGTERM \
+                    "gui/$UID/com.apple.notificationcenterui.agent" > /dev/null 2>&1 || true
                 opt_msg "Notification Center database cleaned (was $(bytes_to_human $((db_size * 1024))))"
                 optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_APPLIED"
             else
@@ -1517,7 +1495,7 @@ opt_notification_cleanup() {
 # causing the system to freeze. Set MOLE_ENABLE_DISK_VERIFY=1 to opt in.
 opt_disk_verify() {
     if [[ "${MOLE_ENABLE_DISK_VERIFY:-0}" != "1" ]]; then
-        opt_msg "Disk verify skipped (set MOLE_ENABLE_DISK_VERIFY=1 to enable)"
+        opt_msg "Disk verify skipped"
         optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_SKIPPED"
         return 0
     fi
@@ -1538,7 +1516,7 @@ opt_disk_verify() {
         stop_inline_spinner
     fi
 
-    if [[ $verify_status -eq 124 ]]; then
+    if mole_rc_timeout "$verify_status"; then
         echo -e "  ${YELLOW}${ICON_WARNING}${NC} Disk verification timed out"
         optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
     elif [[ $verify_status -ne 0 ]]; then
@@ -1601,22 +1579,9 @@ opt_coreduet_cleanup() {
             return 0
         fi
 
-        # Remove WAL and SHM files safely (auto-regenerated by SQLite)
-        local removed_count=0
-        local remove_failed=0
-        for f in "$wal_file" "$shm_file"; do
-            if [[ -f "$f" ]]; then
-                local remove_rc=0
-                safe_remove "$f" true > /dev/null 2>&1 || remove_rc=$?
-                if [[ $remove_rc -eq 124 || $remove_rc -ge 128 ]]; then
-                    return "$remove_rc"
-                elif [[ $remove_rc -eq 0 ]]; then
-                    removed_count=$((removed_count + 1))
-                else
-                    remove_failed=$((remove_failed + 1))
-                fi
-            fi
-        done
+        # A stopped owner can leave committed transactions only in its WAL.
+        # SQLite must recover/checkpoint its own sidecars; unlinking them first
+        # loses recent records even when the open-handle probe says idle.
         # Remove ZOBJECT entries older than 90 days (CoreTime is Mac epoch: seconds since 2001-01-01)
         local sql_applied=0
         local sql_failed=0
@@ -1630,14 +1595,10 @@ opt_coreduet_cleanup() {
 
         if [[ $sql_failed -gt 0 ]]; then
             echo -e "  ${YELLOW}${ICON_WARNING}${NC} Knowledge database cleanup skipped (database busy or locked)"
-        elif [[ $remove_failed -gt 0 ]]; then
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Knowledge database cleanup incomplete"
         else
             opt_msg "Knowledge database cleaned (was $(bytes_to_human $((total_size * 1024))))"
         fi
-        optimize_task_result_from_counts \
-            "$((removed_count + sql_applied))" \
-            "$((remove_failed + sql_failed))"
+        optimize_task_result_from_counts "$sql_applied" "$sql_failed"
     else
         opt_msg "Knowledge database cleaned (was $(bytes_to_human $((total_size * 1024))))"
         optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_APPLIED"
@@ -1649,7 +1610,8 @@ opt_coreduet_cleanup() {
 # POSIX path. Display names can differ from the on-disk bundle name, so the
 # audit needs both pieces before deciding an item is broken.
 _login_items_snapshot() {
-    osascript << 'APPLESCRIPT'
+    local timeout_seconds="${1:-$MOLE_TIMEOUT_MEDIUM_PROBE_SEC}"
+    run_with_timeout "$timeout_seconds" osascript << 'APPLESCRIPT'
 set oldDelimiters to AppleScript's text item delimiters
 set tabChar to ASCII character 9
 set linefeedChar to ASCII character 10
@@ -1698,31 +1660,140 @@ _login_item_name_matches() {
     [[ -z "$actual" ]] && return 1
 
     local actual_nospace="${actual// /}"
-    [[ "$actual" == "$expected" ]] && return 0
-    [[ "$actual_nospace" == "$expected_nospace" ]] && return 0
-    [[ -n "$expected_stripped" && "$actual_nospace" == "$expected_stripped" ]] && return 0
-
-    return 1
+    local nocasematch_state
+    nocasematch_state=$(shopt -p nocasematch || true)
+    shopt -s nocasematch
+    local matched=false
+    if [[ "$actual" == "$expected" || "$actual_nospace" == "$expected_nospace" ||
+        (-n "$expected_stripped" && "$actual_nospace" == "$expected_stripped") ]]; then
+        matched=true
+    fi
+    eval "$nocasematch_state"
+    [[ "$matched" == "true" ]]
 }
 
-_login_item_bundle_metadata_matches() {
-    local app_path="$1"
-    local name="$2"
-    local nospace="$3"
-    local stripped="$4"
-    local info="$app_path/Contents/Info.plist"
-    [[ -f "$info" ]] || return 1
+_login_item_build_metadata_inventory() {
+    local app_scan_file="$1"
+    local metadata_file="$2"
+    local deadline_seconds="$3"
+    local probe_timeout=""
+    probe_timeout=$(_mole_timeout_with_deadline \
+        "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline_seconds") || return $?
 
-    local key value
-    for key in CFBundleDisplayName CFBundleName CFBundleExecutable; do
-        value=$(plutil -extract "$key" raw "$info" 2> /dev/null || echo "")
-        if _login_item_name_matches "$value" "$name" "$nospace" "$stripped"; then
-            _login_item_debug "'$name' matched $key '$value' at $app_path"
-            return 0
+    : > "$metadata_file" || return 2
+    local metadata_rc=0
+    # One bounded worker owns all per-plist subprocesses. Wrapping hundreds of
+    # individual plutil calls makes the Perl timeout fallback itself dominate
+    # the audit; the outer process-group timeout still kills a stalled child and
+    # the caller discards the entire partial record stream on any failure.
+    # shellcheck disable=SC2016 # The child expands its own positional data.
+    run_with_timeout "$probe_timeout" /bin/bash --noprofile --norc -c '
+        while IFS= read -r -d "" app_path; do
+            info="$app_path/Contents/Info.plist"
+            state=ready
+            display_name=""
+            bundle_name=""
+            executable=""
+            if [[ ! -f "$info" ]]; then
+                state=missing
+            elif [[ ! -r "$info" ]]; then
+                state=unreadable
+            elif ! /usr/bin/plutil -lint "$info" > /dev/null 2>&1; then
+                state=invalid
+            else
+                display_name=$(/usr/bin/plutil -extract CFBundleDisplayName raw "$info" 2> /dev/null || true)
+                bundle_name=$(/usr/bin/plutil -extract CFBundleName raw "$info" 2> /dev/null || true)
+                executable=$(/usr/bin/plutil -extract CFBundleExecutable raw "$info" 2> /dev/null || true)
+            fi
+            printf "%s\0%s\0%s\0%s\0%s\0" \
+                "$app_path" "$state" "$display_name" "$bundle_name" "$executable"
+        done
+    ' < "$app_scan_file" > "$metadata_file" 2> /dev/null || metadata_rc=$?
+    if [[ $metadata_rc -ne 0 ]]; then
+        : > "$metadata_file" || true
+        return "$metadata_rc"
+    fi
+    return 0
+}
+
+_login_item_build_app_inventory() {
+    local inventory_file="$1"
+    local deadline_seconds="$2"
+    local app_scan_file=""
+    local root_metadata_file=""
+    if ! app_scan_file=$(mktemp_file "optimize-login-item-paths") ||
+        ! root_metadata_file=$(mktemp_file "optimize-login-item-root-metadata"); then
+        return 2
+    fi
+
+    : > "$inventory_file" || return 2
+    local -a inventory_roots=("$HOME/Applications" "/Applications")
+    if declare -p _MOLE_BUNDLE_RESOLVER_APP_ROOTS > /dev/null 2>&1; then
+        local configured_root already_listed
+        for configured_root in "${_MOLE_BUNDLE_RESOLVER_APP_ROOTS[@]}"; do
+            already_listed=false
+            local listed_root
+            for listed_root in "${inventory_roots[@]}"; do
+                if [[ "$configured_root" == "$listed_root" ]]; then
+                    already_listed=true
+                    break
+                fi
+            done
+            if [[ "$already_listed" != "true" ]]; then
+                inventory_roots+=("$configured_root")
+            fi
+        done
+    fi
+
+    local -a scanned_roots=()
+    local roots probe_timeout probe_rc metadata_rc
+    # User-installed apps are usually the smaller tree and must not sit behind
+    # a large /Applications traversal that can consume the whole shared budget.
+    for roots in "${inventory_roots[@]}"; do
+        [[ -d "$roots" ]] || continue
+        local covered_by_parent=false
+        local scanned_root
+        if [[ ${#scanned_roots[@]} -gt 0 ]]; then
+            for scanned_root in "${scanned_roots[@]}"; do
+                if [[ "$roots" == "$scanned_root"/* ]]; then
+                    covered_by_parent=true
+                    break
+                fi
+            done
+        fi
+        [[ "$covered_by_parent" == "true" ]] && continue
+        scanned_roots+=("$roots")
+        : > "$app_scan_file" || return 2
+        probe_timeout=$(_mole_timeout_with_deadline \
+            "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" "$deadline_seconds") || return $?
+        probe_rc=0
+        run_with_timeout "$probe_timeout" find "$roots" -maxdepth 6 \
+            -type d -iname "*.app" -print0 > "$app_scan_file" 2> /dev/null || probe_rc=$?
+        if [[ $probe_rc -ne 0 ]]; then
+            : > "$inventory_file" || true
+            if mole_rc_timeout_or_signal "$probe_rc"; then
+                return "$probe_rc"
+            fi
+            return 2
+        fi
+
+        metadata_rc=0
+        _login_item_build_metadata_inventory \
+            "$app_scan_file" "$root_metadata_file" \
+            "$deadline_seconds" || metadata_rc=$?
+        if [[ $metadata_rc -ne 0 ]]; then
+            : > "$inventory_file" || true
+            if mole_rc_timeout_or_signal "$metadata_rc"; then
+                return "$metadata_rc"
+            fi
+            return 2
+        fi
+        if ! command cat "$root_metadata_file" >> "$inventory_file"; then
+            : > "$inventory_file" || true
+            return 2
         fi
     done
-
-    return 1
+    return 0
 }
 
 # Check if a login item name corresponds to an installed app.
@@ -1731,6 +1802,8 @@ _login_item_bundle_metadata_matches() {
 _login_item_app_exists() {
     local name="$1"
     local item_path="${2:-}"
+    local deadline_seconds="${3:-$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))}"
+    local app_inventory_file="${4:-}"
 
     if [[ -n "$item_path" ]]; then
         if [[ -e "$item_path" || -L "$item_path" ]]; then
@@ -1742,60 +1815,114 @@ _login_item_app_exists() {
         _login_item_debug "'$name' has no login item path from System Events"
     fi
 
-    # 1. Exact match
-    if [[ "$name" != *"'"* ]] && mdfind "kMDItemFSName == '${name}.app'" 2> /dev/null | grep -q .; then
-        _login_item_debug "'$name' resolved by Spotlight exact app name"
-        return 0
-    fi
-    # 2. Try without spaces (e.g. "Top Calendar" -> "TopCalendar")
+    # Display names often need a no-space or helper-suffix variant. Query each
+    # through the shared deadline and keep probe failures distinct from a clean
+    # no-match result.
     local nospace="${name// /}"
-    if [[ "$name" != *"'"* && "$nospace" != "$name" ]] && mdfind "kMDItemFSName == '${nospace}.app'" 2> /dev/null | grep -q .; then
-        _login_item_debug "'$name' resolved by Spotlight no-space app name"
-        return 0
-    fi
-    # 3. Strip common helper suffixes (e.g. "AliLangClient" -> "AliLang")
     local stripped
     stripped=$(echo "$nospace" | sed -E 's/(Client|Helper|Agent|Launcher|Service)$//')
-    if [[ "$name" != *"'"* && "$stripped" != "$nospace" ]] && mdfind "kMDItemFSName == '${stripped}.app'" 2> /dev/null | grep -q .; then
-        _login_item_debug "'$name' resolved by Spotlight stripped helper name"
-        return 0
-    fi
-    # 4. Recursive filesystem fallback for nested helper apps inside parent
-    #    bundles. Spotlight often misses helpers under Contents/.
-    local candidate roots app_name app_path
-    local -a app_names=("${name}.app")
-    [[ "$nospace" != "$name" ]] && app_names+=("${nospace}.app")
-    [[ "$stripped" != "$nospace" ]] && app_names+=("${stripped}.app")
-    for roots in "/Applications" "$HOME/Applications"; do
-        [[ -d "$roots" ]] || continue
-        local -a name_expr=()
-        for app_name in "${app_names[@]}"; do
-            if [[ ${#name_expr[@]} -gt 0 ]]; then
-                name_expr+=("-o")
-            fi
-            name_expr+=("-iname" "$app_name")
-        done
-        candidate=$(command find "$roots" -maxdepth 6 -type d \( "${name_expr[@]}" \) -print -quit 2> /dev/null || true)
-        if [[ -n "$candidate" && -d "$candidate" ]]; then
-            _login_item_debug "'$name' resolved by filesystem app name: $candidate"
+    local -a lookup_names=("$name")
+    [[ "$nospace" != "$name" ]] && lookup_names+=("$nospace")
+    [[ "$stripped" != "$nospace" ]] && lookup_names+=("$stripped")
+
+    local probe_uncertain=false
+    local lookup_name spotlight_output probe_timeout probe_rc
+    for lookup_name in "${lookup_names[@]}"; do
+        [[ "$lookup_name" != *"'"* ]] || continue
+        probe_timeout=$(_mole_timeout_with_deadline \
+            "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" "$deadline_seconds") || return $?
+        spotlight_output=""
+        probe_rc=0
+        spotlight_output=$(run_with_timeout "$probe_timeout" \
+            mdfind "kMDItemFSName == '${lookup_name}.app'" 2> /dev/null) || probe_rc=$?
+        if mole_rc_timeout_or_signal "$probe_rc"; then
+            return "$probe_rc"
+        elif [[ $probe_rc -ne 0 ]]; then
+            probe_uncertain=true
+        elif [[ -n "$spotlight_output" ]]; then
+            _login_item_debug "'$name' resolved by Spotlight app name '$lookup_name'"
             return 0
         fi
-
-        while IFS= read -r -d '' app_path; do
-            if _login_item_bundle_metadata_matches "$app_path" "$name" "$nospace" "$stripped"; then
-                return 0
-            fi
-        done < <(command find "$roots" -maxdepth 6 -type d -iname "*.app" -print0 2> /dev/null)
     done
-    # 5. Fallback: check sfltool dumpbtm for the actual on-disk path.
+
+    # The audit caller supplies one complete inventory for every unresolved
+    # item. Standalone callers build the same plan once for this lookup.
+    if [[ -z "$app_inventory_file" ]]; then
+        if ! app_inventory_file=$(mktemp_file "optimize-login-item-inventory"); then
+            return 2
+        fi
+        local inventory_rc=0
+        _login_item_build_app_inventory \
+            "$app_inventory_file" "$deadline_seconds" || inventory_rc=$?
+        if [[ $inventory_rc -ne 0 ]]; then
+            return "$inventory_rc"
+        fi
+    elif [[ ! -f "$app_inventory_file" ]]; then
+        return 2
+    fi
+
+    local app_path app_basename metadata_state display_name bundle_name executable
+    local record_complete=true
+    while IFS= read -r -d '' app_path; do
+        if ! IFS= read -r -d '' metadata_state ||
+            ! IFS= read -r -d '' display_name ||
+            ! IFS= read -r -d '' bundle_name ||
+            ! IFS= read -r -d '' executable; then
+            record_complete=false
+            break
+        fi
+        if [[ ! -e "$app_path" && ! -L "$app_path" ]]; then
+            probe_uncertain=true
+            continue
+        fi
+        app_basename="${app_path##*/}"
+        app_basename="${app_basename%.[aA][pP][pP]}"
+        if _login_item_name_matches "$app_basename" "$name" "$nospace" "$stripped"; then
+            _login_item_debug "'$name' resolved by filesystem app name: $app_path"
+            return 0
+        fi
+        if [[ "$metadata_state" == "unreadable" || "$metadata_state" == "invalid" ]]; then
+            probe_uncertain=true
+            continue
+        fi
+        if _login_item_name_matches "$display_name" "$name" "$nospace" "$stripped" ||
+            _login_item_name_matches "$bundle_name" "$name" "$nospace" "$stripped" ||
+            _login_item_name_matches "$executable" "$name" "$nospace" "$stripped"; then
+            _login_item_debug "'$name' matched bundle metadata at $app_path"
+            return 0
+        fi
+    done < "$app_inventory_file"
+    if [[ "$record_complete" != "true" ]]; then
+        probe_uncertain=true
+    fi
+
+    # Last fallback: check sfltool dumpbtm for the actual on-disk path.
     #    Nested helper apps (e.g. DBnginMenuHelper.app inside DBngin.app) are
     #    invisible to mdfind but still have a valid URL in the BTM database.
     #    Root only: unprivileged dumpbtm pops the macOS "sfltool wants to
     #    make changes" admin-password dialog, so without an active sudo
     #    session this fallback is skipped rather than prompting.
     local btm_path=""
-    if [[ "${MOLE_TEST_MODE:-0}" != "1" && "${MOLE_TEST_NO_AUTH:-0}" != "1" ]] && sudo -n true 2> /dev/null; then
-        btm_path=$(sudo -n sfltool dumpbtm 2> /dev/null | awk -v item="$name" '
+    if [[ "${MOLE_TEST_MODE:-0}" != "1" && "${MOLE_TEST_NO_AUTH:-0}" != "1" ]]; then
+        local sudo_ready_rc=0
+        probe_timeout=$(_mole_timeout_with_deadline \
+            "$MOLE_TIMEOUT_QUICK_DETECT_SEC" "$deadline_seconds") || return $?
+        run_with_timeout "$probe_timeout" sudo -n true 2> /dev/null || sudo_ready_rc=$?
+        if mole_rc_timeout_or_signal "$sudo_ready_rc"; then
+            return "$sudo_ready_rc"
+        elif [[ $sudo_ready_rc -eq 0 ]]; then
+            local btm_output=""
+            probe_timeout=$(_mole_timeout_with_deadline \
+                "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" "$deadline_seconds") || return $?
+            probe_rc=0
+            btm_output=$(run_with_timeout "$probe_timeout" \
+                sudo -n sfltool dumpbtm 2> /dev/null) || probe_rc=$?
+            if mole_rc_timeout_or_signal "$probe_rc"; then
+                return "$probe_rc"
+            elif [[ $probe_rc -ne 0 ]]; then
+                probe_uncertain=true
+            else
+                btm_path=$(printf '%s\n' "$btm_output" | awk -v item="$name" '
         BEGIN { IGNORECASE = 1 }
         index($0, item) {
             if (match($0, "/.*\\.app")) {
@@ -1804,10 +1931,16 @@ _login_item_app_exists() {
             }
         }
     ')
+            fi
+        fi
     fi
     if [[ -n "$btm_path" ]] && [[ -e "$btm_path" ]]; then
         _login_item_debug "'$name' resolved by sfltool BTM path: $btm_path"
         return 0
+    fi
+    if [[ "$probe_uncertain" == "true" ]]; then
+        _login_item_debug "'$name' unresolved because at least one owner probe was incomplete"
+        return 2
     fi
     _login_item_debug "'$name' unresolved after path, Spotlight, filesystem, and BTM checks"
     return 1
@@ -1820,13 +1953,30 @@ opt_login_items_audit() {
         return 0
     fi
 
-    local items_output=""
+    local audit_deadline=$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))
+    local snapshot_timeout=""
     local snapshot_status=0
-    items_output=$(_login_items_snapshot 2> /dev/null) || snapshot_status=$?
+    snapshot_timeout=$(_mole_timeout_with_deadline \
+        "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" "$audit_deadline") || snapshot_status=$?
+    local items_output=""
+    if [[ $snapshot_status -eq 0 ]]; then
+        items_output=$(_login_items_snapshot "$snapshot_timeout" 2> /dev/null) || snapshot_status=$?
+    fi
 
     if [[ $snapshot_status -ne 0 ]]; then
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to inspect login items"
+        if mole_rc_timeout "$snapshot_status"; then
+            echo -e "  ${GRAY}-${NC} Login items unavailable (snapshot timed out)"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNAVAILABLE"
+            return 0
+        elif [[ $snapshot_status -ge 128 ]]; then
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to inspect login items (snapshot interrupted)"
+        else
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to inspect login items"
+        fi
         optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+        if [[ $snapshot_status -ge 128 ]]; then
+            return "$snapshot_status"
+        fi
         return 0
     fi
 
@@ -1836,18 +1986,101 @@ opt_login_items_audit() {
         return 0
     fi
 
-    local broken=0
-    local checked=0
+    local -a login_item_names=()
+    local -a login_item_paths=()
     local item item_path
     while IFS=$'\t' read -r item item_path; do
         [[ -z "$item" ]] && continue
+        login_item_names+=("$item")
+        login_item_paths+=("$item_path")
+    done <<< "$items_output"
+
+    local app_inventory_file=""
+    local inventory_needed=false
+    local item_index
+    for ((item_index = 0; item_index < ${#login_item_names[@]}; item_index++)); do
+        item_path="${login_item_paths[$item_index]:-}"
+        if [[ -z "$item_path" || (! -e "$item_path" && ! -L "$item_path") ]]; then
+            inventory_needed=true
+            break
+        fi
+    done
+    if [[ "$inventory_needed" == "true" ]]; then
+        if ! app_inventory_file=$(mktemp_file "optimize-login-item-inventory"); then
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (could not prepare app inventory; no conclusions published)"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+            return 0
+        fi
+        local inventory_status=0
+        _login_item_build_app_inventory \
+            "$app_inventory_file" "$audit_deadline" || inventory_status=$?
+        if [[ $inventory_status -ne 0 ]]; then
+            if mole_rc_timeout "$inventory_status"; then
+                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (app inventory timed out; no conclusions published)"
+                optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNAVAILABLE"
+                return 0
+            elif [[ $inventory_status -ge 128 ]]; then
+                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (app inventory interrupted; no conclusions published)"
+            else
+                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (app inventory unavailable; no conclusions published)"
+            fi
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+            if [[ $inventory_status -ge 128 ]]; then
+                return "$inventory_status"
+            fi
+            return 0
+        fi
+    fi
+
+    local broken=0
+    local checked=0
+    local audit_status=0
+    local -a broken_items=()
+    local item_status
+    for ((item_index = 0; item_index < ${#login_item_names[@]}; item_index++)); do
+        item="${login_item_names[$item_index]}"
+        item_path="${login_item_paths[$item_index]:-}"
         checked=$((checked + 1))
-        if _login_item_app_exists "$item" "$item_path"; then
+        item_status=0
+        _login_item_app_exists \
+            "$item" "$item_path" "$audit_deadline" \
+            "$app_inventory_file" || item_status=$?
+        if [[ $item_status -eq 0 ]]; then
+            continue
+        elif [[ $item_status -eq 1 ]]; then
+            broken_items+=("$item")
             continue
         fi
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Broken login item: $item (app not found)"
-        broken=$((broken + 1))
-    done <<< "$items_output"
+        audit_status=$item_status
+        break
+    done
+
+    if [[ $audit_status -ne 0 ]]; then
+        if mole_rc_timeout "$audit_status"; then
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (time limit reached; no conclusions published)"
+            # A time ceiling is not a failed operation: the audit published no
+            # conclusions either way. Reporting FAILED here turned one slow or
+            # broken login item into a machine-wide failure badge on every run.
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNAVAILABLE"
+            return 0
+        elif [[ $audit_status -ge 128 ]]; then
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (probe interrupted; no conclusions published)"
+        else
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (owner state unknown; no conclusions published)"
+        fi
+        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+        if [[ $audit_status -ge 128 ]]; then
+            return "$audit_status"
+        fi
+        return 0
+    fi
+
+    if [[ ${#broken_items[@]} -gt 0 ]]; then
+        for item in "${broken_items[@]}"; do
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Broken login item: $item (app not found)"
+            broken=$((broken + 1))
+        done
+    fi
 
     if [[ $broken -eq 0 ]]; then
         opt_msg "Login items all healthy ($checked checked)"
@@ -1873,7 +2106,12 @@ execute_optimization() {
         return 1
     fi
 
-    if command -v is_whitelisted > /dev/null && is_whitelisted "$action"; then
+    # V1.59 and earlier refreshed DNS in a "DNS & Spotlight Check" task; a
+    # saved opt-out for it still keeps DNS untouched.
+    local legacy_action=""
+    [[ "$action" == "network_optimization" ]] && legacy_action="system_maintenance"
+    if command -v is_whitelisted > /dev/null &&
+        { is_whitelisted "$action" || { [[ -n "$legacy_action" ]] && is_whitelisted "$legacy_action"; }; }; then
         optimize_task_start
         opt_msg "Skipped (whitelisted): $health_name"
         optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_SKIPPED"

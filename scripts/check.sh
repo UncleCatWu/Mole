@@ -20,42 +20,17 @@ Options:
 EOF
 }
 
-check_diagnostic_guidance() {
+# Mole-Diagnose.command is support-only: a private reply hands it over as one
+# pasted command, and it must never be linked from a public surface such as
+# the README, docs, or issue templates (maintainer 2026-09-21, mirrored from
+# the Mole Mac repo). Maintainer guidance may name it; public pages may not.
+check_diagnostic_placement() {
     local file
     local status=0
 
     for file in "$@"; do
         [[ -f "$file" ]] || continue
-        if ! awk '
-        function inspect_block() {
-            normalized = block
-            gsub(/\$[\047"]/, "", normalized)
-            gsub(/[\047"]/, "", normalized)
-            while (match(normalized, /\\[[:alnum:]_]/)) {
-                normalized = substr(normalized, 1, RSTART - 1) \
-                    substr(normalized, RSTART + 1, 1) \
-                    substr(normalized, RSTART + 2)
-            }
-            if (normalized ~ /Mole-Diagnose[.]command/ &&
-                normalized ~ /\|[[:space:]]*([^|;&[:space:]]+[[:space:]]+)*([^|;&[:space:]]*\/)?(ba|z|da|k)?sh([^[:alnum:]_]|$)/) {
-                printf "%s:%d: unsafe diagnostic pipe-to-shell guidance\n", FILENAME, block_start
-                found = 1
-            }
-            block = ""
-        }
-        /^[[:space:]]*$/ {
-            inspect_block()
-            next
-        }
-        {
-            if (block == "") block_start = FNR
-            block = block " " $0
-        }
-        END {
-            inspect_block()
-            exit found ? 1 : 0
-        }
-        ' "$file"; then
+        if grep -n 'Mole-Diagnose' "$file" | sed "s|^|$file:|; s|\$| (support-only diagnostic script on a public surface)|"; then
             status=1
         fi
     done
@@ -248,12 +223,66 @@ fi
 printf '%s\n' "$duplication_output"
 echo -e "${GREEN}${ICON_SUCCESS} Function duplication check passed${NC}\n"
 
-diagnostic_guidance_files=(AGENTS.md README.md .claude/skills/*/SKILL.md)
-if ! diagnostic_guidance_output=$(check_diagnostic_guidance "${diagnostic_guidance_files[@]}"); then
-    [[ -n "$diagnostic_guidance_output" ]] && printf '%s\n' "$diagnostic_guidance_output"
-    echo -e "${RED}${ICON_ERROR} Diagnostic instructions must download for review before execution${NC}\n"
+if ! destructive_output=$(python3 "$SCRIPT_DIR/audit_destructive_sinks.py" 2>&1); then
+    printf '%s\n' "$destructive_output"
+    echo -e "${RED}${ICON_ERROR} Destructive sink annotation check failed${NC}\n"
     exit 1
 fi
-echo -e "${GREEN}${ICON_SUCCESS} Diagnostic install guidance passed${NC}\n"
+printf '%s\n' "$destructive_output"
+echo -e "${GREEN}${ICON_SUCCESS} Destructive sink annotation check passed${NC}\n"
+
+if ! bats_assertion_output=$(python3 "$SCRIPT_DIR/audit_bats_assertions.py" 2>&1); then
+    printf '%s\n' "$bats_assertion_output"
+    echo -e "${RED}${ICON_ERROR} Bats assertions that cannot fail found${NC}\n"
+    exit 1
+fi
+printf '%s\n' "$bats_assertion_output"
+echo -e "${GREEN}${ICON_SUCCESS} Bats assertion check passed${NC}\n"
+
+if ! timeout_status_output=$(python3 "$SCRIPT_DIR/audit_timeout_status.py" 2>&1); then
+    printf '%s\n' "$timeout_status_output"
+    echo -e "${RED}${ICON_ERROR} Raw timeout status comparisons found${NC}\n"
+    exit 1
+fi
+printf '%s\n' "$timeout_status_output"
+echo -e "${GREEN}${ICON_SUCCESS} Timeout status check passed${NC}\n"
+
+# The published agent skill names commands and flags for both CLIs; a stale one
+# sends other people's agents into rejected commands. CI fetches the windows
+# branch and sets MOLE_SKILL_AUDIT_REQUIRE_WINDOWS so that side cannot be skipped.
+skill_audit_args=()
+[[ "${MOLE_SKILL_AUDIT_REQUIRE_WINDOWS:-0}" == "1" ]] && skill_audit_args+=(--require-windows)
+if ! skill_audit_output=$(python3 "$SCRIPT_DIR/audit_skill_commands.py" "${skill_audit_args[@]+"${skill_audit_args[@]}"}" 2>&1); then
+    printf '%s\n' "$skill_audit_output"
+    echo -e "${RED}${ICON_ERROR} The agent skill names commands or flags the CLI does not have${NC}\n"
+    exit 1
+fi
+printf '%s\n' "$skill_audit_output"
+echo -e "${GREEN}${ICON_SUCCESS} Agent skill command check passed${NC}\n"
+
+diagnostic_public_files=(README.md CONTRIBUTING.md docs/*.md .github/ISSUE_TEMPLATE/*)
+if ! diagnostic_placement_output=$(check_diagnostic_placement "${diagnostic_public_files[@]}"); then
+    [[ -n "$diagnostic_placement_output" ]] && printf '%s\n' "$diagnostic_placement_output"
+    echo -e "${RED}${ICON_ERROR} The diagnostic script must stay off public pages and issue templates${NC}\n"
+    exit 1
+fi
+echo -e "${GREEN}${ICON_SUCCESS} Diagnostic placement check passed${NC}\n"
+
+# Every incident row names real commits, a known layer and a catcher the code
+# defines (docs/incidents.md says why the table is the eval set for review).
+if ! incidents_output=$(python3 "$SCRIPT_DIR/audit_incidents.py" 2>&1); then
+    printf '%s\n' "$incidents_output"
+    echo -e "${RED}${ICON_ERROR} The incident ledger names a commit, layer or catcher that does not hold${NC}\n"
+    exit 1
+fi
+printf '%s\n' "$incidents_output"
+echo -e "${GREEN}${ICON_SUCCESS} Incident ledger check passed${NC}\n"
+
+# Advice only: the gates a change needs follow the paths it touches.
+risk_output=$(python3 "$SCRIPT_DIR/risk_tier.py" 2>&1) || true
+if [[ -n "$risk_output" ]]; then
+    echo -e "${YELLOW}${ICON_LIST} Verification this change needs beyond check.sh:${NC}"
+    printf '%s\n\n' "$risk_output"
+fi
 
 echo -e "${GREEN}=== Checks Completed ===${NC}"

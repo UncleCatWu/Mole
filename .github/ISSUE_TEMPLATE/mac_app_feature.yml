@@ -8,6 +8,8 @@ body:
       value: |
         Thanks for suggesting an improvement for the Mole Mac app.
 
+        First update to the latest stable release from https://mole.fit, quit and reopen Mole, and check whether the feature is already available.
+
         The Mole Mac app is a paid native app. Its source code is not public. This repository hosts the open-source Mole CLI and public feedback for the Mac app.
 
         Please keep requests concrete: what workflow is hard today, what you expected Mole to do, and why it matters.
@@ -52,8 +54,8 @@ body:
     id: examples
     attributes:
       label: Examples, screenshots, or references
-      description: Add screenshots, links, or examples if they help explain the request.
-      placeholder: "Optional context."
+      description: Give one concrete example, such as an app, a folder (with your username removed), or the steps you take today. Screenshots and links can help.
+      placeholder: "Which app, folder, or workflow would this improve?"
     validations:
       required: false
   - type: checkboxes
@@ -61,6 +63,8 @@ body:
     attributes:
       label: Before submitting
       options:
+        - label: I updated to the latest stable Mole Mac app, reopened it, and checked that this feature is still missing.
+          required: true
         - label: This request is for the Mole Mac app, not the Mole CLI.
           required: true
         - label: I did not include license keys, order numbers, or private data.

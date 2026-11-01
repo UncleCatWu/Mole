@@ -1,23 +1,13 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-clean-hints-home.XXXXXX")"
-    export HOME
+    mole_test_setup_home clean-hints-home
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 setup() {
@@ -105,6 +95,79 @@ EOT2B
     [ "$status" -eq 0 ]
     [[ "$output" == *", 0B"* ]] || return 1
     [[ "$output" == *"mo purge --include-empty"* ]] || return 1
+}
+
+@test "show_project_artifact_hint_notice stays silent below the size floor" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOTFLOOR'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/hints.sh"
+probe_project_artifact_hints() {
+    PROJECT_ARTIFACT_HINT_DETECTED=true
+    PROJECT_ARTIFACT_HINT_COUNT=4
+    PROJECT_ARTIFACT_HINT_TRUNCATED=false
+    PROJECT_ARTIFACT_HINT_EXAMPLES=("~/www/demo/build")
+    PROJECT_ARTIFACT_HINT_ESTIMATED_KB=20
+    PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES=4
+    PROJECT_ARTIFACT_HINT_ESTIMATE_PARTIAL=false
+}
+bytes_to_human() { echo "20KB"; }
+TRACK_SECTION=1
+SECTION_ACTIVITY=0
+show_project_artifact_hint_notice
+printf "ACTIVITY:%s\n" "$SECTION_ACTIVITY"
+EOTFLOOR
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Build artifacts"* ]] || return 1
+    [[ "$output" == *"ACTIVITY:0"* ]] || return 1
+}
+
+@test "show_project_artifact_hint_notice still reports a measurement above the floor" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOTABOVE'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/hints.sh"
+probe_project_artifact_hints() {
+    PROJECT_ARTIFACT_HINT_DETECTED=true
+    PROJECT_ARTIFACT_HINT_COUNT=4
+    PROJECT_ARTIFACT_HINT_TRUNCATED=false
+    PROJECT_ARTIFACT_HINT_EXAMPLES=("~/www/demo/build")
+    PROJECT_ARTIFACT_HINT_ESTIMATED_KB=512000
+    PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES=4
+    PROJECT_ARTIFACT_HINT_ESTIMATE_PARTIAL=false
+}
+bytes_to_human() { echo "500MB"; }
+note_activity() { :; }
+show_project_artifact_hint_notice
+EOTABOVE
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Build artifacts"* ]] || return 1
+    [[ "$output" == *"500MB"* ]] || return 1
+}
+
+@test "show_project_artifact_hint_notice reports a partial measurement below the floor" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOTPARTIAL'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/hints.sh"
+probe_project_artifact_hints() {
+    PROJECT_ARTIFACT_HINT_DETECTED=true
+    PROJECT_ARTIFACT_HINT_COUNT=30
+    PROJECT_ARTIFACT_HINT_TRUNCATED=true
+    PROJECT_ARTIFACT_HINT_EXAMPLES=("~/www/demo/build")
+    PROJECT_ARTIFACT_HINT_ESTIMATED_KB=20
+    PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES=1
+    PROJECT_ARTIFACT_HINT_ESTIMATE_PARTIAL=true
+}
+bytes_to_human() { echo "20KB"; }
+note_activity() { :; }
+show_project_artifact_hint_notice
+EOTPARTIAL
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Build artifacts"* ]] || return 1
 }
 
 @test "show_project_artifact_hint_notice reports skipped slow project artifact scans (#1053)" {

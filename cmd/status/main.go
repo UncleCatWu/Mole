@@ -50,30 +50,15 @@ func shouldUseJSONOutput(forceJSON bool, stdout *os.File) bool {
 type tickMsg struct{}
 type animTickMsg struct{}
 
-type collectionMode int
-
-const (
-	collectionFast collectionMode = iota
-	collectionProcess
-	collectionFull
-)
-
-type metricsMsg struct {
-	data MetricsSnapshot
-	err  error
-	mode collectionMode
-}
-
 type model struct {
 	collector     *Collector
 	width         int
 	height        int
 	metrics       MetricsSnapshot
 	errMessage    string
-	ready         bool
+	schedule      collectionSchedule
+	fullCollected bool
 	lastUpdated   time.Time
-	lastFullAt    time.Time
-	lastProcessAt time.Time
 	collecting    bool
 	animFrame     int
 	catHidden     bool // true = hidden, false = visible
@@ -151,28 +136,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.collecting = true
-		return m, m.collectCmd(m.nextCollectionMode(time.Now()))
-	case metricsMsg:
-		wasReady := m.ready
+		return m, m.collectCmd(m.schedule.nextMode(time.Now()))
+	case collectionResult:
 		if msg.err != nil {
 			m.errMessage = msg.err.Error()
 		} else {
 			m.errMessage = ""
 		}
-		m.metrics = msg.data
-		m.lastUpdated = msg.data.CollectedAt
-		if msg.err == nil {
-			recordCollectionFreshness(msg.mode, msg.data.CollectedAt, &m.lastFullAt, &m.lastProcessAt)
+		if !msg.data.CollectedAt.IsZero() {
+			m.metrics = msg.data
+			m.lastUpdated = msg.data.CollectedAt
+		}
+		if msg.mode == collectionFull && msg.err == nil {
+			m.fullCollected = true
 		}
 		m.collecting = false
-		// Mark ready after first successful data collection.
-		if !m.ready {
-			m.ready = true
-		}
-		delay := refreshInterval
-		if !wasReady {
-			delay = 0
-		}
+		delay := m.schedule.recordCompletion(msg, refreshInterval)
 		return m, tickAfter(delay)
 	case animTickMsg:
 		m.animFrame++
@@ -182,7 +161,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	if !m.ready {
+	if !m.schedule.hasSnapshot {
 		return "Loading..."
 	}
 
@@ -206,7 +185,7 @@ func (m model) View() string {
 			if cardWidth > 2 {
 				cardWidth -= 2
 			}
-			cards := buildCards(m.metrics, cardWidth, cpuCores, !m.lastFullAt.IsZero())
+			cards := buildCards(m.metrics, cardWidth, cpuCores, m.fullCollected)
 
 			var rendered []string
 			for i, c := range cards {
@@ -218,7 +197,7 @@ func (m model) View() string {
 			cardContent = lipgloss.JoinVertical(lipgloss.Left, rendered...)
 		} else {
 			cardWidth := max(24, termWidth/2-4)
-			cards := buildCards(m.metrics, cardWidth, cpuCores, !m.lastFullAt.IsZero())
+			cards := buildCards(m.metrics, cardWidth, cpuCores, m.fullCollected)
 			cardContent = renderTwoColumns(cards, termWidth)
 		}
 
@@ -247,47 +226,9 @@ func (m model) View() string {
 	return padViewToHeight(output, m.height)
 }
 
-func (m model) nextCollectionMode(now time.Time) collectionMode {
-	return nextCollectionMode(m.ready, m.lastFullAt, m.lastProcessAt, now)
-}
-
-func nextCollectionMode(ready bool, lastFullAt, lastProcessAt, now time.Time) collectionMode {
-	if !ready {
-		return collectionFast
-	}
-	if lastFullAt.IsZero() || now.Sub(lastFullAt) >= slowRefreshInterval {
-		return collectionFull
-	}
-	if lastProcessAt.IsZero() || now.Sub(lastProcessAt) >= processWatchInterval {
-		return collectionProcess
-	}
-	return collectionFast
-}
-
-func recordCollectionFreshness(mode collectionMode, collectedAt time.Time, lastFullAt, lastProcessAt *time.Time) {
-	if mode == collectionFull {
-		*lastFullAt = collectedAt
-	}
-	if mode == collectionProcess || mode == collectionFull {
-		*lastProcessAt = collectedAt
-	}
-}
-
 func (m model) collectCmd(mode collectionMode) tea.Cmd {
 	return func() tea.Msg {
-		var (
-			data MetricsSnapshot
-			err  error
-		)
-		switch mode {
-		case collectionFull:
-			data, err = m.collector.Collect()
-		case collectionProcess:
-			data, err = m.collector.CollectProcesses()
-		default:
-			data, err = m.collector.CollectFast()
-		}
-		return metricsMsg{data: data, err: err, mode: mode}
+		return m.collector.collectMode(mode)
 	}
 }
 
@@ -310,17 +251,46 @@ func runJSONMode() {
 	collector := NewCollector(processWatchOptionsFromFlags())
 
 	data, err := collector.Collect()
+	if code := writeJSONSnapshot(os.Stdout, os.Stderr, data, err); code != 0 {
+		os.Exit(code)
+	}
+}
+
+// writeJSONSnapshot follows the watch stream and the dashboard: one failed
+// collector is reported on stderr, and the metrics that did succeed are still
+// printed and exit 0. A snapshot with no core metrics, or an encoding error, fails.
+func writeJSONSnapshot(stdout, stderr io.Writer, data MetricsSnapshot, err error) int {
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error collecting metrics: %v\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(stderr, "status: collect failed: %v\n", err)
+	}
+	if !hasCoreMetrics(data) {
+		if err == nil {
+			_, _ = fmt.Fprintln(stderr, "status: collect failed: no metrics collected")
+		}
+		return 1
 	}
 
-	encoder := json.NewEncoder(os.Stdout)
+	encoder := json.NewEncoder(stdout)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(data); err != nil {
-		fmt.Fprintf(os.Stderr, "error encoding JSON: %v\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(stderr, "error encoding JSON: %v\n", err)
+		return 1
 	}
+	return 0
+}
+
+// CollectedAt records the attempt even if every collector failed. Core metrics
+// establish a usable sample; idle CPU and an empty process list are valid too.
+func hasCoreMetrics(data MetricsSnapshot) bool {
+	if data.CPU.LogicalCPU > 0 || data.Memory.Total > 0 || data.ProcessCollectedAt != nil {
+		return true
+	}
+	for _, disk := range data.Disks {
+		if disk.Total > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // runTUIMode runs the interactive terminal UI.

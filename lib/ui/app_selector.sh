@@ -9,16 +9,29 @@ set -euo pipefail
 format_app_display() {
     local display_name="$1" size="$2" last_used="$3"
 
+    # Display names come from app bundles and can carry terminal control bytes.
+    # This row is a rendering site only: apps_data keeps the stored name, and
+    # matching, sizes and removal plans are untouched.
+    display_name=$(mole_terminal_safe_text "$display_name")
+
     # Use common function from ui.sh to format last used time
     local compact_last_used
     compact_last_used=$(format_last_used_summary "$last_used")
     if [[ -z "$compact_last_used" || "$compact_last_used" == "Never" ]]; then
         compact_last_used="Unknown"
     fi
+    if [[ $(get_display_width "$compact_last_used") -gt 9 ]]; then
+        compact_last_used=$(truncate_by_display_width "$compact_last_used" 9)
+    fi
 
-    # Format size
+    # Format size. The selector column is %9s; list/json keep the long
+    # Steam-managed label, but that 19-column string wraps the menu row.
     local size_str="--"
-    [[ "$size" != "0" && "$size" != "" && "$size" != "Unknown" && "$size" != "N/A" && "$size" != "--" ]] && size_str="$size"
+    if [[ "$size" == "N/A (Steam-managed)" ]]; then
+        size_str="Steam"
+    elif [[ "$size" != "0" && "$size" != "" && "$size" != "Unknown" && "$size" != "N/A" && "$size" != "--" ]]; then
+        size_str="$size"
+    fi
 
     # Calculate available width for app name based on terminal width
     # Accept pre-calculated max_name_width (5th param) to avoid recalculation in loops
@@ -31,9 +44,10 @@ format_app_display() {
         available_width=$max_name_width
     else
         # Fallback: calculate it (slower, but works for standalone calls)
-        # Fixed elements: "  ○ " (4) + " " (1) + size (9) + " | " (3) + max_last (7) = 24
-        local fixed_width=24
-        available_width=$((terminal_width - fixed_width))
+        # Fixed elements: prefix (up to 6) + " " (1) + size (9) + " | " (3) + max_last (9) = 28
+        local fixed_width=28
+        local max_available=$((terminal_width - fixed_width))
+        available_width=$max_available
 
         # Dynamic minimum for better spacing on wide terminals
         local min_width=18
@@ -46,7 +60,10 @@ format_app_display() {
         fi
 
         [[ $available_width -lt $min_width ]] && available_width=$min_width
+        # min_width must not push the row past the reserved budget.
+        [[ $available_width -gt $max_available ]] && available_width=$max_available
         [[ $available_width -gt 60 ]] && available_width=60
+        ((available_width < 1)) && available_width=1
     fi
 
     # Truncate long names if needed (based on display width, not char count)
@@ -91,7 +108,9 @@ select_apps_for_uninstall() {
     # Show loading for large lists (formatting can be slow due to width calculations)
     local app_count=${#apps_data[@]}
     local terminal_width=$(tput cols 2> /dev/null || echo 80)
-    if [[ $app_count -gt 100 ]]; then
+    # The uninstall scan already left a "Preparing app list..." line on its
+    # alternate screen.
+    if [[ $app_count -gt 100 && "${MOLE_ALT_SCREEN_ACTIVE:-}" != "1" ]]; then
         if [[ -t 2 ]]; then
             printf "\rPreparing %d applications...    " "$app_count" >&2
         fi
@@ -104,8 +123,8 @@ select_apps_for_uninstall() {
         local name_width=$(get_display_width "$display_name")
         [[ $name_width -gt $max_name_width ]] && max_name_width=$name_width
     done
-    # Constrain based on terminal width: fixed=24, min varies by terminal width, max=60
-    local fixed_width=24
+    # Constrain based on terminal width: fixed=28 (prefix 4-6 + space 1 + size 9 + sep 3 + max_last 9)
+    local fixed_width=28
     local available=$((terminal_width - fixed_width))
 
     # Dynamic minimum: wider terminals get larger minimum for better spacing
@@ -121,6 +140,7 @@ select_apps_for_uninstall() {
     [[ $max_name_width -lt $min_width ]] && max_name_width=$min_width
     [[ $available -lt $max_name_width ]] && max_name_width=$available
     [[ $max_name_width -gt 60 ]] && max_name_width=60
+    ((max_name_width < 1)) && max_name_width=1
 
     local -a menu_options=()
     local epochs_csv=""
@@ -153,14 +173,15 @@ select_apps_for_uninstall() {
     local names_newline
     names_newline=$(printf '%s\n' "${names_arr[@]}")
 
-    # Clear loading message
-    if [[ $app_count -gt 100 ]]; then
+    # Clear loading message. On the uninstall alternate screen the menu header
+    # clears this line itself, so erasing it here would only blank the screen.
+    if [[ $app_count -gt 100 && "${MOLE_ALT_SCREEN_ACTIVE:-}" != "1" ]]; then
         if [[ -t 2 ]]; then
             printf "\r\033[K" >&2
         fi
     fi
 
-    drain_pending_input 0.2
+    drain_pending_input
 
     # Expose metadata for the paginated menu (optional inputs)
     # - MOLE_MENU_META_EPOCHS: numeric last_used_epoch per item
@@ -179,6 +200,12 @@ select_apps_for_uninstall() {
     export MOLE_MENU_FILTER_NAMES="$names_newline"
     export MOLE_MENU_IGNORE_INITIAL_ENTER=1
 
+    # The uninstall scan hands its "Preparing app list..." line to an inline
+    # spinner; stop it just before the menu draws over that line.
+    if declare -f stop_inline_spinner > /dev/null 2>&1; then
+        stop_inline_spinner
+    fi
+
     # Use paginated menu - result will be stored in MOLE_SELECTION_RESULT
     # Note: paginated_multi_select enters alternate screen and handles clearing
     MOLE_SELECTION_RESULT=""
@@ -187,7 +214,6 @@ select_apps_for_uninstall() {
 
     # Clean env leakage for safety
     unset MOLE_MENU_META_EPOCHS MOLE_MENU_META_SIZEKB MOLE_MENU_FILTER_NAMES MOLE_MENU_IGNORE_INITIAL_ENTER
-    # leave MOLE_MENU_SORT_DEFAULT untouched if user set it globally
 
     if [[ $exit_code -ne 0 ]]; then
         return 1

@@ -1,25 +1,14 @@
 #!/usr/bin/env bats
 
-setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-    
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
+load helpers/common
 
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-purge-config.XXXXXX")"
-    export HOME
-    
-    mkdir -p "$HOME"
+setup_file() {
+    export MOLE_PURGE_YES=1
+    mole_test_setup_home purge-config
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 setup() {
@@ -226,8 +215,8 @@ run_with_timeout() {
     esac
 }
 load_purge_config
-[[ $PURGE_DISCOVERY_STATUS -eq 124 ]]
-[[ "${PURGE_SEARCH_PATHS[*]}" == *"$HOME/Alpha"* ]]
+[[ $PURGE_DISCOVERY_STATUS -eq 124 ]] || exit 1
+[[ "${PURGE_SEARCH_PATHS[*]}" == *"$HOME/Alpha"* ]] || exit 1
 [[ ! -e "$PURGE_CONFIG_FILE" ]]
 EOF
     [ "$status" -eq 0 ] || return 1

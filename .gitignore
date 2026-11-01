@@ -40,9 +40,10 @@ tests/tmp-*
 # System files
 *.pid
 *.lock
+!flake.lock
 
 # Local AI Assistant Instructions
-# CLAUDE.md is a symlink to AGENTS.md (shared source of truth, tracked).
+# CLAUDE.md remains a tracked symlink to AGENTS.md, the shared guide.
 # Personal overrides go in *.local.md, which stay gitignored.
 CLAUDE.local.md
 AGENTS.local.md
@@ -50,6 +51,7 @@ AGENTS.override.md
 .claude/*
 !.claude/agents/
 !.claude/hooks/
+!.claude/rules/
 !.claude/skills/
 !.claude/settings.json
 .claude/settings.local.json
@@ -87,3 +89,7 @@ coverage.html
 session.json
 run_tests.ps1
 mole_guidelines.md
+
+# Nix build output symlinks
+/result
+/result-*

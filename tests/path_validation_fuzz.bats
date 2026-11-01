@@ -1,30 +1,21 @@
 #!/usr/bin/env bats
+
+load helpers/common
+
 # Property-based test: every path in tests/fuzz_corpus/dangerous_paths.txt
 # MUST be rejected by validate_path_for_deletion. If even one passes,
 # the corpus has caught a real safety regression - investigate, do not
 # weaken the corpus.
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-path-fuzz.XXXXXX")"
-    export HOME
-    mkdir -p "$HOME"
+    mole_test_setup_home path-fuzz
 
     CORPUS="$BATS_TEST_DIRNAME/fuzz_corpus/dangerous_paths.txt"
     export CORPUS
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 setup() {

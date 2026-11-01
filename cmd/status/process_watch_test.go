@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"runtime"
 	"strings"
 	"testing"
@@ -28,12 +29,37 @@ func TestRunCmdForcesCLocale(t *testing.T) {
 	}
 }
 
-func TestCollectProcessesUnderCommaLocale(t *testing.T) {
+// The real command runner still applies cLocaleEnv and executes a private
+// shell producer. Only exact Darwin ps command shapes receive fixture output.
+func useDarwinPSFixture(t *testing.T, fail bool) {
+	t.Helper()
+	original := runCmd
+	t.Cleanup(func() { runCmd = original })
+	runCmd = func(ctx context.Context, name string, args ...string) (string, error) {
+		key := name + " " + strings.Join(args, " ")
+		var table string
+		switch key {
+		case "ps -Aceo pid=,ppid=,state=,pcpu=,pmem=,rss=,comm= -r":
+			table = "101 1 S 1.5 0.2 1024 Fixture Worker\n"
+		case "ps aux":
+			table = "USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND\nfixture 101 1.5 0.2 2048 1024 ?? S 12:00 0:00 Fixture Worker\n"
+		default:
+			return "", fmt.Errorf("unsupported Darwin ps fixture command: %s", key)
+		}
+		if fail {
+			return original(ctx, "sh", "-c", "exit 17")
+		}
+		return original(ctx, "sh", "-c", `test "$LC_ALL" = C && test -z "$LC_NUMERIC" && printf '%s' "$1"`, "fixture", table)
+	}
+}
+
+func TestCollectDarwinPSFixtureUnderCommaLocale(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("ps output format is darwin-specific")
 	}
 	t.Setenv("LC_ALL", "ru_RU.UTF-8")
 	t.Setenv("LC_NUMERIC", "ru_RU.UTF-8")
+	useDarwinPSFixture(t, false)
 
 	sample, err := collectProcesses()
 	if err != nil {
@@ -45,12 +71,16 @@ func TestCollectProcessesUnderCommaLocale(t *testing.T) {
 	if !sample.parentsAvailable {
 		t.Fatal("primary process sample should include parent metadata")
 	}
+	if sample.processes[0].CPU != 1.5 || sample.processes[0].MemoryBytes != 1024*1024 {
+		t.Fatalf("fixture process values changed: %#v", sample.processes[0])
+	}
 }
 
-func TestParsePsAuxOutputStrictAcceptsCurrentDarwinOutput(t *testing.T) {
+func TestParsePsAuxOutputStrictAcceptsDarwinFixture(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("ps output format is darwin-specific")
 	}
+	useDarwinPSFixture(t, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	out, err := runCmd(ctx, "ps", "aux")
@@ -66,10 +96,11 @@ func TestParsePsAuxOutputStrictAcceptsCurrentDarwinOutput(t *testing.T) {
 	}
 }
 
-func TestParsePrimaryProcessOutputStrictAcceptsCurrentDarwinOutput(t *testing.T) {
+func TestParsePrimaryProcessOutputStrictAcceptsDarwinFixture(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("ps output format is darwin-specific")
 	}
+	useDarwinPSFixture(t, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	out, err := runCmd(ctx, "ps", "-Aceo", "pid=,ppid=,state=,pcpu=,pmem=,rss=,comm=", "-r")
@@ -82,6 +113,24 @@ func TestParsePrimaryProcessOutputStrictAcceptsCurrentDarwinOutput(t *testing.T)
 	}
 	if len(procs) == 0 {
 		t.Fatal("parseProcessOutputStrict(current output) returned no processes")
+	}
+}
+
+func TestDarwinPSFixtureRejectsUnknownCommand(t *testing.T) {
+	useDarwinPSFixture(t, false)
+	if _, err := runCmd(context.Background(), "ps", "unknown"); err == nil {
+		t.Fatal("unknown fixture command was admitted")
+	}
+}
+
+func TestDarwinPSFixtureProducerFailureReachesCollector(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("collector ps path is darwin-specific")
+	}
+	useDarwinPSFixture(t, true)
+	sample, err := collectProcesses()
+	if err == nil || len(sample.processes) != 0 || !strings.Contains(err.Error(), "exit status 17") {
+		t.Fatalf("producer failure was hidden: sample=%#v err=%v", sample, err)
 	}
 }
 

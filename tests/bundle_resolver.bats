@@ -1,13 +1,14 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 # Tests for lib/core/bundle_resolver.sh. Validates the filesystem-fallback path:
 # we cannot rely on Spotlight indexing a fake /Applications under a tmpdir,
 # so each test forces the Spotlight path to miss (no binary or empty result)
 # and asserts the filesystem scan finds the app.
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_project_root
 }
 
 setup() {
@@ -19,6 +20,9 @@ setup() {
         return 1
     fi
     mkdir -p "$FAKE_HOME/Applications"
+    # The prelude's mdfind function never reaches run_with_timeout, which hands
+    # the command to gtimeout; a PATH double makes the Spotlight miss real.
+    mole_test_fake_command mdfind
 
     # Stage a fake /Applications tree inside the tmp area. bundle_has_installed_app
     # hardcodes the real /Applications roots, so we patch _MOLE_BUNDLE_RESOLVER_APP_ROOTS

@@ -21,7 +21,7 @@ MO_TIMEOUT_PERL_BIN="/usr/bin/perl"
 # Here the background worker takes the terminal first and keeps it for 2s. The
 # foreground helper below starts inside that window, so its child must report
 # that it does NOT own the terminal.
-(run_with_timeout 5 /bin/sleep 2) < /dev/tty &
+(run_with_timeout 5 /bin/sleep 2) < "$MOLE_TEST_TTY_PATH" &
 worker=$!
 
 /bin/sleep 0.3

@@ -41,7 +41,7 @@
 #         `find /private/var/folders -maxdepth 8` GPU-cache scan in
 #         lib/clean/system.sh - same "occasionally slow disk probe" shape.
 #   15s   Long-running maintenance ops on user-selected targets:
-#         `hdiutil detach`, `lsregister -r -f`, Time Machine backupdb
+#         `hdiutil detach`, Time Machine backupdb
 #         `find`. Different shape from PKG_CLEANUP (20s, brew/conda) -
 #         keep them apart so tuning one doesn't move the other.
 #   0.2s  Per-app inline mdls probe in the uninstall scan tight loop. Tens

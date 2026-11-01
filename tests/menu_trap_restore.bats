@@ -1,11 +1,13 @@
 #!/usr/bin/env bats
+
+load helpers/common
+
 # The paginated/simple selectors override EXIT/INT/TERM while they run.
 # They must restore the caller's traps on exit, or an outer handler (e.g.
 # bin/uninstall.sh's session-end operation-log writer) is silently dropped.
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_project_root
 }
 
 @test "paginated_multi_select preserves the caller's EXIT trap" {
@@ -97,6 +99,45 @@ EOF
     [[ "$output" == *OUTER_CLEANUP_MARKER* ]] || return 1
 }
 
+@test "simple paginated_multi_select keeps the caller's cleanup and interrupt handlers" {
+    # lib/ui/menu_simple.sh backs `mo clean --whitelist`, where bin/clean.sh
+    # has already armed `trap 'cleanup EXIT $?' EXIT` with its own cleanup().
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/ui/menu_simple.sh"
+
+enter_alt_screen() { :; }
+leave_alt_screen() { :; }
+stty() { :; }
+tput() { :; }
+export MOLE_MANAGED_ALT_SCREEN=1
+
+cleanup() { echo "OUTER_CLEANUP_MARKER $1"; }
+handle_interrupt() { echo OUTER_INTERRUPT_MARKER; }
+trap 'cleanup EXIT' EXIT
+trap handle_interrupt INT TERM
+original_cleanup=$(declare -f cleanup)
+original_interrupt=$(declare -f handle_interrupt)
+
+paginated_multi_select "Pick" "alpha" "beta" < <(printf 'q') > /dev/null 2>&1 || true
+
+current_cleanup=$(declare -f cleanup)
+[[ "$current_cleanup" == "$original_cleanup" ]] || {
+    printf 'caller cleanup function was replaced:\n%s\n' "$current_cleanup" >&2
+    exit 1
+}
+current_interrupt=$(declare -f handle_interrupt)
+[[ "$current_interrupt" == "$original_interrupt" ]] || {
+    printf 'caller handle_interrupt function was replaced:\n%s\n' "$current_interrupt" >&2
+    exit 1
+}
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"OUTER_CLEANUP_MARKER EXIT"* ]] || return 1
+}
+
 @test "footer never drops the Space Select hint before secondary controls (#1382)" {
 	run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -120,4 +161,79 @@ EOF
 		return 1
 	}
 	[[ "$output" == *"ok"* ]]
+}
+
+@test "paginated_multi_select search keeps pasted and fast-typed terms" {
+    command -v python3 > /dev/null 2>&1 || skip "python3 not available"
+    run python3 "$PROJECT_ROOT/tests/menu_search_pty.py"
+    [ "$status" -eq 0 ]
+}
+
+@test "menu controls hide secondary hints before wrapping and reserve their actual rows" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" python3 <<'PY'
+import os
+import re
+import subprocess
+
+script = r'''
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/ui/menu_paginated.sh"
+enter_alt_screen() { :; }
+leave_alt_screen() { :; }
+stty() { :; }
+tput() { if [[ "$1" == cols ]]; then echo "$COLUMNS"; else echo "$LINES"; fi; }
+read_key() { echo QUIT; }
+items=()
+for ((i=0; i<40; i++)); do items+=("App $i"); done
+MOLE_MENU_META_SIZEKB=1
+paginated_multi_select Pick "${items[@]}" || true
+'''
+ansi = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+cases = 0
+for columns in (35, 36, 37, 39, 40, 46, 47, 48, 53, 54, 55, 56, 57, 59, 60, 67, 68, 69, 79, 80, 81, 82, 83, 84, 120):
+    for mode, select_all in (('size', 'false'), ('name', 'false'), ('size', 'true')):
+        env = dict(os.environ, COLUMNS=str(columns), LINES='12', LC_ALL='C',
+                   MOLE_MENU_SORT_MODE=mode, _MOLE_MENU_SELECT_ALL=select_all)
+        result = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', script],
+                                env=env, capture_output=True, text=True, check=True)
+        lines = ansi.sub('', result.stderr).splitlines()
+        controls = [line for line in lines if re.match(
+            r'(?:↑↓|Space Select|A All|Enter Save|Q Cancel|S |O |/ Search|h/l Page)', line)]
+        footer = ' | '.join(controls)
+        for key in ('Space Select', 'Enter Save', 'Q Cancel'):
+            assert key in footer, (columns, mode, key, controls)
+        for index, line in enumerate(controls):
+            assert len(line) <= columns, (columns, line)
+            if index + 1 < len(controls):
+                next_segment = controls[index + 1].split(' | ')[0]
+                assert len(line) + 3 + len(next_segment) > columns, (columns, controls)
+        if columns >= 36:
+            assert len(controls) == 1, (columns, mode, controls)
+        if columns >= 47:
+            assert '/ Search' in footer, (columns, controls)
+        if columns == 54:
+            assert 'S ' not in footer and 'O ' not in footer and 'h/l Page' not in footer, controls
+        if columns == 120:
+            for key in ('↑↓', 'S ', 'O ', '/ Search', 'h/l Page'):
+                assert key in footer, (key, controls)
+            assert ('A All' in footer) == (select_all == 'true'), controls
+        item_rows = [line for line in lines if 'App ' in line]
+        assert len(item_rows) == 12 - 4 - len(controls), (columns, mode, len(item_rows), controls)
+        cases += 1
+for columns in (23, 24, 34, 35, 36, 39, 40, 49, 50, 51, 54, 80):
+    env = dict(os.environ, COLUMNS=str(columns), LINES='12', LC_ALL='C',
+               MOLE_READ_KEY_FORCE_CHAR='1')
+    result = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', script],
+                            env=env, capture_output=True, text=True, check=True)
+    frame = next(frame for frame in result.stderr.split('\x1b[H') if 'Enter Apply' in frame)
+    lines = ansi.sub('', frame).splitlines()
+    controls = [line for line in lines if line.startswith('Enter Apply')]
+    assert len(controls) == 1 and len(controls[0]) <= columns, (columns, controls)
+    assert 'Esc Clear' in controls[0], (columns, controls)
+    if columns >= 50:
+        assert 'Backspace' in controls[0] and 'Ctrl+U Clear' in controls[0], controls
+    cases += 1
+print(f'PASS: {cases} browse/search footer layouts under LC_ALL=C')
+PY
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }

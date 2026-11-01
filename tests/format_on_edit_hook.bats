@@ -1,5 +1,7 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup() {
     PROJECT_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
     HOOK="$PROJECT_ROOT/.claude/hooks/format-on-edit.sh"

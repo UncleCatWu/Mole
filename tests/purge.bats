@@ -1,25 +1,14 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-	export PROJECT_ROOT
-
-	ORIGINAL_HOME="${HOME:-}"
-	export ORIGINAL_HOME
-
-	HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-purge-home.XXXXXX")"
-	export HOME
-
-	mkdir -p "$HOME"
+    export MOLE_PURGE_YES=1
+	mole_test_setup_home purge-home
 }
 
 teardown_file() {
-	if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-		rm -rf "$HOME"
-	fi
-	if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-		export HOME="$ORIGINAL_HOME"
-	fi
+	mole_test_teardown_home
 }
 
 setup() {
@@ -34,6 +23,170 @@ setup() {
 
 	rm -rf "${HOME:?}/www"/* "${HOME:?}/dev"/*
 	rm -rf "${HOME:?}/Library/CloudStorage" "${HOME:?}/Library/Mobile Documents"
+}
+
+
+assert_activity_result_fails_closed() {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" RESULT_MODE="$1" /bin/bash --noprofile --norc <<'EOF_RESULT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+for name in a-bad b-control; do
+    mkdir -p "$HOME/www/$name/node_modules"
+    touch "$HOME/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$HOME/www/"{a-bad,b-control}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+purge_node_modules_is_protected() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo 1; }
+safe_remove() { printf 'SELECTED:%s\n' "$1"; }
+is_recently_modified() { _PURGE_ACTIVITY_STATE=old; return 1; }
+printf() {
+    if [[ "$1" == '%s %s %s\n' && "${item:-}" == *a-bad* ]]; then
+        case "$RESULT_MODE" in
+            truncated) builtin printf '1' ;;
+            missing-field) builtin printf '1 \n' ;;
+            missing-mtime) builtin printf '1 old\n' ;;
+            failed-worker) builtin printf '1 old 1700000000\n'; exit 7 ;;
+            failed-write) builtin printf '1 old 1700000000\n'; return 7 ;;
+        esac
+    else
+        builtin printf "$@"
+    fi
+}
+export MOLE_DRY_RUN=1
+clean_project_artifacts </dev/null
+[[ -d "$HOME/www/a-bad/node_modules" && -d "$HOME/www/b-control/node_modules" ]] || exit 1
+EOF_RESULT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SELECTED:$HOME/www/b-control/node_modules"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"SELECTED:$HOME/www/a-bad/node_modules"* ]] || { echo "$output"; return 1; }
+}
+
+assert_purge_final_owner_guard() {
+    run env HOME="$BATS_TEST_TMPDIR/purge-home" PROJECT_ROOT="$PROJECT_ROOT" \
+        scenario="$1" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME"
+HOME=$(cd "$HOME" && pwd -P)
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture_project="$HOME/projects/app"
+fixture_entry="$fixture_project/node_modules"
+mkdir -p "$fixture_entry/pkg"
+printf '{}' > "$fixture_project/package.json"
+printf '{}' > "$fixture_project/package-lock.json"
+printf payload > "$fixture_entry/pkg/index.js"
+touch -t 202001010000 "$fixture_entry/pkg/index.js"
+printf '{}' > "$fixture_entry/.package-lock.json"
+touch -t 202001020000 "$fixture_entry/.package-lock.json"
+touch -t 202001020000 "$fixture_entry" "$fixture_entry/pkg"
+PURGE_SEARCH_PATHS=("$HOME/projects")
+purge_node_project_running() {
+    echo PROJECT_PROBE >&2
+    [[ "$scenario" != initial-running ]] || return 0
+    if [[ -f "$HOME/started" ]]; then
+        case "$scenario" in
+            final-running) return 0 ;;
+            final-unknown) return 2 ;;
+            final-signal) return 130 ;;
+        esac
+    fi
+    return 1
+}
+# Keep the real activity classifier and real bounded find. Switch owner state
+# during the real activity walk, which must precede the final owner probe.
+eval "$(declare -f run_with_timeout | sed '1s/run_with_timeout/_original_timeout/')"
+run_with_timeout() {
+    if [[ "${2:-}" == find && "$*" == *' -mtime '* ]]; then
+        echo ACTIVITY_SCAN >&2
+        touch "$HOME/started"
+    fi
+    _original_timeout "$@"
+}
+_MOLE_PURGE_FINAL_ACTIVITY_STATE=old
+_mole_snapshot_path_identity "$HOME/projects"
+_MOLE_PURGE_FINAL_SCAN_ROOT="$HOME/projects"
+_MOLE_PURGE_FINAL_SCAN_ROOT_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+_MOLE_PURGE_FINAL_SCAN_ROOT_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+_MOLE_PURGE_FINAL_SCAN_ROOT_TARGET_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+_MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL="$_MOLE_PURGE_FINAL_SCAN_ROOT"
+_MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+_MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+_MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL_TARGET_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+_mole_snapshot_path_identity "$fixture_entry"
+_MOLE_PURGE_FINAL_EXPECTED_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+_MOLE_PURGE_FINAL_EXPECTED_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+_MOLE_PURGE_FINAL_EXPECTED_TARGET_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+_MOLE_SAFE_REMOVE_FINAL_GUARD=_mole_purge_final_remove_guard
+rc=0
+safe_remove "$fixture_entry" true 1 '' "$_MOLE_PURGE_FINAL_EXPECTED_PARENT" "$_MOLE_PURGE_FINAL_EXPECTED_PARENT_ID" "$_MOLE_PURGE_FINAL_EXPECTED_TARGET_ID" || rc=$?
+case "$scenario" in
+    idle) [[ ! -e "$fixture_entry" && "$rc" == 0 ]] || exit 1 ;;
+    *) [[ -d "$fixture_entry" && "$rc" != 0 ]] || exit 1 ;;
+esac
+if [[ "$scenario" == final-signal ]]; then
+    [[ "$rc" == 130 ]] || exit 1
+fi
+[[ "$scenario" == initial-running || -f "$HOME/started" ]] || exit 1
+printf 'PASS\n'
+EOF
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *PASS* ]]
+}
+
+
+@test "purge Git probe never invokes the Apple shim without developer tools" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+unset DEVELOPER_DIR
+ln -s /usr/bin/git "$HOME/git-shim-alias"
+command() {
+    if [[ "$*" == '-v git' ]]; then echo "$git_command"; else builtin command "$@"; fi
+}
+
+run_with_timeout() {
+    shift
+    case "$1" in
+        /usr/bin/xcode-select) return 1 ;;
+        env) echo UNEXPECTED_GIT_SHIM; return 0 ;;
+        *) "$@" ;;
+    esac
+}
+for git_command in /usr/bin/git "$HOME/git-shim-alias"; do
+    rc=0
+    mole_git_ls_files "$HOME" '' "$HOME" || rc=$?
+    [[ $rc -ne 0 ]] || exit 1
+done
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *UNEXPECTED_GIT_SHIM* ]]
+}
+
+@test "purge node_modules requires an install record and preserves modified packages" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+project="$HOME/www/rebuildable"
+mkdir -p "$project/node_modules/example"
+touch "$project/package.json" "$project/package-lock.json"
+touch -t 202001010000 "$project/node_modules/example/index.js"
+is_protected_purge_artifact "$project/node_modules" || exit 1
+touch -t 202001020000 "$project/node_modules/.package-lock.json"
+purge_node_project_running() { return 1; }
+if is_protected_purge_artifact "$project/node_modules"; then exit 1; fi
+touch -t 202001030000 "$project/node_modules/example/index.js"
+is_protected_purge_artifact "$project/node_modules" || exit 1
+touch -t 202001010000 "$project/node_modules/example/index.js"
+purge_node_project_running() { return 0; }
+is_protected_purge_artifact "$project/node_modules" || exit 1
+purge_node_project_running() { return 2; }
+is_protected_purge_artifact "$project/node_modules" || exit 1
+[[ "$PURGE_PROTECTION_UNVERIFIED" == true ]]
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
 @test "mole_purge_is_cloud_synced_path matches only exact cloud roots and descendants" {
@@ -244,7 +397,7 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
 result=$(format_purge_display '[cloud] ~/Library/CloudStorage/Provider/company/team/very/deep/project' node_modules 1GB 48)
 printf '%s\n' "$result"
-[[ "$result" == "[cloud] "* ]]
+[[ "$result" == "[cloud] "* ]] || exit 1
 [[ $(get_display_width "$result") -le 48 ]]
 EOF
 
@@ -340,6 +493,52 @@ EOF
 
 	# Should only keep the top-level 'build' directory, filtering out nested .build dirs
 	[[ "$result" == "1" ]]
+}
+
+@test "purge content probes share the result-filter deadline (#1679)" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture="$HOME/deadline-probes"
+mkdir -p "$fixture/project/build"
+touch "$fixture/project/.git"
+run_with_timeout() {
+    printf '%s\n' "$1" >> "$fixture/budgets"
+    return 0
+}
+SECONDS=0
+printf '%s\n' "$fixture/project/build" | filter_protected_artifacts 4
+[[ $(wc -l < "$fixture/budgets") -eq 2 ]] || exit 1
+while IFS= read -r budget; do
+    [[ "$budget" -gt 0 && "$budget" -le 4 ]] || exit 1
+done < "$fixture/budgets"
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"deadline-probes/project/build"* ]] || return 1
+}
+
+@test "purge discards a root when its final content probe exhausts the budget (#1679)" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MO_USE_FIND=1 MO_PURGE_SCAN_TIMEOUT_SEC=2 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture="$HOME/deadline-root"
+mkdir -p "$fixture/project/node_modules"
+touch "$fixture/project/package.json"
+purge_artifact_has_authored_content() {
+    printf 'CONTENT_PROBE\n' >> "$fixture/trace"
+    sleep 3
+    return 1
+}
+result=0
+scan_purge_targets "$fixture" "$fixture/result" || result=$?
+[[ $(cat "$fixture/trace") == CONTENT_PROBE ]] || exit 1
+mole_rc_timeout "$result" || exit 1
+[[ ! -s "$fixture/result" ]] || exit 1
+[[ ! -e "$fixture/result.processed" ]] || exit 1
+printf 'INCOMPLETE_ROOT_KEPT\n'
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"INCOMPLETE_ROOT_KEPT"* ]] || return 1
 }
 
 # Vendor protection unit tests
@@ -591,7 +790,7 @@ EOF
 @test "purge terminal preserves focus across resize and supports project navigation" {
 	command -v python3 >/dev/null 2>&1 || skip "python3 not available"
 	run python3 "$PROJECT_ROOT/tests/purge_menu_pty.py"
-	[ "$status" -eq 0 ]
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
 @test "select_purge_categories returns failure on empty input" {
@@ -642,6 +841,37 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"PASS"* ]]
+}
+
+@test "select_purge_categories keeps the caller's handle_interrupt for later signals" {
+    # bin/purge.sh arms `trap handle_interrupt INT TERM` before the menu and
+    # relies on it through the removal phase that follows the menu.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+handle_interrupt() {
+    echo OUTER_INTERRUPT_MARKER
+    exit 130
+}
+trap handle_interrupt INT TERM
+original_interrupt=$(declare -f handle_interrupt)
+
+PURGE_CATEGORY_SIZES="1"
+PURGE_RECENT_CATEGORIES="false"
+select_purge_categories "demo" <<< $'\n' > /dev/null 2>&1 || true
+
+current_interrupt=$(declare -f handle_interrupt)
+[[ "$current_interrupt" == "$original_interrupt" ]] || {
+    printf 'caller handle_interrupt function was replaced:\n%s\n' "$current_interrupt" >&2
+    exit 1
+}
+kill -TERM $$
+echo AFTER_SIGNAL
+EOF
+
+    [ "$status" -eq 130 ] || { echo "status=$status $output"; return 1; }
+    [[ "$output" == *OUTER_INTERRUPT_MARKER* ]] || return 1
+    [[ "$output" != *AFTER_SIGNAL* ]] || return 1
 }
 
 @test "select_purge_categories names the destructive choice and keeps project skip visible when narrow" {
@@ -747,7 +977,7 @@ PURGE_CATEGORY_PROJECT_IDS_ARRAY=("a" "b" "c")
 PURGE_CATEGORY_PROJECT_PATHS_ARRAY=("~/client-a/obelisk" "~/client-b/obelisk" "~/client-c/atlas")
 # Search is case-insensitive and accepts vim navigation letters as query text.
 select_purge_categories "node_modules" "dist" "target" <<< $'/CLIENT-B\n \n' >/dev/null
-[[ "$PURGE_SELECTION_RESULT" == "0,2" ]]
+[[ "$PURGE_SELECTION_RESULT" == "0,2" ]] || exit 1
 # Searching must restore the caller's shell matching mode.
 if shopt -q nocasematch; then exit 1; fi
 PURGE_CATEGORY_PROJECT_PATHS_ARRAY[1]="~/client-b/项目"
@@ -873,7 +1103,7 @@ EOF
 	[[ "$result" == "NOT_PROTECTED" ]]
 }
 
-@test "is_protected_purge_artifact: returns false for non-vendor artifacts" {
+@test "is_protected_purge_artifact: preserves node_modules without reinstall evidence" {
 	mkdir -p "$HOME/www/app/node_modules"
 
 	result=$(/bin/bash -c "
@@ -885,8 +1115,8 @@ EOF
         fi
     ")
 
-	# node_modules is not in the protected list
-	[[ "$result" == "NOT_PROTECTED" ]]
+	# A directory name alone is not reinstall evidence.
+	[[ "$result" == "PROTECTED" ]]
 }
 
 @test "is_protected_purge_artifact avoids basename and dirname subprocesses" {
@@ -1007,6 +1237,7 @@ EOF
 
 	result=$(/bin/bash -c "
         source '$PROJECT_ROOT/lib/clean/project.sh'
+purge_node_modules_is_protected() { return 1; }
         MO_USE_FIND=1 scan_purge_targets '$HOME/single-project' '$scan_output'
         if grep -q '$HOME/single-project/node_modules' '$scan_output'; then
             echo 'FOUND'
@@ -1051,6 +1282,7 @@ EOF
 
 	result=$(/bin/bash -c "
         source '$PROJECT_ROOT/lib/clean/project.sh'
+purge_node_modules_is_protected() { return 1; }
         MO_USE_FIND=1 scan_purge_targets '$HOME/single-project/' '$scan_output'
         if grep -q '$HOME/single-project/node_modules' '$scan_output'; then
             echo 'FOUND'
@@ -1194,6 +1426,7 @@ EOF
 		/bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 scan_purge_targets "$HOME/www" "$SCAN_OUTPUT"
 [[ ! -e "$HOME/find-called" ]] || exit 1
 grep -Fx "$HOME/www/test-project/node_modules" "$SCAN_OUTPUT"
@@ -1228,6 +1461,7 @@ EOF
 		/bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 is_safe_project_artifact() {
     printf '%s\n' "$1" >> "$HOME/safety-calls"
     return 0
@@ -1262,6 +1496,7 @@ EOF
 		/bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+_MOLE_PURGE_FIND=find  # route the purge walk through the stub
 
 scan_status=0
 MO_USE_FIND=1 scan_purge_targets "$HOME/www" "$SCAN_OUTPUT" || scan_status=$?
@@ -1280,14 +1515,12 @@ EOF
 
 	local mock_bin="$HOME/mock-find-tag-failure"
 	mkdir -p "$mock_bin"
+	# One walk lists targets and tags (#1666); it fails after printing both.
 	cat > "$mock_bin/find" <<'EOF'
 #!/bin/bash
 args=" $* "
-if [[ "$args" != *" -type f "* ]]; then
-	printf '%s\n' "$HOME/www/test-project/node_modules"
-	exit 0
-fi
-
+[[ "$args" == *" -type f "* ]] || exit 8
+printf '%s\n' "$HOME/www/test-project/node_modules"
 printf '%s\n' "$HOME/www/test-project/.cache/CACHEDIR.TAG"
 exit 9
 EOF
@@ -1300,6 +1533,7 @@ EOF
 		/bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+_MOLE_PURGE_FIND=find  # route the purge walk through the stub
 
 scan_status=0
 MO_USE_FIND=1 scan_purge_targets "$HOME/www" "$SCAN_OUTPUT" || scan_status=$?
@@ -1362,6 +1596,62 @@ EOF
 	[[ "$output" == "STATUS=124 CALLS=3" ]] || return 1
 }
 
+@test "scan_purge_targets: does not rediscover completed fd results after filtering fails" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/filter-failure.XXXXXX")
+mkdir -p "$fixture/project/node_modules" "$fixture/bin"
+cat > "$fixture/bin/fd" <<'STUB'
+#!/bin/bash
+case " $* " in
+    *" --type d "*) printf '%s\n' "$FIXTURE/project/node_modules" ;;
+esac
+exit 0
+STUB
+cat > "$fixture/bin/find" <<'STUB'
+#!/bin/bash
+printf 'FIND_CALLED\n' >> "$FIXTURE/find-called"
+exit 0
+STUB
+chmod +x "$fixture/bin/fd" "$fixture/bin/find"
+export FIXTURE="$fixture" PATH="$fixture/bin:$PATH"
+filter_protected_artifacts() {
+    printf 'FILTER_CALLED\n' >> "$fixture/filter-called"
+    return 124
+}
+result=0
+MO_DEBUG=1 scan_purge_targets "$fixture" "$fixture/output" || result=$?
+printf 'STATUS=%s\n' "$result"
+[[ -s "$fixture/filter-called" ]] || exit 1
+[[ ! -e "$fixture/find-called" ]] || exit 1
+[[ ! -s "$fixture/output" ]] || exit 1
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"STATUS=124"* ]] || return 1
+	[[ "$output" == *"Purge result filtering failed (status 124)"* ]] || return 1
+	[[ "$output" != *"fd scan failed"* ]] || return 1
+}
+
+@test "scan_purge_targets: reports find result filtering failure as its own stage" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/find-filter-failure.XXXXXX")
+mkdir -p "$fixture/project/node_modules"
+filter_protected_artifacts() { printf 'FILTER_CALLED\n' >&2; return 7; }
+result=0
+MO_DEBUG=1 MO_USE_FIND=1 scan_purge_targets "$fixture" "$fixture/output" || result=$?
+printf 'STATUS=%s\n' "$result"
+[[ ! -s "$fixture/output" ]] || exit 1
+EOF
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"FILTER_CALLED"* ]] || return 1
+	[[ "$output" == *"STATUS=7"* ]] || return 1
+	[[ "$output" == *"Purge result filtering failed (status 7)"* ]] || return 1
+	[[ "$output" != *"find scan failed"* ]] || return 1
+}
+
 @test "scan_purge_targets: bounds nested filtering within the shared deadline" {
 	mkdir -p "$HOME/.config/mole" "$HOME/www/test-project/node_modules"
 	printf '%s\n' "$HOME/www" > "$HOME/.config/mole/purge_paths"
@@ -1370,10 +1660,7 @@ EOF
 	mkdir -p "$mock_bin"
 	cat > "$mock_bin/find" <<'EOF'
 #!/bin/bash
-args=" $* "
-if [[ "$args" != *" -type f "* ]]; then
-	printf '%s\n' "$HOME/www/test-project/node_modules"
-fi
+printf '%s\n' "$HOME/www/test-project/node_modules"
 EOF
 	chmod +x "$mock_bin/find"
 	cat > "$mock_bin/sort" <<'EOF'
@@ -1612,6 +1899,7 @@ EOF
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+_MOLE_PURGE_FIND=find  # route the purge walk through the stub
 mkdir -p "$HOME/probe/project/node_modules" "$HOME/.cache/mole"
 touch "$HOME/probe/project/package.json"
 fd() { :; }
@@ -1634,7 +1922,7 @@ run_with_timeout() {
 probe_mode=cancelled
 result=0
 scan_purge_targets "$HOME/probe" "$HOME/scan-result" || result=$?
-[[ $result -eq 130 && ! -e "$HOME/find-trace" && ! -s "$HOME/scan-result" ]]
+[[ $result -eq 130 && ! -e "$HOME/find-trace" && ! -s "$HOME/scan-result" ]] || exit 1
 probe_mode=unreadable
 result=0
 scan_purge_targets "$HOME/probe" "$HOME/scan-result" || result=$?
@@ -1684,6 +1972,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 artifact="$HOME/www/app/node_modules"
 PURGE_SEARCH_PATHS=("$HOME/www")
 get_optimal_parallel_jobs() { printf '1\n'; }
@@ -1799,6 +2088,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 
 good_root="$HOME/www"
 failed_root="$HOME/dev"
@@ -1844,6 +2134,7 @@ EOF
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 for name in slow failed fast; do
     mkdir -p "$HOME/$name/project/node_modules"
     touch "$HOME/$name/project/package.json"
@@ -1864,7 +2155,7 @@ scan_purge_targets() {
     esac
 }
 get_dir_size_kb() { echo 4; }
-is_recently_modified() { return 1; }
+is_recently_modified() { _PURGE_ACTIVITY_STATE=old; return 1; }
 purge_target_activity_still_safe() { return 0; }
 safe_remove() { printf 'REVIEW:%s\n' "$1"; }
 MOLE_DRY_RUN=1 clean_project_artifacts </dev/null
@@ -2114,8 +2405,8 @@ set -euo pipefail
 source "$PROJECT_ROOT/bin/purge.sh"
 clean_project_artifacts() {
     PURGE_RUN_OUTCOME=incomplete
-    printf '0\n' > "$HOME/.cache/mole/purge_stats"
-    printf '0\n' > "$HOME/.cache/mole/purge_count"
+    printf '0\n' > "$_MOLE_PURGE_STATE_DIR/purge_stats"
+    printf '0\n' > "$_MOLE_PURGE_STATE_DIR/purge_count"
 }
 perform_purge </dev/null
 EOF
@@ -2132,8 +2423,8 @@ source "$PROJECT_ROOT/bin/purge.sh"
 clean_project_artifacts() {
     PURGE_RUN_OUTCOME=completed
     PURGE_UNKNOWN_SIZE_COUNT=1
-    printf '0\n' > "$HOME/.cache/mole/purge_stats"
-    printf '1\n' > "$HOME/.cache/mole/purge_count"
+    printf '0\n' > "$_MOLE_PURGE_STATE_DIR/purge_stats"
+    printf '1\n' > "$_MOLE_PURGE_STATE_DIR/purge_count"
 }
 perform_purge </dev/null
 EOF
@@ -2148,6 +2439,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 
 mkdir -p "$HOME/www/test-project/node_modules"
 touch "$HOME/www/test-project/package.json"
@@ -2167,9 +2459,9 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 
 mkdir -p "$HOME/.cache/mole"
-echo "0" > "$HOME/.cache/mole/purge_stats"
 
 mkdir -p "$HOME/www/test-project/node_modules"
 touch "$HOME/www/test-project/package.json"
@@ -2182,7 +2474,7 @@ export MOLE_PURGE_INCLUDE_EMPTY=1
 export MOLE_DRY_RUN=1
 clean_project_artifacts </dev/null
 
-stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+stats_dir="$_MOLE_PURGE_LAST_STATE_DIR"
 echo "COUNT=$(cat "$stats_dir/purge_count" 2> /dev/null || echo missing)"
 echo "SIZE=$(cat "$stats_dir/purge_stats" 2> /dev/null || echo missing)"
 [[ -d "$HOME/www/test-project/node_modules" ]]
@@ -2198,6 +2490,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 
 mkdir -p "$HOME/www/test-project/node_modules"
 touch "$HOME/www/test-project/package.json"
@@ -2220,6 +2513,7 @@ EOF
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 artifact="$HOME/www/old-project/node_modules"
 mkdir -p "$artifact"
 printf 'payload\n' > "$artifact/file"
@@ -2245,6 +2539,7 @@ EOF
 		run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" CANCELLATION_STATUS="$cancellation_status" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 for project in first second; do
     artifact="$HOME/www/$project/node_modules"
     mkdir -p "$artifact"
@@ -2279,6 +2574,7 @@ EOF
 		run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" CANCELLATION_STATUS="$cancellation_status" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 for project in first second; do
     artifact="$HOME/www/$project/node_modules"
     mkdir -p "$artifact"
@@ -2311,11 +2607,12 @@ EOF
 
 @test "clean_project_artifacts: manually selected uncertain activity never reaches removal" {
 	local script_file
-	script_file=$(mktemp "$HOME/uncertain_selection.XXXXXX.sh")
+	script_file=$(mktemp "$HOME/uncertain_selection.XXXXXX")
 
 	cat > "$script_file" <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 artifact="$HOME/www/uncertain-project/node_modules"
 mkdir -p "$artifact" "$HOME/.cache/mole"
 printf 'payload\n' > "$artifact/file"
@@ -2356,12 +2653,9 @@ SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 
 mkdir -p "$HOME/.cache/mole"
-echo "0" > "$HOME/.cache/mole/purge_stats"
-# purge_count must be seeded too: without it this reads a previous test's file
-# through the shared HOME, or reports "missing" when run alone.
-echo "0" > "$HOME/.cache/mole/purge_count"
 
 mkdir -p "$HOME/www/test-project/node_modules"
 echo "test data" > "$HOME/www/test-project/node_modules/file.js"
@@ -2379,7 +2673,7 @@ safe_remove() { return 1; }
 export MOLE_DRY_RUN=1
 clean_project_artifacts
 
-stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+stats_dir="$_MOLE_PURGE_LAST_STATE_DIR"
 echo "COUNT=$(cat "$stats_dir/purge_count" 2> /dev/null || echo missing)"
 echo "SIZE=$(cat "$stats_dir/purge_stats" 2> /dev/null || echo missing)"
 [[ -d "$HOME/www/test-project/node_modules" ]]
@@ -2396,6 +2690,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 
 external_root="$BATS_TEST_TMPDIR/var-www"
 artifact="$external_root/site/node_modules"
@@ -2405,7 +2700,7 @@ touch "$external_root/site/package.json"
 PURGE_SEARCH_PATHS=("$external_root")
 scan_purge_targets() { printf '%s\n' "$artifact" > "$2"; }
 get_dir_size_kb() { echo 1; }
-is_recently_modified() { return 1; }
+is_recently_modified() { _PURGE_ACTIVITY_STATE=old; return 1; }
 safe_remove() {
     printf 'REMOVE:%s\n' "$1"
     return 0
@@ -2424,6 +2719,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 
 configured_root="$HOME/www"
 original_root="$HOME/www-original"
@@ -2509,6 +2805,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 
 configured_root="$HOME/www"
 artifact="$configured_root/project/node_modules"
@@ -2544,6 +2841,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 
 configured_root="$HOME/www"
 artifact="$configured_root/project/node_modules"
@@ -2630,6 +2928,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 
 cloud_root="$HOME/Library/CloudStorage"
 cloud_artifact="$cloud_root/TestProvider/CloudProject/target"
@@ -2716,6 +3015,13 @@ EOF
 	[[ "$output" == *"Show zero-size project artifact directories"* ]]
 }
 
+@test "mo purge -h shows usage and exits 0" {
+	run env HOME="$HOME" "$PROJECT_ROOT/mole" purge -h
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"Usage:"* && "$output" == *"mo purge [options]"* ]] || return 1
+	[[ "$output" == *"-h, --help"* ]]
+}
+
 @test "mo purge: accepts --debug flag" {
 	if ! command -v gtimeout >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1; then
 		skip "gtimeout/timeout not available"
@@ -2798,6 +3104,7 @@ printf '%s\n' "$protected" > "$HOME/.config/mole/whitelist"
 export MOLE_SKIP_MAIN=1
 export MOLE_TEST_NO_AUTH=1
 source "$PROJECT_ROOT/bin/purge.sh"
+purge_node_modules_is_protected() { return 1; }
 PURGE_SEARCH_PATHS=("$HOME/www")
 scan_purge_targets() {
     printf '%s\n' "$protected" "$unprotected" > "$2"
@@ -2807,7 +3114,7 @@ get_dir_size_kb() {
     echo 1
 }
 get_file_mtime() { echo 1577836800; }
-is_recently_modified() { return 1; }
+is_recently_modified() { _PURGE_ACTIVITY_STATE=old; return 1; }
 purge_target_activity_still_safe() { return 0; }
 
 start_purge
@@ -2946,7 +3253,7 @@ EOF
 _run_in_pty() {
 	local script_file="$1"
 	# A socket-backed runner stdin makes macOS script(1) fail before the child starts.
-	script -q /dev/null /bin/bash --noprofile --norc "$script_file" < /dev/null 2>/dev/null
+	python3 -B "$PROJECT_ROOT/tests/support/owned_pty.py" run "$script_file"
 }
 
 @test "sort: PURGE_CATEGORY_FULL_PATHS_ARRAY[0] is the largest artifact after size-descending sort" {
@@ -2962,11 +3269,12 @@ _run_in_pty() {
 
 	local capture_file script_file
 	capture_file=$(mktemp "$HOME/sort_capture.XXXXXX")
-	script_file=$(mktemp  "$HOME/sort_script.XXXXXX.sh")
+	script_file=$(mktemp  "$HOME/sort_script.XXXXXX")
 
 	cat > "$script_file" << SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 mkdir -p "$HOME/.cache/mole"
 export XDG_CACHE_HOME="$HOME/.cache"
 export TERM="dumb"
@@ -3011,11 +3319,12 @@ SCRIPT
 
 	local capture_file script_file
 	capture_file=$(mktemp "$HOME/sort_capture.XXXXXX")
-	script_file=$(mktemp  "$HOME/sort_script.XXXXXX.sh")
+	script_file=$(mktemp  "$HOME/sort_script.XXXXXX")
 
 	cat > "$script_file" << SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 mkdir -p "$HOME/.cache/mole"
 export XDG_CACHE_HOME="$HOME/.cache"
 export TERM="dumb"
@@ -3089,11 +3398,12 @@ SCRIPT
 
 	local capture_file script_file
 	capture_file=$(mktemp "$HOME/group_sort_capture.XXXXXX")
-	script_file=$(mktemp "$HOME/group_sort_script.XXXXXX.sh")
+	script_file=$(mktemp "$HOME/group_sort_script.XXXXXX")
 
 	cat > "$script_file" << SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 mkdir -p "$HOME/.cache/mole"
 export XDG_CACHE_HOME="$HOME/.cache"
 export TERM="dumb"
@@ -3134,11 +3444,12 @@ SCRIPT
 
 	local capture_file script_file
 	capture_file=$(mktemp "$HOME/fallback_group_capture.XXXXXX")
-	script_file=$(mktemp "$HOME/fallback_group_script.XXXXXX.sh")
+	script_file=$(mktemp "$HOME/fallback_group_script.XXXXXX")
 
 	cat > "$script_file" << SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 mkdir -p "$HOME/.cache/mole"
 export XDG_CACHE_HOME="$HOME/.cache"
 export TERM="dumb"
@@ -3191,11 +3502,12 @@ SCRIPT
 
 	local capture_file script_file
 	capture_file=$(mktemp "$HOME/sort_cloud_capture.XXXXXX")
-	script_file=$(mktemp "$HOME/sort_cloud_script.XXXXXX.sh")
+	script_file=$(mktemp "$HOME/sort_cloud_script.XXXXXX")
 
 	cat > "$script_file" << SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
 mkdir -p "$HOME/.cache/mole"
 export XDG_CACHE_HOME="$HOME/.cache"
 export TERM="dumb"
@@ -3242,4 +3554,1798 @@ SCRIPT
 	[[ "$path1" == *"[cloud]"* ]] || return 1
 	[[ "$menu1" == *"cloud-project"* ]] || return 1
 	[[ "$path1" == *"cloud-project"* ]] || return 1
+}
+
+@test "purge state is per invocation and cannot cancel or overwrite a peer run" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+# The only destructive action below removes this fixture's progress marker;
+# target deletion is never invoked by this state/progress regression.
+local_run() {
+    local _MOLE_PURGE_STATE_DIR=""
+    mole_purge_init_run_state
+    local state="$_MOLE_PURGE_STATE_DIR"
+    printf '%s\n' "$state" > "$HOME/$1.state"
+    if [[ "$1" == first ]]; then
+        printf '13\n' > "$state/purge_stats"
+        printf '2\n' > "$state/purge_count"
+        local attempts=0
+        while [[ ! -f "$HOME/second.ready" ]]; do
+            attempts=$((attempts + 1)); [[ $attempts -lt 250 ]] || return 3
+            sleep 0.02
+        done
+        # Simulate first run's ordinary scan completion/cancel boundary.
+        rm -f "$state/purge_scanning" # SAFE: exact fixture-owned progress file
+        : > "$HOME/first.finished"
+    else
+        : > "$HOME/second.ready"
+        local attempts=0
+        while [[ ! -f "$HOME/first.finished" ]]; do
+            attempts=$((attempts + 1)); [[ $attempts -lt 250 ]] || return 4
+            sleep 0.02
+        done
+        [[ -f "$state/purge_scanning" ]] || return 1
+        [[ $(cat "$state/purge_stats") == 0 && $(cat "$state/purge_count") == 0 ]] || return 2
+        printf 'PEER_PROGRESS_AND_TOTALS_PRESERVED\n'
+    fi
+}
+local_run first & a=$!
+local_run second & b=$!
+wait "$a"; wait "$b"
+[[ $(cat "$HOME/first.state") != "$(cat "$HOME/second.state")" ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"PEER_PROGRESS_AND_TOTALS_PRESERVED"* ]]
+}
+
+@test "purge protects deployment keys and tracked source but keeps ordinary artifacts eligible" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/protected-artifacts.XXXXXX")
+mkdir -p "$root/anchor[1]/target/deploy" "$root/rust/target/debug" "$root/repo/build"
+printf fixture > "$root/anchor[1]/target/deploy/demo-keypair.json"
+printf fixture > "$root/repo/build/default.nix"
+git init -q "$root/repo"
+git -C "$root/repo" add build/default.nix
+is_protected_purge_artifact "$root/anchor[1]/target" || exit 11
+is_protected_purge_artifact "$root/repo/build" || exit 12
+if is_protected_purge_artifact "$root/rust/target"; then exit 13; fi
+rm "$root/anchor[1]/target/deploy/demo-keypair.json"
+if is_protected_purge_artifact "$root/anchor[1]/target"; then exit 14; fi
+mkdir "$root/rust/target/nested"
+git init -q "$root/rust/target/nested"
+is_protected_purge_artifact "$root/rust/target" || exit 15
+EOF
+    [ "$status" -eq 0 ]
+}
+
+@test "purge protects artifacts when Git inspection fails" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/broken-git.XXXXXX")
+mkdir -p "$root/.git" "$root/target"
+is_protected_purge_artifact "$root/target" || exit 1
+EOF
+    [ "$status" -eq 0 ]
+}
+
+@test "purge refuses unattended real deletion without explicit consent" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+unset MOLE_PURGE_YES MOLE_DRY_RUN
+clean_project_artifacts
+EOF
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Purge requires confirmation"* ]] || return 1
+}
+
+@test "purge inspection never executes repository fsmonitor hooks" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/fsmonitor.XXXXXX")
+mkdir -p "$root/target"
+git init -q "$root"
+printf fixture > "$root/target/source.txt"
+git -C "$root" add target/source.txt
+printf '#!/bin/sh\ntouch "%s"\n' "$root/invoked" > "$root/hook"
+chmod +x "$root/hook"
+git -C "$root" config core.fsmonitor "$root/hook"
+is_protected_purge_artifact "$root/target" || exit 1
+[[ ! -e "$root/invoked" ]] || exit 2
+EOF
+    [ "$status" -eq 0 ]
+}
+
+@test "purge protects tracked source through a symlinked project ancestor" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/git-alias.XXXXXX")
+mkdir -p "$root/repo/subproject/child/build" "$root/aliases"
+printf authored > "$root/repo/subproject/child/build/source.txt"
+git init -q "$root/repo"
+git -C "$root/repo" add subproject/child/build/source.txt
+ln -s "$root/repo/subproject" "$root/aliases/project"
+is_protected_purge_artifact "$root/aliases/project/child/build" || exit 1
+EOF
+    [ "$status" -eq 0 ]
+}
+
+@test "purge protects tracked source under a folder renamed only in case" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/case-rename.XXXXXX")
+mkdir -p "$root/repo/Svc/app/build" "$root/repo/Svc/other/build"
+printf authored > "$root/repo/Svc/app/build/source.txt"
+printf generated > "$root/repo/Svc/other/build/out.txt"
+git init -q "$root/repo"
+git -C "$root/repo" add Svc/app/build/source.txt
+# A plain mv leaves the index with the old spelling and git status clean.
+/bin/mv "$root/repo/Svc" "$root/repo/svc"
+is_protected_purge_artifact "$root/repo/svc/app/build" || exit 11
+# An untracked sibling under the same folder is still disposable.
+if is_protected_purge_artifact "$root/repo/svc/other/build"; then exit 12; fi
+EOF
+    [ "$status" -eq 0 ]
+}
+
+@test "purge keeps and reports a candidate whose content probe could not finish" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF_INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/unverified.XXXXXX")
+mkdir -p "$root/proj/node_modules/pkg"
+printf x > "$root/proj/node_modules/pkg/index.js"
+# A timed-out or failed walk is status 2: neither authored nor clean.
+purge_artifact_has_authored_content() { return 2; }
+is_protected_purge_artifact "$root/proj/node_modules" || exit 11
+[[ "$PURGE_PROTECTION_UNVERIFIED" == "true" ]] || exit 12
+# Discovery must not drop it silently.
+kept=$(printf '%s\n' "$root/proj/node_modules" | filter_protected_artifacts)
+[[ "$kept" == "$root/proj/node_modules" ]] || exit 13
+# Evidence still protects, and clears the unverified flag.
+purge_artifact_has_authored_content() { return 0; }
+is_protected_purge_artifact "$root/proj/node_modules" || exit 14
+[[ "$PURGE_PROTECTION_UNVERIFIED" == "false" ]] || exit 15
+kept=$(printf '%s\n' "$root/proj/node_modules" | filter_protected_artifacts)
+[[ -z "$kept" ]] || exit 16
+EOF_INNER
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "purge review names a candidate it could not inspect and marks the run incomplete" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF_INNER'
+set -euo pipefail
+# Match the physical paths returned by discovery when HOME contains a symlink.
+HOME=$(cd "$HOME" && pwd -P)
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mkdir -p "$HOME/www/test-project/node_modules/pkg"
+printf x > "$HOME/www/test-project/node_modules/pkg/index.js"
+printf '{}' > "$HOME/www/test-project/package.json"
+touch -t 202001010101 "$HOME/www/test-project/node_modules/pkg/index.js" \
+    "$HOME/www/test-project/node_modules" "$HOME/www/test-project/package.json" "$HOME/www/test-project"
+PURGE_SEARCH_PATHS=("$HOME/www")
+purge_artifact_has_authored_content() { return 2; }
+export MOLE_DRY_RUN=1
+clean_project_artifacts
+echo "OUTCOME=$PURGE_RUN_OUTCOME"
+[[ -d "$HOME/www/test-project/node_modules" ]]
+EOF_INNER
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"Could not inspect ~/www/test-project/node_modules; kept"* ]] || return 1
+    [[ "$output" == *"OUTCOME=incomplete"* ]] || return 1
+}
+
+
+@test "purge review does not walk a candidate discovery already verified" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF_INNER'
+set -euo pipefail
+HOME=$(cd "$HOME" && pwd -P)
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+mkdir -p "$HOME/www/test-project/node_modules/pkg"
+printf x > "$HOME/www/test-project/node_modules/pkg/index.js"
+printf '{}' > "$HOME/www/test-project/package.json"
+touch -t 202001010101 "$HOME/www/test-project/node_modules/pkg/index.js" \
+    "$HOME/www/test-project/node_modules" "$HOME/www/test-project/package.json" "$HOME/www/test-project"
+PURGE_SEARCH_PATHS=("$HOME/www")
+probe_log="$HOME/content-probes"
+: > "$probe_log"
+purge_artifact_has_authored_content() {
+    printf '%s\n' "$1" >> "$probe_log"
+    return 1
+}
+export MOLE_DRY_RUN=1
+clean_project_artifacts
+echo "PROBES=$(wc -l < "$probe_log" | tr -d ' ')"
+EOF_INNER
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"test-project/node_modules"* ]] || return 1
+    # Discovery and the recheck before removal; the review in between reuses
+    # the discovery verdict instead of walking the tree a third time.
+    [[ "$output" == *"PROBES=2"* ]] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "purge still refuses a candidate that gained authored content after discovery" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF_INNER'
+set -euo pipefail
+HOME=$(cd "$HOME" && pwd -P)
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mkdir -p "$HOME/www/test-project/node_modules/pkg"
+printf x > "$HOME/www/test-project/node_modules/pkg/index.js"
+printf '{}' > "$HOME/www/test-project/package.json"
+touch -t 202001010101 "$HOME/www/test-project/node_modules/pkg/index.js" \
+    "$HOME/www/test-project/node_modules" "$HOME/www/test-project/package.json" "$HOME/www/test-project"
+PURGE_SEARCH_PATHS=("$HOME/www")
+probe_log="$HOME/content-probes"
+: > "$probe_log"
+# Clean when discovery looks, authored content by the time removal rechecks.
+purge_artifact_has_authored_content() {
+    printf '%s\n' "$1" >> "$probe_log"
+    [[ $(wc -l < "$probe_log") -gt 1 ]]
+}
+export MOLE_DRY_RUN=1
+clean_project_artifacts
+[[ -d "$HOME/www/test-project/node_modules" ]] || exit 1
+EOF_INNER
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"[DRY RUN] ~/www/test-project/node_modules"* ]] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "activity batch inspects later fast artifacts without selecting recent or failed probes" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_ACTIVITY'
+set -euo pipefail
+rm -f "$HOME/fast-probed"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+for name in a-slow b-fast c-recent d-error e-later f-later-error; do
+    artifact="$HOME/www/$name/node_modules"
+    mkdir -p "$artifact"
+    touch "$HOME/www/$name/package.json"
+    touch -t 202001010101 "$artifact"
+done
+touch "$HOME/www/c-recent/node_modules/current.js"
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() {
+    printf '%s\n' "$HOME/www/"{a-slow,b-fast,c-recent,d-error,e-later,f-later-error}/node_modules > "$2"
+}
+purge_artifact_has_authored_content() { return 1; }
+get_optimal_parallel_jobs() { echo 4; }
+get_dir_size_kb() { echo 1; }
+safe_remove() { printf 'SELECTED:%s\n' "$1"; }
+mkdir -p "$HOME/activity-bin"
+cat > "$HOME/activity-bin/find" <<'EOF_FIND'
+#!/bin/bash
+case "$1" in
+    */a-slow/node_modules)
+        while [[ ! -e "$HOME/fast-probed" ]]; do sleep 0.05; done
+        ;;
+    */b-fast/node_modules) touch "$HOME/fast-probed" ;;
+    */d-error/node_modules | */f-later-error/node_modules) exit 2 ;;
+    *) exec /usr/bin/find "$@" ;;
+esac
+EOF_FIND
+chmod +x "$HOME/activity-bin/find"
+export PATH="$HOME/activity-bin:$PATH"
+export MO_PURGE_ACTIVITY_TOTAL_TIMEOUT_SEC=5 MO_PURGE_ACTIVITY_TIMEOUT_SEC=5
+export MOLE_DRY_RUN=1
+clean_project_artifacts </dev/null
+[[ -e "$HOME/fast-probed" ]] || exit 1
+for name in a-slow b-fast c-recent d-error e-later f-later-error; do
+    [[ -d "$HOME/www/$name/node_modules" ]] || exit 1
+done
+EOF_ACTIVITY
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SELECTED:$HOME/www/b-fast/node_modules"* ]] || return 1
+    [[ "$output" == *"SELECTED:$HOME/www/a-slow/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$HOME/www/c-recent/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$HOME/www/d-error/node_modules"* ]] || return 1
+    [[ "$output" == *"SELECTED:$HOME/www/e-later/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$HOME/www/f-later-error/node_modules"* ]] || return 1
+}
+
+@test "activity batch propagates worker cancellation, drains peers, and removes result files" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_CANCEL'
+set -euo pipefail
+rm -f "$HOME/peer-retired" "$HOME/registered-results"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+for name in a-cancel b-peer c-later; do
+    artifact="$HOME/www/$name/node_modules"
+    mkdir -p "$artifact"
+    touch "$HOME/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$HOME/www/"{a-cancel,b-peer,c-later}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo SIZE_PHASE_REACHED >&2; echo 1; }
+safe_remove() { echo UNEXPECTED_REMOVE; }
+is_recently_modified() {
+    case "$1" in
+        */a-cancel/node_modules) return 143 ;;
+        */b-peer/node_modules) sleep 0.2; touch "$HOME/peer-retired"; return 1 ;;
+        *) echo LATER_PROBE_REACHED >&2; return 1 ;;
+    esac
+}
+register_temp_file() { printf '%s\n' "$1" >> "$HOME/registered-results"; }
+export MOLE_DRY_RUN=1
+result=0
+clean_project_artifacts </dev/null || result=$?
+printf 'RESULT=%s OUTCOME=%s\n' "$result" "$PURGE_RUN_OUTCOME"
+[[ -e "$HOME/peer-retired" ]] || exit 1
+while IFS= read -r result_file; do [[ ! -e "$result_file" ]] || exit 1; done < "$HOME/registered-results"
+[[ "$result" -eq 143 && "$PURGE_RUN_OUTCOME" == cancelled ]] || exit 1
+EOF_CANCEL
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RESULT=143 OUTCOME=cancelled"* ]] || return 1
+    [[ "$output" != *"SIZE_PHASE_REACHED"* ]] || return 1
+    [[ "$output" != *"LATER_PROBE_REACHED"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+}
+
+
+@test "activity batch handles parent TERM before later probes and restores caller trap" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_TERM'
+set -euo pipefail
+rm -f "$HOME/activity-started" "$HOME/activity-peer-done"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+for name in a-first b-peer c-later; do
+    mkdir -p "$HOME/www/$name/node_modules"
+    touch "$HOME/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$HOME/www/"{a-first,b-peer,c-later}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo SIZE_PHASE_REACHED >&2; echo 1; }
+is_recently_modified() {
+    [[ "$1" != *c-later* ]] || { echo LATER_PROBE_REACHED >&2; return 1; }
+    touch "$HOME/activity-started"
+    sleep 0.4
+    touch "$HOME/activity-peer-done"
+    return 1
+}
+trap 'echo CALLER_TERM' TERM
+caller_trap=$(trap -p TERM)
+(
+    while [[ ! -e "$HOME/activity-started" ]]; do sleep 0.05; done
+    kill -TERM "$$"
+) & sender=$!
+export MOLE_DRY_RUN=1
+result=0
+clean_project_artifacts </dev/null || result=$?
+wait "$sender"
+printf 'RESULT=%s OUTCOME=%s\n' "$result" "$PURGE_RUN_OUTCOME"
+[[ -e "$HOME/activity-peer-done" ]] || exit 1
+[[ "$(trap -p TERM)" == "$caller_trap" ]] || exit 1
+[[ "$result" -eq 143 && "$PURGE_RUN_OUTCOME" == cancelled ]] || exit 1
+EOF_TERM
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RESULT=143 OUTCOME=cancelled"* ]] || return 1
+    [[ "$output" != *"SIZE_PHASE_REACHED"* ]] || return 1
+    [[ "$output" != *"LATER_PROBE_REACHED"* ]] || return 1
+    [[ "$output" != *"CALLER_TERM"* ]] || return 1
+}
+
+@test "activity batch drains the first worker across repeated parent TERM signals" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_REPEAT_TERM'
+set -euo pipefail
+rm -f "$HOME/activity-started" "$HOME/activity-peer-done" "$HOME/activity-first-done"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+for name in a-first b-peer c-later; do
+    mkdir -p "$HOME/www/$name/node_modules"
+    touch "$HOME/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$HOME/www/"{a-first,b-peer,c-later}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo SIZE_PHASE_REACHED >&2; echo 1; }
+is_recently_modified() {
+    [[ "$1" != *c-later* ]] || { echo LATER_PROBE_REACHED >&2; return 1; }
+    touch "$HOME/activity-started"
+    if [[ "$1" == *a-first* ]]; then
+        sleep 1
+        touch "$HOME/activity-first-done"
+    else
+        sleep 0.4
+    fi
+    touch "$HOME/activity-peer-done"
+    return 1
+}
+trap 'echo CALLER_TERM' TERM
+caller_trap=$(trap -p TERM)
+(
+    while [[ ! -e "$HOME/activity-started" ]]; do sleep 0.05; done
+    kill -TERM "$$"
+    sleep 0.1
+    kill -TERM "$$"
+) & sender=$!
+export MOLE_DRY_RUN=1
+result=0
+clean_project_artifacts </dev/null || result=$?
+wait "$sender"
+printf 'RESULT=%s OUTCOME=%s\n' "$result" "$PURGE_RUN_OUTCOME"
+[[ -e "$HOME/activity-peer-done" ]] || exit 1
+[[ -e "$HOME/activity-first-done" ]] || { echo FIRST_WORKER_NOT_DRAINED; exit 1; }
+[[ "$(trap -p TERM)" == "$caller_trap" ]] || exit 1
+[[ "$result" -eq 143 && "$PURGE_RUN_OUTCOME" == cancelled ]] || exit 1
+EOF_REPEAT_TERM
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RESULT=143 OUTCOME=cancelled"* ]] || return 1
+    [[ "$output" != *"SIZE_PHASE_REACHED"* ]] || return 1
+    [[ "$output" != *"LATER_PROBE_REACHED"* ]] || return 1
+    [[ "$output" != *"CALLER_TERM"* ]] || return 1
+}
+
+
+@test "activity batch retains a truncated worker result" {
+    assert_activity_result_fails_closed truncated
+}
+
+@test "activity batch retains a worker result missing its state" {
+    assert_activity_result_fails_closed missing-field
+}
+
+@test "activity batch retains a worker result missing its mtime" {
+    assert_activity_result_fails_closed missing-mtime
+}
+
+@test "activity batch retains a result from an unsuccessful worker" {
+    assert_activity_result_fails_closed failed-worker
+}
+
+@test "activity batch retains a result after its writer fails" {
+    assert_activity_result_fails_closed failed-write
+}
+
+
+@test "activity batch parent TERM drains real timeout probes and their children" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_PROCESS'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+for name in a-first b-peer c-later; do
+    mkdir -p "$HOME/www/$name/node_modules"
+    touch "$HOME/www/$name/package.json"
+    touch -t 202001010101 "$HOME/www/$name/node_modules"
+done
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$HOME/www/"{a-first,b-peer,c-later}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo SIZE_PHASE_REACHED >&2; echo 1; }
+safe_remove() { echo UNEXPECTED_REMOVE; }
+register_temp_file() { printf '%s\n' "$1" >> "$HOME/activity-results"; }
+mkdir -p "$HOME/activity-bin"
+cat > "$HOME/activity-bin/find" <<'EOF_FIND'
+#!/bin/bash
+[[ "$1" != *c-later* ]] || { echo LATER_PROBE_REACHED >&2; exit 2; }
+sleep 10 & child=$!
+printf '%s %s\n' "$$" "$child" >> "$HOME/activity-processes"
+cleanup() { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; }
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 130' INT
+wait "$child"
+EOF_FIND
+chmod +x "$HOME/activity-bin/find"
+export PATH="$HOME/activity-bin:$PATH" MOLE_DRY_RUN=1
+export MO_PURGE_ACTIVITY_TIMEOUT_SEC=1 MO_PURGE_ACTIVITY_TOTAL_TIMEOUT_SEC=3
+trap 'echo CALLER_TERM' TERM
+caller_trap=$(trap -p TERM)
+(
+    for ((n=0; n<100; n++)); do
+        if [[ -f "$HOME/activity-processes" && $(wc -l < "$HOME/activity-processes") -ge 2 ]]; then
+            kill -TERM "$$"
+            exit 0
+        fi
+        sleep 0.02
+    done
+    exit 1
+) & sender=$!
+result=0
+clean_project_artifacts </dev/null || result=$?
+wait "$sender"
+[[ "$result" -eq 143 && "$PURGE_RUN_OUTCOME" == cancelled ]] || exit 1
+[[ "$(trap -p TERM)" == "$caller_trap" ]] || exit 1
+while read -r probe_pid child_pid; do
+    ! kill -0 "$probe_pid" 2>/dev/null || exit 1
+    ! kill -0 "$child_pid" 2>/dev/null || exit 1
+done < "$HOME/activity-processes"
+while IFS= read -r result_file; do [[ ! -e "$result_file" ]] || exit 1; done < "$HOME/activity-results"
+printf 'DRAINED_REAL_PROBES\n'
+EOF_PROCESS
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *DRAINED_REAL_PROBES* ]] || return 1
+    [[ "$output" != *SIZE_PHASE_REACHED* && "$output" != *LATER_PROBE_REACHED* && "$output" != *UNEXPECTED_REMOVE* && "$output" != *CALLER_TERM* ]] || return 1
+}
+
+
+@test "activity batch preserves cancellation when its result writer also fails" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_SIGNAL_WRITE'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+for name in a-cancel b-later; do
+    mkdir -p "$HOME/www/$name/node_modules"
+    touch "$HOME/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$HOME/www/"{a-cancel,b-later}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+get_optimal_parallel_jobs() { echo 1; }
+get_dir_size_kb() { echo SIZE_PHASE_REACHED >&2; echo 1; }
+safe_remove() { echo UNEXPECTED_REMOVE; }
+is_recently_modified() {
+    [[ "$1" != *b-later* ]] || { echo LATER_PROBE_REACHED >&2; _PURGE_ACTIVITY_STATE=old; return 1; }
+    return 143
+}
+printf() {
+    [[ "$1" != '%s %s %s\n' ]] || return 7
+    builtin printf "$@"
+}
+export MOLE_DRY_RUN=1
+result=0
+clean_project_artifacts </dev/null || result=$?
+[[ "$result" -eq 143 && "$PURGE_RUN_OUTCOME" == cancelled ]] || exit 1
+printf 'CANCELLED_WITH_FAILED_WRITER\n'
+EOF_SIGNAL_WRITE
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *CANCELLED_WITH_FAILED_WRITER* ]] || return 1
+    [[ "$output" != *SIZE_PHASE_REACHED* && "$output" != *LATER_PROBE_REACHED* && "$output" != *UNEXPECTED_REMOVE* ]] || return 1
+}
+
+@test "activity sliding window reaches a later fast artifact while an earlier probe waits" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_WINDOW'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/activity-window.XXXXXX")
+for name in a-waits b-fast c-recent d-error e-later f-later-error; do
+    artifact="$fixture/www/$name/node_modules"
+    mkdir -p "$artifact"
+    touch "$fixture/www/$name/package.json"
+    touch -t 202001010101 "$artifact"
+done
+touch "$fixture/www/c-recent/node_modules/current.js"
+PURGE_SEARCH_PATHS=("$fixture/www")
+scan_purge_targets() {
+    printf '%s\n' "$fixture/www/"{a-waits,b-fast,c-recent,d-error,e-later,f-later-error}/node_modules > "$2"
+}
+purge_artifact_has_authored_content() { return 1; }
+purge_node_modules_is_protected() { return 1; }
+get_optimal_parallel_jobs() { echo 4; }
+get_dir_size_kb() { echo 1; }
+safe_remove() { printf 'SELECTED:%s\n' "$1"; }
+mkdir -p "$fixture/bin"
+cat > "$fixture/bin/find" <<'EOF_FIND'
+#!/bin/bash
+case "$1" in
+    */a-waits/node_modules)
+        while [[ ! -e "$ACTIVITY_WINDOW_FIXTURE/later-probed" ]]; do sleep 0.02; done
+        ;;
+    */e-later/node_modules) touch "$ACTIVITY_WINDOW_FIXTURE/later-probed" ;;
+    */d-error/node_modules | */f-later-error/node_modules) exit 2 ;;
+esac
+exec /usr/bin/find "$@"
+EOF_FIND
+chmod +x "$fixture/bin/find"
+export ACTIVITY_WINDOW_FIXTURE="$fixture" PATH="$fixture/bin:$PATH"
+export MO_PURGE_ACTIVITY_TOTAL_TIMEOUT_SEC=5 MO_PURGE_ACTIVITY_TIMEOUT_SEC=2 MOLE_DRY_RUN=1
+clean_project_artifacts </dev/null
+[[ -e "$fixture/later-probed" ]] || exit 1
+for name in a-waits b-fast c-recent d-error e-later f-later-error; do
+    [[ -d "$fixture/www/$name/node_modules" ]] || exit 1
+done
+printf 'FIXTURE=%s\n' "$fixture"
+EOF_WINDOW
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local fixture
+    fixture="$(printf '%s\n' "$output" | sed -n 's/^FIXTURE=//p')"
+    [[ -n "$fixture" ]] || return 1
+    [[ "$output" == *"SELECTED:$fixture/www/a-waits/node_modules"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"SELECTED:$fixture/www/b-fast/node_modules"* ]] || return 1
+    [[ "$output" == *"SELECTED:$fixture/www/e-later/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$fixture/www/c-recent/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$fixture/www/d-error/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$fixture/www/f-later-error/node_modules"* ]] || return 1
+}
+
+@test "activity sliding window keeps result status bound to its original index" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_INDEX'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/activity-index.XXXXXX")
+for name in a-delayed b-failed c-control d-recent e-error; do
+    mkdir -p "$fixture/www/$name/node_modules"
+    touch "$fixture/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$fixture/www")
+scan_purge_targets() { printf '%s\n' "$fixture/www/"{a-delayed,b-failed,c-control,d-recent,e-error}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+purge_node_modules_is_protected() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo 1; }
+safe_remove() { printf 'SELECTED:%s\n' "$1"; }
+is_recently_modified() {
+    case "$1" in
+        */a-delayed/node_modules) sleep 0.4 ;;
+        */d-recent/node_modules) _PURGE_ACTIVITY_STATE=recent; return 0 ;;
+        */e-error/node_modules) _PURGE_ACTIVITY_STATE=uncertain; return 0 ;;
+    esac
+    _PURGE_ACTIVITY_STATE=old
+    return 1
+}
+printf() {
+    if [[ "$1" == '%s %s %s\n' && "${item:-}" == */b-failed/node_modules ]]; then
+        builtin printf '1 old 1700000000\n'
+        exit 7
+    fi
+    builtin printf "$@"
+}
+export MOLE_DRY_RUN=1
+clean_project_artifacts </dev/null
+printf 'FIXTURE=%s\n' "$fixture"
+EOF_INDEX
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local fixture
+    fixture="$(printf '%s\n' "$output" | sed -n 's/^FIXTURE=//p')"
+    [[ -n "$fixture" ]] || return 1
+    [[ "$output" == *"SELECTED:$fixture/www/a-delayed/node_modules"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"SELECTED:$fixture/www/c-control/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$fixture/www/b-failed/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$fixture/www/d-recent/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$fixture/www/e-error/node_modules"* ]] || return 1
+}
+
+@test "purge menu rows reuse the activity mtime and batch scratch removal" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_ROWS'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/menu-rows.XXXXXX")
+for name in a-one b-two c-three d-four; do
+    mkdir -p "$fixture/www/$name/node_modules"
+    touch "$fixture/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$fixture/www")
+scan_purge_targets() { printf '%s\n' "$fixture/www/"{a-one,b-two,c-three,d-four}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+purge_node_modules_is_protected() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo 1; }
+safe_remove() { printf 'SELECTED:%s\n' "$1"; }
+get_file_mtime() { printf 'x\n' >> "$fixture/mtime-calls"; echo 1577836800; }
+register_temp_file() { printf '%s\n' "$1" >> "$fixture/registered"; }
+is_registered_scratch() {
+    local arg
+    for arg in "$@"; do
+        [[ -f "$fixture/registered" ]] && grep -Fqx -- "$arg" "$fixture/registered" && return 0
+    done
+    return 1
+}
+cat() {
+    if is_registered_scratch "$@"; then printf 'x\n' >> "$fixture/cat-calls"; fi
+    command cat "$@"
+}
+rm() {
+    if is_registered_scratch "$@"; then printf 'x\n' >> "$fixture/rm-calls"; fi
+    command rm "$@"
+}
+export MOLE_DRY_RUN=1
+clean_project_artifacts </dev/null
+while IFS= read -r scratch; do
+    [[ ! -e "$scratch" ]] || { echo "LEFT:$scratch"; exit 1; }
+done < "$fixture/registered"
+count_lines() { if [[ -f "$1" ]]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
+printf 'MTIME_CALLS=%s\n' "$(count_lines "$fixture/mtime-calls")"
+printf 'CAT_CALLS=%s\n' "$(count_lines "$fixture/cat-calls")"
+printf 'RM_CALLS=%s\n' "$(count_lines "$fixture/rm-calls")"
+EOF_ROWS
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local name
+    for name in a-one b-two c-three d-four; do
+        [[ "$output" == *"SELECTED:"*"/www/$name/node_modules"* ]] || { echo "$output"; return 1; }
+    done
+    # Per artifact: the activity worker and the final pre-delete recheck.
+    # The menu row reuses the worker's read instead of taking a third.
+    [[ "$output" == *"MTIME_CALLS=8"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"CAT_CALLS=0"* ]] || { echo "$output"; return 1; }
+    # Dedupe output, activity batch, size batch: one removal each.
+    [[ "$output" == *"RM_CALLS=3"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge binding rechecks a scan root once instead of per candidate" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_BIND'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/bind-count.XXXXXX")
+for name in a-one b-two c-three d-four; do
+    mkdir -p "$fixture/www/$name/node_modules"
+    touch "$fixture/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$fixture/www")
+scan_purge_targets() { printf '%s\n' "$fixture/www/"{a-one,b-two,c-three,d-four}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+purge_node_modules_is_protected() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo 1; }
+safe_remove() { printf 'SELECTED:%s\n' "$1"; }
+is_path_whitelisted() { printf 'WL\n' >> "$fixture/phase-log"; return 1; }
+is_recently_modified() { printf 'ACT\n' >> "$fixture/phase-log"; _PURGE_ACTIVITY_STATE=old; return 1; }
+_mole_path_matches_identity() {
+    printf 'ID\n' >> "$fixture/phase-log"
+    _mole_snapshot_path_identity "$1" || return 1
+    [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "$2" ]] || return 1
+    [[ "$_MOLE_PATH_SNAPSHOT_PARENT_ID" == "$3" ]] || return 1
+    [[ "$_MOLE_PATH_SNAPSHOT_TARGET_ID" == "$4" ]]
+}
+export MOLE_DRY_RUN=1
+clean_project_artifacts </dev/null
+bind_checks=$(awk '$0 == "WL" { bind = 1 } $0 == "ACT" { exit } bind && $0 == "ID" { n++ } END { print n + 0 }' "$fixture/phase-log")
+printf 'BIND_IDENTITY_CHECKS=%s\n' "$bind_checks"
+EOF_BIND
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local name
+    for name in a-one b-two c-three d-four; do
+        [[ "$output" == *"SELECTED:"*"/www/$name/node_modules"* ]] || { echo "$output"; return 1; }
+    done
+    # One lexical and one physical root check for the single scan root.
+    [[ "$output" == *"BIND_IDENTITY_CHECKS=2"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge binding drops candidates whose scan root changed while binding" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_SWAP'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/bind-swap.XXXXXX")
+for name in a-one b-two; do
+    mkdir -p "$fixture/www/$name/node_modules"
+    touch "$fixture/www/$name/package.json"
+    touch -t 202001010101 "$fixture/www/$name/node_modules"
+done
+PURGE_SEARCH_PATHS=("$fixture/www")
+scan_purge_targets() { printf '%s\n' "$fixture/www/"{a-one,b-two}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+purge_node_modules_is_protected() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo 1; }
+safe_remove() { printf 'SELECTED:%s\n' "$1"; }
+# Replace the scan root with a copy while the first candidate is bound.
+is_path_whitelisted() {
+    if [[ ! -e "$fixture/swapped" ]]; then
+        : > "$fixture/swapped"
+        mv "$fixture/www" "$fixture/www.orig"
+        cp -Rp "$fixture/www.orig" "$fixture/www"
+    fi
+    return 1
+}
+export MOLE_DRY_RUN=1
+clean_project_artifacts </dev/null
+printf 'OUTCOME=%s\n' "$PURGE_RUN_OUTCOME"
+EOF_SWAP
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"OUTCOME=no_candidates"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"No eligible project artifacts to purge"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"SELECTED:"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge content probes overlap within a root and publish in input order" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_POOL'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/probe-pool.XXXXXX")
+get_optimal_parallel_jobs() { echo 4; }
+# The first probe finishes only after the second one has started, so a
+# serial filter records SERIAL and the pool publishes the slow item first.
+is_protected_purge_artifact() {
+    PURGE_PROTECTION_UNVERIFIED=false
+    case "$1" in
+        */a-slow/node_modules)
+            local n
+            for ((n = 0; n < 150; n++)); do
+                [[ ! -e "$fixture/b-started" ]] || return 1
+                sleep 0.02
+            done
+            printf 'SERIAL\n' >> "$fixture/serial"
+            return 1
+            ;;
+        */b-fast/node_modules) : > "$fixture/b-started"; return 1 ;;
+        */c-protected/node_modules) return 0 ;;
+    esac
+    return 1
+}
+printf '%s\n' "$fixture/"{a-slow,b-fast,c-protected,d-last}/node_modules |
+    filter_protected_artifacts "" "$fixture/verified" > "$fixture/kept"
+[[ ! -e "$fixture/serial" ]] || { echo SERIAL_PROBES; exit 1; }
+[[ ! -e "$fixture/verified.probes" ]] || { echo PROBES_LEFT; exit 1; }
+printf 'KEPT=%s\n' "$(tr '\n' ' ' < "$fixture/kept")"
+printf 'VERIFIED=%s\n' "$(tr '\n' ' ' < "$fixture/verified")"
+printf 'FIXTURE=%s\n' "$fixture"
+EOF_POOL
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local fixture
+    fixture="$(printf '%s\n' "$output" | sed -n 's/^FIXTURE=//p')"
+    [[ -n "$fixture" ]] || return 1
+    local expected="$fixture/a-slow/node_modules $fixture/b-fast/node_modules $fixture/d-last/node_modules "
+    [[ "$output" == *"KEPT=$expected"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"VERIFIED=$expected"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge keeps a candidate whose content probe left no record, unverified" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_LOST'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/probe-lost.XXXXXX")
+get_optimal_parallel_jobs() { echo 4; }
+is_protected_purge_artifact() { PURGE_PROTECTION_UNVERIFIED=false; return 1; }
+# The probe for b-lost reaches a clean verdict but its record is never written.
+printf() {
+    if [[ "$1" == '%s %s %s\n' && "${item:-}" == */b-lost/node_modules ]]; then
+        return 1
+    fi
+    builtin printf "$@"
+}
+builtin printf '%s\n' "$fixture/"{a-ok,b-lost}/node_modules |
+    filter_protected_artifacts "" "$fixture/verified" > "$fixture/kept"
+builtin printf 'KEPT=%s\n' "$(tr '\n' ' ' < "$fixture/kept")"
+builtin printf 'VERIFIED=%s\n' "$(tr '\n' ' ' < "$fixture/verified")"
+builtin printf 'FIXTURE=%s\n' "$fixture"
+EOF_LOST
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local fixture
+    fixture="$(printf '%s\n' "$output" | sed -n 's/^FIXTURE=//p')"
+    [[ -n "$fixture" ]] || return 1
+    [[ "$output" == *"KEPT=$fixture/a-ok/node_modules $fixture/b-lost/node_modules "* ]] || { echo "$output"; return 1; }
+    # Only a recorded clean verdict may skip the review walk.
+    [[ "$output" == *"VERIFIED=$fixture/a-ok/node_modules "* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"VERIFIED="*"b-lost"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge content probe filter stops when the scan sentinel is removed" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_CANCEL'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/probe-cancel.XXXXXX")
+get_optimal_parallel_jobs() { echo 4; }
+is_protected_purge_artifact() {
+    printf '%s\n' "$1" >> "$fixture/probed"
+    PURGE_PROTECTION_UNVERIFIED=false
+    return 1
+}
+
+: > "$fixture/scanning"
+result=0
+{
+    printf '%s\n' "$fixture/a-first/node_modules"
+    rm -f "$fixture/scanning"
+    printf '%s\n' "$fixture/b-after-cancel/node_modules"
+} | filter_protected_artifacts "" "$fixture/verified" "$fixture/scanning" > "$fixture/kept" || result=$?
+printf 'STATUS=%s\n' "$result"
+[[ ! -s "$fixture/kept" ]] || { echo PUBLISHED; exit 1; }
+[[ ! -e "$fixture/verified.probes" ]] || { echo PROBES_LEFT; exit 1; }
+if grep -q b-after-cancel "$fixture/probed" 2> /dev/null; then echo LATER_PROBED; exit 1; fi
+EOF_CANCEL
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"STATUS=130"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge content probes never run more than four at a time and keep input order past the pool" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_WIDE'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/probe-wide.XXXXXX")
+mkdir "$fixture/live"
+# A reported pool size above the cap of four must still run four probes at most.
+get_optimal_parallel_jobs() { echo 8; }
+# Earlier items take longer, so completions arrive in reverse input order.
+# Every fourth item is protected and must be left out of both lists.
+is_protected_purge_artifact() {
+    PURGE_PROTECTION_UNVERIFIED=false
+    local n="${1%/node_modules}" pause
+    n=$((10#${n##*/p}))
+    : > "$fixture/live/$n"
+    ls "$fixture/live" | wc -l | tr -d ' ' >> "$fixture/concurrency"
+    printf -v pause '0.%02d' $((20 - n))
+    sleep "$pause"
+    rm -f "$fixture/live/$n"
+    [[ $((n % 4)) -ne 0 ]] || return 0
+    return 1
+}
+for n in 01 02 03 04 05 06 07 08 09 10 11 12; do
+    printf '%s\n' "$fixture/p$n/node_modules"
+done | filter_protected_artifacts "" "$fixture/verified" > "$fixture/kept"
+printf 'PEAK=%s\n' "$(sort -n "$fixture/concurrency" | tail -1)"
+printf 'KEPT=%s\n' "$(sed 's|.*/\(p[0-9]*\)/node_modules|\1|' "$fixture/kept" | tr '\n' ' ')"
+printf 'VERIFIED=%s\n' "$(sed 's|.*/\(p[0-9]*\)/node_modules|\1|' "$fixture/verified" | tr '\n' ' ')"
+EOF_WIDE
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local peak
+    peak="$(printf '%s\n' "$output" | sed -n 's/^PEAK=//p')"
+    # Four ran together (the pool filled) and never more (the cap held).
+    [[ "$peak" -ge 3 && "$peak" -le 4 ]] || { echo "peak=$peak"; echo "$output"; return 1; }
+    [[ "$output" == *"KEPT=p01 p02 p03 p05 p06 p07 p09 p10 p11 "* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"VERIFIED=p01 p02 p03 p05 p06 p07 p09 p10 p11 "* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge content probe signal inside a full pool stops the filter with nothing published" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_POOLSIG'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/probe-poolsig.XXXXXX")
+get_optimal_parallel_jobs() { echo 4; }
+# The first probe is interrupted while three slower ones run and three more
+# items wait for a slot, so the signal arrives through the refill wait.
+is_protected_purge_artifact() {
+    PURGE_PROTECTION_UNVERIFIED=false
+    case "$1" in
+        */q01/node_modules) return 130 ;;
+    esac
+    sleep 0.3
+    return 1
+}
+result=0
+for n in 01 02 03 04 05 06 07; do
+    printf '%s\n' "$fixture/q$n/node_modules"
+done | filter_protected_artifacts "" "$fixture/verified" > "$fixture/kept" || result=$?
+printf 'STATUS=%s\n' "$result"
+[[ ! -s "$fixture/kept" ]] || { echo PUBLISHED; exit 1; }
+[[ ! -s "$fixture/verified" ]] || { echo VERIFIED_PUBLISHED; exit 1; }
+[[ ! -e "$fixture/verified.probes" ]] || { echo PROBES_LEFT; exit 1; }
+EOF_POOLSIG
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"STATUS=130"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge content probe filter publishes nothing when the sentinel goes away during the last probes" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_LATE'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+fixture=$(mktemp -d "$HOME/probe-late.XXXXXX")
+get_optimal_parallel_jobs() { echo 4; }
+: > "$fixture/scanning"
+# Control: with the sentinel in place the same input is published.
+is_protected_purge_artifact() { PURGE_PROTECTION_UNVERIFIED=false; return 1; }
+result=0
+printf '%s\n' "$fixture/a-only/node_modules" |
+    filter_protected_artifacts "" "$fixture/control-verified" "$fixture/scanning" > "$fixture/control-kept" || result=$?
+printf 'CONTROL=%s:%s\n' "$result" "$(tr '\n' ' ' < "$fixture/control-kept")"
+# The cancel arrives after the last item was read, while its probe runs.
+is_protected_purge_artifact() {
+    PURGE_PROTECTION_UNVERIFIED=false
+    rm -f "$fixture/scanning"
+    return 1
+}
+result=0
+printf '%s\n' "$fixture/a-only/node_modules" |
+    filter_protected_artifacts "" "$fixture/verified" "$fixture/scanning" > "$fixture/kept" || result=$?
+printf 'STATUS=%s\n' "$result"
+[[ ! -s "$fixture/kept" ]] || { echo PUBLISHED; exit 1; }
+[[ ! -e "$fixture/verified" ]] || { echo VERIFIED_RECREATED; exit 1; }
+[[ ! -e "$fixture/verified.probes" ]] || { echo PROBES_LEFT; exit 1; }
+printf 'DONE\n'
+EOF_LATE
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CONTROL=0:"*"a-only/node_modules"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"STATUS=130"* && "$output" == *"DONE"* ]] || { echo "$output"; return 1; }
+}
+
+@test "scan_purge_targets leaves a verified sidecar only for the caller that names one" {
+    mkdir -p "$HOME/www/test-project/node_modules"
+    touch "$HOME/www/test-project/package.json"
+    local plain="$BATS_TEST_TMPDIR/plain" asked="$BATS_TEST_TMPDIR/asked" failed="$BATS_TEST_TMPDIR/failed"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PLAIN="$plain" ASKED="$asked" FAILED="$failed" MO_USE_FIND=1 \
+        /bin/bash --noprofile --norc <<'EOF_SIDECAR'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+scan_purge_targets "$HOME/www" "$PLAIN"
+# The filter appends to the sidecar, so a leftover entry would survive a rescan.
+printf '%s\n' "$HOME/stale/node_modules" > "$ASKED.verified"
+scan_purge_targets "$HOME/www" "$ASKED" "$ASKED.verified"
+# A filter that fails after writing its scratch must not leave it behind.
+filter_protected_artifacts() {
+    cat > /dev/null
+    : > "$2"
+    : > "$2.probes"
+    return 130
+}
+rc=0
+scan_purge_targets "$HOME/www" "$FAILED" "$FAILED.verified" || rc=$?
+printf 'FAILED_RC=%s\n' "$rc"
+EOF_SIDECAR
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"FAILED_RC=130"* ]] || { echo "$output"; return 1; }
+    # Control: both completed scans found the candidate.
+    grep -Fxq "$HOME/www/test-project/node_modules" "$plain" || { echo "plain scan found nothing"; return 1; }
+    grep -Fxq "$HOME/www/test-project/node_modules" "$asked" || { echo "named scan found nothing"; return 1; }
+    local leftovers
+    # shellcheck disable=SC2010  # Scratch directory with mktemp-generated ASCII names.
+    leftovers="$(ls "$BATS_TEST_TMPDIR" | grep '^plain\.' || true)"
+    [ -z "$leftovers" ] || { echo "plain scan left: $leftovers"; return 1; }
+    # The caller that named a sidecar gets the verified list, and nothing else.
+    grep -Fxq "$HOME/www/test-project/node_modules" "$asked.verified" || { echo "no verified list"; return 1; }
+    ! grep -Fq "$HOME/stale/node_modules" "$asked.verified" || { echo "stale entry survived the rescan"; return 1; }
+    # shellcheck disable=SC2010  # Scratch directory with mktemp-generated ASCII names.
+    leftovers="$(ls "$BATS_TEST_TMPDIR" | grep '^asked\.' | tr '\n' ' ' || true)"
+    [ "$leftovers" = "asked.verified " ] || { echo "named scan left: $leftovers"; return 1; }
+    # shellcheck disable=SC2010  # Scratch directory with mktemp-generated ASCII names.
+    leftovers="$(ls "$BATS_TEST_TMPDIR" | grep '^failed\.' | tr '\n' ' ' || true)"
+    [ -z "$leftovers" ] || { echo "failed scan left: $leftovers"; return 1; }
+}
+
+@test "purge authored probes preserve signals through the final guard and pool" {
+    local failures=0
+    for source in find git; do
+        for code in 124 130 143; do
+            run env HOME="$BATS_TEST_TMPDIR/$source-$code" PROJECT_ROOT="$PROJECT_ROOT" PROBE_SOURCE="$source" PROBE_CODE="$code" /bin/bash <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME/repo/build"
+# Complete the real activity walk before reaching the injected authored probe.
+touch -t 202001010000 "$HOME/repo/build"
+git init -q "$HOME/repo"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+eval "original_$(declare -f run_with_timeout)"
+run_with_timeout() {
+    if [[ "$PROBE_SOURCE" == find && "$2" == /usr/bin/find ]]; then return "$PROBE_CODE"; fi
+    original_run_with_timeout "$@"
+}
+mole_git_ls_files() { return "$PROBE_CODE"; }
+is_safe_configured_purge_artifact() { return 0; }
+for layer in purge_artifact_has_authored_content is_protected_purge_artifact _mole_purge_final_remove_guard; do
+    rc=0
+    "$layer" "$HOME/repo/build" || rc=$?
+    expected="$PROBE_CODE"
+    if [[ "$PROBE_CODE" == 124 ]]; then
+        case "$layer" in
+            purge_artifact_has_authored_content) expected=2 ;;
+            is_protected_purge_artifact) expected=0 ;;
+            *) expected=1 ;;
+        esac
+    fi
+    [[ "$rc" == "$expected" ]] || { echo "$layer: $rc != $expected"; exit 11; }
+done
+rc=0
+printf '%s\n' "$HOME/repo/build" | filter_protected_artifacts "" "$HOME/verified" > "$HOME/output" || rc=$?
+if [[ "$PROBE_CODE" == 124 ]]; then
+    [[ "$rc" == 0 && -s "$HOME/output" && ! -s "$HOME/verified" ]] || exit 12
+else
+    [[ "$rc" == "$PROBE_CODE" && ! -s "$HOME/output" && ! -s "$HOME/verified" ]] || exit 13
+fi
+EOF
+            [ "$status" -eq 0 ] || { echo "$source/$code: $output"; failures=$((failures + 1)); }
+        done
+    done
+    [ "$failures" -eq 0 ]
+}
+
+@test "purge authored cancellation stops later targets at review removal and sink" {
+    local failures=0
+    for phase in review removal sink; do
+        run env HOME="$BATS_TEST_TMPDIR/$phase" PROJECT_ROOT="$PROJECT_ROOT" PHASE="$phase" /bin/bash <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME/www/a/node_modules" "$HOME/www/b/node_modules"
+HOME=$(cd "$HOME" && pwd -P)
+mkdir -p "$HOME/.cache/mole"
+touch "$HOME/www/a/package.json" "$HOME/www/b/package.json"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$HOME/www/"{a,b}/node_modules > "$2"; }
+get_dir_size_kb() { echo 1; }
+is_recently_modified() { _PURGE_ACTIVITY_STATE=old; return 1; }
+purge_artifact_has_authored_content() {
+    [[ "$1" == */a/node_modules ]] || return 1
+    echo call >> "$HOME/probes"
+    count=$(wc -l < "$HOME/probes")
+    case "$PHASE" in
+        review) return 130 ;;
+        removal) [[ "$count" -lt 2 ]] || return 130 ;;
+        sink) [[ "$count" -lt 3 ]] || return 130 ;;
+    esac
+    return 1
+}
+safe_remove() {
+    [[ "$1" != */b/node_modules ]] || echo LATER_SINK >> "$HOME/later"
+    _mole_purge_final_remove_guard "$1"
+}
+rc=0
+clean_project_artifacts || rc=$?
+[[ "$rc" == 130 && "$PURGE_RUN_OUTCOME" == cancelled ]] || { echo "RC=$rc OUTCOME=$PURGE_RUN_OUTCOME"; exit 11; }
+[[ ! -e "$HOME/later" ]] || exit 12
+EOF
+        [ "$status" -eq 0 ] || { echo "$phase: $output"; failures=$((failures + 1)); }
+    done
+    [ "$failures" -eq 0 ]
+}
+
+@test "scan_purge_targets still walks when find rejects the dataless flag name" {
+	# An older macOS find that does not know `dataless` fails the whole walk
+	# with the flag in it. The probe must turn the prune off instead.
+	local root="$HOME/dataless-probe"
+	mkdir -p "$root/app/node_modules"
+	touch "$root/app/package.json"
+
+	local scan_output
+	scan_output="$(mktemp)"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ROOT="$root" SCAN_OUTPUT="$scan_output" \
+		/bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+_MOLE_PURGE_FIND=find  # route the purge walk through the stub
+run_with_timeout() { shift; "$@"; }
+fd() { return 1; }
+find() {
+	local arg
+	for arg in "$@"; do
+		if [[ "$arg" == "-flags" ]]; then
+			echo "FLAG_SEEN" >> "$HOME/walk.log"
+			echo "find: -flags: dataless: illegal flag name" >&2
+			return 1
+		fi
+	done
+	/usr/bin/find "$@"
+}
+scan_purge_targets "$ROOT" "$SCAN_OUTPUT"
+cat "$SCAN_OUTPUT"
+echo "WALK_LOG:$(cat "$HOME/walk.log")"
+EOF
+
+	rm -f "$scan_output" "$HOME/walk.log"
+	rm -rf "$root"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"$root/app/node_modules"* ]] || return 1
+	[[ "$output" == *"WALK_LOG:FLAG_SEEN"* ]] || return 1
+	[[ "$output" != *"WALK_LOG:FLAG_SEEN"*"FLAG_SEEN"* ]]
+}
+
+@test "scan_purge_targets skips online-only cloud folders and never uses fd for a cloud root (#1679)" {
+	local cloud="$HOME/Library/CloudStorage/GoogleDrive-test"
+	mkdir -p "$cloud/Local/app/node_modules" "$cloud/OnlineOnly/app/node_modules"
+	touch "$cloud/Local/app/package.json" "$cloud/OnlineOnly/app/package.json"
+
+	local scan_output
+	scan_output="$(mktemp)"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" CLOUD="$cloud" SCAN_OUTPUT="$scan_output" \
+		/bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+_MOLE_PURGE_FIND=find  # route the purge walk through the stub
+run_with_timeout() { shift; "$@"; }
+fd() { echo "FD_USED" >> "$HOME/walk.log"; return 1; }
+# A real dataless flag needs a File Provider, so the stub stands in for it with
+# a name match and records that every walk asked for the flag.
+find() {
+	local -a args=()
+	local saw_flag=false
+	while [[ $# -gt 0 ]]; do
+		if [[ "$1" == "-flags" && "${2:-}" == "+dataless" ]]; then
+			args+=(-name OnlineOnly)
+			saw_flag=true
+			shift 2
+			continue
+		fi
+		args+=("$1")
+		shift
+	done
+	[[ "${args[0]}" != "$CLOUD" ]] || echo "WALK_DATALESS=$saw_flag" >> "$HOME/walk.log"
+	/usr/bin/find "${args[@]}"
+}
+scan_purge_targets "$CLOUD" "$SCAN_OUTPUT"
+cat "$SCAN_OUTPUT"
+cat "$HOME/walk.log"
+EOF
+
+	rm -f "$scan_output" "$HOME/walk.log"
+	rm -rf "$HOME/Library/CloudStorage"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"$cloud/Local/app/node_modules"* ]] || return 1
+	[[ "$output" != *"OnlineOnly/app/node_modules"* ]] || return 1
+	[[ "$output" == *"WALK_DATALESS=true"* ]] || return 1
+	[[ "$output" != *"WALK_DATALESS=false"* ]] || return 1
+	[[ "$output" != *"FD_USED"* ]]
+}
+
+@test "purge keeps the dataless prune with GNU find first in PATH" {
+	# GNU findutils has no -flags primary, so a PATH find would always answer
+	# "unknown" and the walk would list online-only cloud folders. The probe
+	# and both walks use the system find instead.
+	local root="$HOME/gnu-find-purge"
+	local stub_bin="$HOME/gnu-find-bin"
+	mkdir -p "$root/app/node_modules" "$stub_bin"
+	touch "$root/app/package.json"
+	cat > "$stub_bin/find" <<'STUB'
+#!/bin/bash
+echo "PATH_FIND $*" >> "$HOME/gnu-find.log"
+for arg in "$@"; do
+	[[ "$arg" == "-flags" ]] && { echo "find: unknown predicate '-flags'" >&2; exit 1; }
+done
+exec /usr/bin/find "$@"
+STUB
+	chmod +x "$stub_bin/find"
+
+	local scan_output
+	scan_output="$(mktemp)"
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$stub_bin:$PATH" ROOT="$root" SCAN_OUTPUT="$scan_output" \
+		/bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+run_with_timeout() { shift; "$@"; }
+fd() { return 1; }
+rc=0
+_purge_find_knows_dataless || rc=$?
+echo "DATALESS_RC=$rc"
+scan_purge_targets "$ROOT" "$SCAN_OUTPUT"
+cat "$SCAN_OUTPUT"
+EOF
+
+	local path_find_calls=""
+	path_find_calls=$(cat "$HOME/gnu-find.log" 2> /dev/null || true)
+	rm -f "$scan_output" "$HOME/gnu-find.log"
+	rm -rf "$root" "$stub_bin"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"DATALESS_RC=0"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"$root/app/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$path_find_calls" != *"-flags"* ]] || { echo "$path_find_calls"; return 1; }
+	[[ "$path_find_calls" != *"$root -mindepth"* ]] || { echo "$path_find_calls"; return 1; }
+}
+
+@test "dataless capability signals cancel discovery before any candidate is published" {
+    local signal
+    for signal in 130 143; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" SIGNAL="$signal" /bin/bash --noprofile --norc <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+_MOLE_PURGE_FIND=find  # route the purge walk through the stub
+mkdir -p "$HOME/.cache/mole" "$HOME/projects/app/node_modules"
+touch "$HOME/projects/app/package.json"
+run_with_timeout() { shift; "$@"; }
+fd() { return 1; }
+find() {
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == -flags ]]; then return "$SIGNAL"; fi
+    done
+    /usr/bin/find "$@"
+}
+rc=0
+scan_purge_targets "$HOME/projects" "$HOME/result" || rc=$?
+[[ $rc -eq $SIGNAL ]] || exit 1
+[[ ! -s "$HOME/result" ]] || exit 1
+SH
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    done
+}
+
+# #1666: a container root (purge_paths entry that is not a project) is scanned
+# as one unit first. Only when that scan times out is it scanned again one
+# child at a time, each with its own budget, so one slow project no longer
+# skips every sibling under the same root.
+_purge_unit_flow_script() {
+	cat <<'EOF_FLOW'
+get_dir_size_kb() { echo 4; }
+is_recently_modified() { _PURGE_ACTIVITY_STATE=old; return 1; }
+purge_target_activity_still_safe() { return 0; }
+safe_remove() { printf 'REMOVE:%s\n' "$1"; }
+export MOLE_DRY_RUN=1
+clean_rc=0
+clean_project_artifacts </dev/null || clean_rc=$?
+printf 'RC=%s OUTCOME=%s\n' "$clean_rc" "$PURGE_RUN_OUTCOME"
+EOF_FLOW
+}
+
+@test "purge falls back to child units when a container root times out and keeps completed siblings (#1666)" {
+	local root="$HOME/sites-1666"
+	local name
+	for name in a-fast b-slow c-fast; do
+		mkdir -p "$root/$name/node_modules"
+		touch "$root/$name/package.json"
+	done
+	local stub="$HOME/find-1666-slow"
+	cat > "$stub" <<'STUB'
+#!/bin/bash
+# A walk that enters b-slow never finishes in time: the child walk itself, or
+# any deep walk started at the container root.
+if [[ "$1" == "$ROOT/b-slow" ]]; then exec /bin/sleep 20; fi
+if [[ "$1" == "$ROOT" && " $* " != *" -maxdepth 1 "* ]]; then exec /bin/sleep 20; fi
+exec /usr/bin/find "$@"
+STUB
+	chmod +x "$stub"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ROOT="$root" STUB="$stub" FLOW="$(_purge_unit_flow_script)" \
+		MO_USE_FIND=1 MO_PURGE_SCAN_TIMEOUT_SEC=3 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+mkdir -p "$HOME/.cache/mole"
+_MOLE_PURGE_FIND="$STUB"  # route the purge walk through the stub
+PURGE_SEARCH_PATHS=("$ROOT")
+get_optimal_parallel_jobs() { echo 2; }
+eval "$FLOW"
+EOF
+
+	rm -rf "$root" "$stub"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"REMOVE:$root/a-fast/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"REMOVE:$root/c-fast/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"REMOVE:$root/b-slow/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"Skipped 1 project scan root because scanning did not complete"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"~/sites-1666/b-slow"*"(status 124)"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"OUTCOME=incomplete"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge scans a container root that completes as one unit with one find call (#1666)" {
+	local root="$HOME/sites-1666-calls"
+	mkdir -p "$root/a/node_modules" "$root/b/.cache"
+	touch "$root/a/package.json" "$root/b/package.json"
+	printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$root/b/.cache/CACHEDIR.TAG"
+	local stub="$HOME/find-1666-calls" log="$HOME/find-1666-calls.log"
+	cat > "$stub" <<'STUB'
+#!/bin/bash
+printf '%s\t%s\n' "$1" "$*" >> "$LOG"
+exec /usr/bin/find "$@"
+STUB
+	chmod +x "$stub"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ROOT="$root" STUB="$stub" LOG="$log" FLOW="$(_purge_unit_flow_script)" \
+		MO_USE_FIND=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+mkdir -p "$HOME/.cache/mole"
+_MOLE_PURGE_FIND="$STUB"  # route the purge walk through the stub
+PURGE_SEARCH_PATHS=("$ROOT")
+eval "$FLOW"
+EOF
+
+	local root_calls a_calls b_calls root_deep
+	root_calls=$(awk -F'\t' -v r="$root" '$1 == r' "$log" | wc -l | tr -d ' ')
+	root_deep=$(awk -F'\t' -v r="$root" '$1 == r && $2 !~ / -maxdepth 1 /' "$log" | wc -l | tr -d ' ')
+	a_calls=$(awk -F'\t' -v r="$root/a" '$1 == r' "$log" | wc -l | tr -d ' ')
+	b_calls=$(awk -F'\t' -v r="$root/b" '$1 == r' "$log" | wc -l | tr -d ' ')
+	rm -rf "$root" "$stub" "$log"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"REMOVE:$root/a/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"REMOVE:$root/b/.cache"* ]] || { echo "$output"; return 1; }
+	[[ "$root_calls" == 1 && "$root_deep" == 1 ]] || { echo "ROOT=$root_calls DEEP=$root_deep"; return 1; }
+	[[ "$a_calls" == 0 && "$b_calls" == 0 ]] || { echo "A=$a_calls B=$b_calls"; return 1; }
+}
+
+@test "purge keeps target and CACHEDIR.TAG depth coverage when walking scan units (#1666)" {
+	local sig='Signature: 8a477f597d28d172789f06886806bc55'
+	local box="$HOME/parity-1666"
+	local container="$box/container" project="$box/project"
+	# Container root: targets at depth 1, 2, 6 and 7; tags at depth 2, 3, 7 and 8.
+	mkdir -p "$container/node_modules" "$container/x/node_modules" \
+		"$container/x/a/b/c/d/node_modules" "$container/x/a/b/c/d/e/node_modules" \
+		"$container/t" "$container/x/k" "$container/x/a/b/c/d/cachy" "$container/x/a/b/c/d/e/cachy"
+	touch "$container/x/package.json"
+	printf '%s\n' "$sig" > "$container/t/CACHEDIR.TAG"
+	printf '%s\n' "$sig" > "$container/x/k/CACHEDIR.TAG"
+	printf '%s\n' "$sig" > "$container/x/a/b/c/d/cachy/CACHEDIR.TAG"
+	printf '%s\n' "$sig" > "$container/x/a/b/c/d/e/cachy/CACHEDIR.TAG"
+	# Project root: direct-child target, tags at depth 1 and 2.
+	mkdir -p "$project/node_modules" "$project/c"
+	touch "$project/package.json"
+	printf '%s\n' "$sig" > "$project/CACHEDIR.TAG"
+	printf '%s\n' "$sig" > "$project/c/CACHEDIR.TAG"
+
+	# The second pass makes the container's single walk time out, so the same
+	# fixture is found again through child units with shifted depth limits.
+	local stub="$HOME/find-1666-parity"
+	cat > "$stub" <<'STUB'
+#!/bin/bash
+if [[ "$FALLBACK" == 1 && "$1" == "$BOX/container" && " $* " != *" -maxdepth 1 "* && " $* " != *" -maxdepth 0 "* ]]; then
+	exec /bin/sleep 20
+fi
+exec /usr/bin/find "$@"
+STUB
+	chmod +x "$stub"
+
+	local expected="container/x/a/b/c/d/cachy,container/x/a/b/c/d/node_modules,container/x/k,container/x/node_modules,project/c,project/node_modules"
+	local fallback removed
+	for fallback in 0 1; do
+		run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" BOX="$box" STUB="$stub" FALLBACK="$fallback" FLOW="$(_purge_unit_flow_script)" \
+			MO_USE_FIND=1 MO_PURGE_SCAN_TIMEOUT_SEC=2 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+mkdir -p "$HOME/.cache/mole"
+_MOLE_PURGE_FIND="$STUB"  # route the purge walk through the stub
+PURGE_SEARCH_PATHS=("$BOX/container" "$BOX/project")
+eval "$FLOW"
+EOF
+		[ "$status" -eq 0 ] || { echo "$output"; rm -rf "$box" "$stub"; return 1; }
+		removed=$(printf '%s\n' "$output" | sed -n "s|^REMOVE:$box/||p" | LC_ALL=C sort | paste -sd, -)
+		[[ "$removed" == "$expected" ]] || { echo "FALLBACK=$fallback GOT=$removed"; echo "$output"; rm -rf "$box" "$stub"; return 1; }
+		[[ "$output" != *"Skipped"* ]] || { echo "$output"; rm -rf "$box" "$stub"; return 1; }
+	done
+	rm -rf "$box" "$stub"
+}
+
+@test "purge never offers a CACHEDIR.TAG directory inside a depth-one .git or Library (#1666)" {
+	local sig='Signature: 8a477f597d28d172789f06886806bc55'
+	local root="$HOME/git-tag-1666"
+	mkdir -p "$root/node_modules" "$root/Library/cache"
+	touch "$root/package.json"
+	git -C "$root" init -q
+	mkdir -p "$root/.git/lfs-cache"
+	printf '%s\n' "$sig" > "$root/.git/lfs-cache/CACHEDIR.TAG"
+	printf '%s\n' "$sig" > "$root/Library/cache/CACHEDIR.TAG"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ROOT="$root" FLOW="$(_purge_unit_flow_script)" \
+		MO_USE_FIND=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+mkdir -p "$HOME/.cache/mole"
+PURGE_SEARCH_PATHS=("$ROOT")
+eval "$FLOW"
+EOF
+
+	rm -rf "$root"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"REMOVE:$root/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"REMOVE:$root/.git/"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"REMOVE:$root/Library/"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge container expansion keeps the root's safety rules for its children (#1666)" {
+	local root="$HOME/expand-safety-1666"
+	local outside="$HOME/outside-1666"
+	mkdir -p "$root/node_modules" "$root/ok/node_modules" "$root/OnlineOnly/app/node_modules" \
+		"$outside/app/node_modules"
+	touch "$root/ok/package.json" "$root/OnlineOnly/app/package.json" "$outside/app/package.json"
+	ln -s "$outside" "$root/linked"
+	local stub="$HOME/find-1666-dataless" log="$HOME/find-1666-dataless.log"
+	# A real dataless flag needs a File Provider; the stub turns the flag into a
+	# name match on OnlineOnly and records where every walk started. The deep
+	# walk of the root never finishes, so the root falls back to child units.
+	cat > "$stub" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$1" >> "$LOG"
+if [[ "$1" == "$ROOT" && " $* " != *" -maxdepth 1 "* && " $* " != *" -maxdepth 0 "* ]]; then exec /bin/sleep 20; fi
+args=()
+while [[ $# -gt 0 ]]; do
+	if [[ "$1" == "-flags" && "${2:-}" == "+dataless" ]]; then
+		args+=(-name OnlineOnly)
+		shift 2
+		continue
+	fi
+	args+=("$1")
+	shift
+done
+exec /usr/bin/find "${args[@]}"
+STUB
+	chmod +x "$stub"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ROOT="$root" STUB="$stub" LOG="$log" FLOW="$(_purge_unit_flow_script)" \
+		MO_USE_FIND=1 MO_PURGE_SCAN_TIMEOUT_SEC=2 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+mkdir -p "$HOME/.cache/mole"
+_MOLE_PURGE_FIND="$STUB"  # route the purge walk through the stub
+PURGE_SEARCH_PATHS=("$ROOT")
+eval "$FLOW"
+EOF
+
+	local starts
+	starts=$(cat "$log" 2> /dev/null || true)
+	rm -rf "$root" "$outside" "$stub" "$log"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"REMOVE:$root/ok/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"REMOVE:$root/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"OnlineOnly"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"$outside"* && "$output" != *"REMOVE:$root/linked"* ]] || { echo "$output"; return 1; }
+	[[ "$starts" == *"$root/ok"* ]] || { echo "$starts"; return 1; }
+	[[ "$starts" != *"$root/OnlineOnly"* && "$starts" != *"$root/linked"* ]] || { echo "$starts"; return 1; }
+	[[ "$starts" != *"$root/node_modules"* ]] || { echo "$starts"; return 1; }
+}
+
+@test "purge removes every scan unit temp file when one unit is cancelled (#1666)" {
+	local box="$HOME/cancel-1666"
+	local root="$box/sites"
+	local name
+	for name in a b c d; do
+		mkdir -p "$root/$name/node_modules"
+		touch "$root/$name/package.json"
+	done
+	mkdir -p "$box/tmp"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ROOT="$root" TMPDIR="$box/tmp" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mkdir -p "$HOME/.cache/mole"
+PURGE_SEARCH_PATHS=("$ROOT")
+get_optimal_parallel_jobs() { echo 2; }
+scan_purge_targets() {
+	local unit="${4:-$1}"
+	printf '%s/node_modules\n' "$unit" > "$2"
+	: > "$2.targets"; : > "$2.verified"; : > "$2.verified.probes"
+	[[ "$unit" == "$ROOT" ]] && return 124
+	printf '%s\n' "$unit" >> "$HOME/cancel-1666-units"
+	[[ "$unit" == "$ROOT/b" ]] && return 130
+	# The peer is still running when b is cancelled.
+	sleep 1
+	return 0
+}
+safe_remove() { printf 'UNEXPECTED_REMOVE:%s\n' "$1"; }
+export MOLE_DRY_RUN=1
+clean_rc=0
+clean_project_artifacts </dev/null || clean_rc=$?
+printf 'RC=%s\n' "$clean_rc"
+printf 'UNITS=%s\n' "$(paste -sd, "$HOME/cancel-1666-units")"
+# mole.registry.* is the process-wide temp registry that bin/purge.sh removes on exit.
+printf 'LEFT=%s\n' "$(find "$TMPDIR" -type f ! -name 'mole.registry.*' | wc -l | tr -d ' ')"
+EOF
+
+	rm -rf "$box" "$HOME/cancel-1666-units"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"RC=130"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"LEFT=0"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"UNEXPECTED_REMOVE"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"UNITS="*"$root/a"* && "$output" == *"UNITS="*"$root/b"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"$root/c"* && "$output" != *"$root/d"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge reports container children left unscanned at the root cap by path (#1666)" {
+	local root="$HOME/cap-1666"
+	local name
+	for name in a b c; do
+		mkdir -p "$root/$name/node_modules"
+		touch "$root/$name/package.json"
+	done
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ROOT="$root" FLOW="$(_purge_unit_flow_script)" \
+		MO_PURGE_SCAN_TIMEOUT_SEC=2 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_modules_is_protected() { return 1; }
+mkdir -p "$HOME/.cache/mole"
+PURGE_SEARCH_PATHS=("$ROOT")
+get_optimal_parallel_jobs() { echo 1; }
+# The root's single scan times out at once. One job and a 2 s budget give its
+# fallback a 2 s cap. Unit a takes 2.5 s, so the cap has expired before b and
+# c can start.
+scan_purge_targets() {
+	local unit="${4:-$1}"
+	[[ "$unit" == "$ROOT" ]] && return 124
+	printf '%s %s\n' "${unit##*/}" "$MO_PURGE_SCAN_TIMEOUT_SEC" >> "$HOME/cap-1666-units"
+	sleep 2.5
+	printf '%s/node_modules\n' "$unit" > "$2"
+}
+eval "$FLOW"
+printf 'UNITS=%s\n' "$(paste -sd, "$HOME/cap-1666-units")"
+EOF
+
+	rm -rf "$root" "$HOME/cap-1666-units"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"REMOVE:$root/a/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"REMOVE:$root/b/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"REMOVE:$root/c/node_modules"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"UNITS=a 2" ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"Skipped 2 project scan roots because scanning did not complete"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"~/cap-1666/b"*"(status 124)"*"~/cap-1666/c"*"(status 124)"* ]] || { echo "$output"; return 1; }
+	local listed
+	listed=$(printf '%s\n' "$output" | grep -c '(status ' || true)
+	[[ "$listed" == 2 ]] || { echo "$output"; return 1; }
+}
+
+@test "purge stops running scan units when a later root listing is interrupted (#1666)" {
+	local box="$HOME/listing-signal-1666"
+	mkdir -p "$box/first/a/node_modules" "$box/second/b/node_modules" "$box/tmp"
+	touch "$box/first/a/package.json" "$box/second/b/package.json"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" BOX="$box" TMPDIR="$box/tmp" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mkdir -p "$HOME/.cache/mole"
+PURGE_SEARCH_PATHS=("$BOX/first" "$BOX/second")
+get_optimal_parallel_jobs() { echo 2; }
+scan_purge_targets() {
+	[[ "${4:-$1}" == "$1" ]] && return 124
+	printf '%s/node_modules\n' "${4:-$1}" > "$2"
+	: > "$2.verified"
+	sleep 3
+	touch "$BOX/unit-finished"
+}
+_purge_list_scan_units() {
+	if [[ "$1" == "$BOX/second" ]]; then
+		sleep 0.3
+		return 130
+	fi
+	_PURGE_SCAN_UNITS=("$1/a")
+}
+rc=0
+clean_project_artifacts </dev/null || rc=$?
+printf 'RC=%s\n' "$rc"
+sleep 3.5
+printf 'FINISHED=%s\n' "$([[ -e "$BOX/unit-finished" ]] && echo yes || echo no)"
+printf 'LEFT=%s\n' "$(find "$TMPDIR" -type f ! -name 'mole.registry.*' | wc -l | tr -d ' ')"
+EOF
+
+	rm -rf "$box"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"RC=130"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"FINISHED=no"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"LEFT=0"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge prints at most ten skipped child paths and keeps the full count (#1666)" {
+	local root="$HOME/many-skipped-1666"
+	local i
+	for i in 01 02 03 04 05 06 07 08 09 10 11 12 13; do
+		mkdir -p "$root/p$i/node_modules"
+		touch "$root/p$i/package.json"
+	done
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ROOT="$root" FLOW="$(_purge_unit_flow_script)" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mkdir -p "$HOME/.cache/mole"
+PURGE_SEARCH_PATHS=("$ROOT")
+scan_purge_targets() { : > "$2"; return 124; }
+eval "$FLOW"
+EOF
+
+	rm -rf "$root"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Skipped 13 project scan roots because scanning did not complete"* ]] || { echo "$output"; return 1; }
+	local listed
+	listed=$(printf '%s\n' "$output" | grep -c '(status 124)' || true)
+	[[ "$listed" == 10 ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"~/many-skipped-1666/p10"*"(status 124)"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"~/many-skipped-1666/p11"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"and 3 more"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge node_modules proves npm pnpm and yarn installs and preserves scan uncertainty" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+purge_node_project_running() { return 1; }
+for pair in 'package-lock.json:.package-lock.json' 'pnpm-lock.yaml:.modules.yaml' 'yarn.lock:.yarn-integrity' 'yarn.lock:.yarn-state.yml'; do
+    project="$HOME/www/${pair#*:}"
+    mkdir -p "$project/node_modules/example" "$project/node_modules/.cache/tool"
+    touch "$project/package.json" "$project/${pair%%:*}"
+    touch -t 202001010000 "$project/node_modules/example/index.js"
+    touch -t 202001020000 "$project/node_modules/${pair#*:}"
+    touch "$project/node_modules/.cache/tool/rebuildable"
+    rc=0
+    is_protected_purge_artifact "$project/node_modules" || rc=$?
+    [[ $rc -eq 1 ]] || exit 1
+    selected=$(printf '%s\n' "$project/node_modules" | filter_protected_artifacts)
+    [[ "$selected" == "$project/node_modules" ]] || exit 1
+done
+for probe_status in 124 1 143; do
+    run_with_timeout() { return "$probe_status"; }
+    rc=0
+    purge_node_modules_is_protected "$project/node_modules" || rc=$?
+    if [[ $probe_status -eq 143 ]]; then [[ $rc -eq 143 ]]; else [[ $rc -eq 2 ]]; fi
+done
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "purge node project process checks distinguish cwd arguments and incomplete visibility" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+project="$HOME/www/name[1]"
+for mode in cwd args idle error partial signal; do
+    run_with_timeout() {
+        shift
+        if [[ "$1" == /usr/sbin/lsof ]]; then
+            case "$mode" in
+                cwd) printf 'p123\nn%s/src\n' "$project" ;;
+                error) return 1 ;;
+                partial) printf 'p123\nn/unrelated\n'; echo 'lsof: incomplete visibility' >&2 ;;
+                signal) return 143 ;;
+                *) printf 'p123\nn/unrelated\n' ;;
+            esac
+        else
+            [[ "$1" == pgrep && "$3" == *'name\[1\]'* ]] || return 2
+            [[ "$mode" == args ]]
+        fi
+    }
+    rc=0
+    purge_node_project_running "$project" || rc=$?
+    case "$mode" in
+        cwd|args) [[ $rc -eq 0 ]] ;;
+        idle) [[ $rc -eq 1 ]] ;;
+        error|partial) [[ $rc -eq 2 ]] ;;
+        signal) [[ $rc -eq 143 ]] ;;
+    esac
+done
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "purge node project process check reads an idle project as idle under --debug" {
+    # The real run_with_timeout, so its debug notice reaches the lsof capture
+    # the way it does in `mo purge --debug`; the stubbed case above cannot see it.
+    mkdir -p "$HOME/fake-timeout" "$HOME/www/idle-project"
+    cat > "$HOME/fake-timeout/timeout" <<'SCRIPT'
+#!/bin/bash
+shift 3
+case "$1" in
+    /usr/sbin/lsof) printf 'p123\nfcwd\nn/unrelated\n' ;;
+    pgrep) exit 1 ;;
+    *) exec "$@" ;;
+esac
+SCRIPT
+    chmod +x "$HOME/fake-timeout/timeout"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MO_DEBUG=1 FAKE_TIMEOUT="$HOME/fake-timeout/timeout" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+MO_TIMEOUT_BIN="$FAKE_TIMEOUT"
+rc=0
+purge_node_project_running "$HOME/www/idle-project" 2> /dev/null || rc=$?
+echo "RC=$rc"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=1"* ]] || { echo "$output"; return 1; }
+}
+
+@test "purge final node owner after activity scan initial-running" {
+    assert_purge_final_owner_guard initial-running
+}
+
+@test "purge final node owner after activity scan final-running" {
+    assert_purge_final_owner_guard final-running
+}
+
+@test "purge final node owner after activity scan final-unknown" {
+    assert_purge_final_owner_guard final-unknown
+}
+
+@test "purge final node owner after activity scan final-signal" {
+    assert_purge_final_owner_guard final-signal
+}
+
+@test "purge final node owner after activity scan idle" {
+    assert_purge_final_owner_guard idle
 }

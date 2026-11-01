@@ -1,7 +1,8 @@
 ---
 name: release-notes
 description: Publish curated release notes for an existing Mole `V<version>` tag, including bilingual format, `gh release edit`, contributor thanks, and reactions. Use only when explicitly asked to edit or publish Mole release notes. Not for release readiness, tagging, or code review.
-disable-model-invocation: true
+metadata:
+  internal: true
 ---
 
 # Mole release notes
@@ -13,27 +14,21 @@ This skill drives the curated-notes step that runs **after** `release.yml` has f
 Before drafting, confirm:
 
 1. **Version**. Capital `V`, e.g. `V1.38.0`. Lowercase `v` does not trigger the workflow and may indicate a botched tag.
-2. **CodeName + emoji**. Ask the user. The title format is `V<version> <CodeName> <emoji>`.
+2. **CodeName**. Every macOS and Windows release title, including prereleases, needs a short codename after its tag. Include a proposed name in the review draft when none was provided; use the approved name when publishing. Append an emoji only when the maintainer requests one.
 3. **Release commit range**. `git log <previous-tag>..V<version> --oneline` gives the raw material.
 4. **User-visible behavior changes**. Scan the full commit message bodies (not just subjects) for narrowed detection, removed features, or controlled regressions. These belong in notes even when they are not bug-fix-shaped, because users will encounter the changed boundary in production.
-5. **Issue reporters and PR contributors in this cycle**. Use the merged PRs and fixed issues in the release range. Keep it short, for example `Issue reporters and PR contributors this cycle: @a · @b.` Exclude `tw93` and bots.
+5. **Issue reporters and PR contributors in this cycle**. Derive them from what the release actually contains, never from a date window of closed issues: `git log --format='%an' <prev>..<tag>` for contributors, and the issue numbers the range's own commit messages cite for reporters, checking each is `state_reason: completed` and was fixed here rather than merely referenced as background. A closing window silently pulls in `not_planned` issues and everything the PREVIOUS release fixed, which is how V1.55.0 nearly shipped 30 names where 8 were real. Keep it short, for example `Issue reporters and PR contributors this cycle: @a · @b.` Exclude `tw93`, `youxi798` and bots.
 6. **Verify release exists**. `gh release view V<version> --repo tw93/Mole --json id,name` should return non-empty. If it doesn't, the workflow hasn't finished, wait, don't `gh release create`.
 
-## Pre-flight (cross-check against AGENTS.md)
+## Pre-flight (published-tag evidence)
 
-These should already be true if the tag was pushed correctly. Confirm before publishing notes:
+Use the target tag's exact commit and the completed checks and public-asset evidence from [release-flow](../release-flow/SKILL.md). Reuse that evidence when it still matches the immutable tag; rerun only a missing or failed gate. A build of a newer working tree does not verify the release being described. The full build, test, asset, and script-update gates stay owned by `release-flow` rather than a second checklist here.
 
-- `grep '^VERSION=' mole` matches `<version>`.
-- `SECURITY_AUDIT.md` opening line reflects the new version and date.
-- `./scripts/check.sh --format` clean.
-- `TERM=xterm-256color MOLE_TEST_NO_AUTH=1 MOLE_TEST_JOBS=2 BATS_FORMATTER=tap ./scripts/test.sh` exits 0.
-- `go test ./...` and `make build` pass.
-
-If any fail, stop. The notes can wait; a bad release tag cannot.
+If evidence is missing, complete the applicable release-flow gate before publishing notes. Keep draft work read-only; an existing release object alone is not proof its assets or upgrade path passed.
 
 ## Format
 
-Strictly follow the current compact release shape. Read the latest stable release as the live format reference before drafting: `gh release view --repo tw93/Mole --json tagName,body`.
+Strictly follow the current compact release shape. Read the previous published stable release before the target tag as the live format reference. Exclude the candidate release: the workflow may already have made it the latest release with an empty body. Resolve the previous tag first, then read it with `gh release view <previous-tag> --repo tw93/Mole --json tagName,body`.
 
 Structure:
 
@@ -46,12 +41,12 @@ Structure:
 
 ### Changelog
 
-1. **<English headline>**: <one-sentence English elaboration>.
+1. <English headline>: <one-sentence English elaboration>.
 2. ...
 
 ### 更新日志
 
-1. **<中文 headline>**：<一句中文说明>。
+1. <中文 headline>：<一句中文说明>。
 2. ...
 
 ### Thanks
@@ -67,11 +62,12 @@ No `---` separators between sections, and no trailing repository link; the publi
 
 ### Format rules (all are documented bugs that have shipped before)
 
-- **Body h1 is just `Mole`**. Version, codename, and emoji live only in the `--title` argument (`V<version> <CodeName> <emoji>`); repeating them in the body header is redundant and has been explicitly rejected before.
+- **Body h1 is just `Mole`**. Version, codename, and emoji live only in the `--title` argument (`V<version> <CodeName>`); repeating them in the body header is redundant and has been explicitly rejected before.
 - **No em dash anywhere**. Use commas, periods, colons, semicolons, or parentheses.
 - **No sponsor list by default**. The current public release style thanks issue reporters and PR contributors for this cycle only.
 - **No emoji except the version emoji in the release title**. Body section headers stay plain, including `### Thanks` (the old `Thanks 💖` header is gone from the published pages).
 - **No inline PR refs, no inline `@handle` thanks**. PRs and people belong in the dedicated Thanks block only.
+- **Item lead-ins use plain text, not bold.**
 - **English block first, 中文 block second**. Same numbered order in both blocks. Same number of items.
 - **Order items by user-perceived impact, not commit chronology**. Headline change first; internal safety hardening, performance, and bug fixes follow.
 - **Do not describe overview icons that no longer exist**. Analyze overview rows are text-only because emoji width and baselines vary across terminals. If icons return later, they must not imply that user data such as iOS Backups, Xcode Archives, or Old Downloads is safe to delete.
@@ -85,7 +81,7 @@ Once the user approves the draft:
 
 ```bash
 gh release edit V<version> --repo tw93/Mole \
-  --title "V<version> <CodeName> <emoji>" \
+  --title "V<version> <CodeName>" \
   --notes-file <path-to-draft>
 ```
 

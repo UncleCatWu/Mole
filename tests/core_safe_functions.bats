@@ -1,25 +1,13 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-safe-functions.XXXXXX")"
-    export HOME
-
-    mkdir -p "$HOME"
+    mole_test_setup_home safe-functions
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 setup() {
@@ -35,6 +23,222 @@ setup() {
 
 teardown() {
     rm -rf "$TEST_DIR"
+}
+
+# Exercise production guards and sinks with only lsof's response scripted.
+# Each case gets a separate home, and the later ordinary file is independently
+# removable, so a preserved file cannot mask a sticky-cancellation regression.
+check_handle_probe_outcome() {
+    local kind="$1" scripted_rc="$2" stage="$3" dry_run="${4:-0}"
+    local fixture="$TEST_DIR/probe-$kind-$scripted_rc-$stage-$dry_run"
+    mkdir -p "$fixture"
+    run env HOME="$fixture" PROJECT_ROOT="$PROJECT_ROOT" kind="$kind" \
+        scripted_rc="$scripted_rc" stage="$stage" MOLE_DRY_RUN="$dry_run" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+[[ "$MOLE_DRY_RUN" == 0 ]] || DRY_RUN=true
+case "$kind" in
+    download) target="$HOME/Downloads/first.crdownload" ;;
+    container) target="$HOME/Library/Containers/com.example.Probe/Data/Library/Caches/First" ;;
+    group) target="$HOME/Library/Group Containers/TEAM.com.example.probe/Library/Caches/first.log" ;;
+esac
+mkdir -p "$(dirname "$target")"
+if [[ "$kind" == container ]]; then
+    mkdir -p "$target"
+    printf 'keep\n' > "$target/state"
+else
+    printf 'keep\n' > "$target"
+fi
+next="$HOME/next.log"
+printf 'later\n' > "$next"
+: > "$HOME/probes"
+: > "$HOME/sinks"
+: > "$HOME/previews"
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+_mole_user_cache_owner_process_state() { return 1; }
+[[ "$stage" == visibility ]] || _MOLE_COMPLETE_LSOF_MODE=direct
+lsof() {
+    printf '%s\n' "$*" >> "$HOME/probes"
+    # Return a genuinely idle result until sizing completes in the final case.
+    if [[ "$stage" == final && ! -f "$HOME/sized" ]]; then
+        return 1
+    fi
+    return "$scripted_rc"
+}
+run_with_timeout() { shift; "$@"; }
+oplog_enabled() { return 0; }
+get_path_size_kb() { touch "$HOME/sized"; printf '1\n'; }
+rm() {
+    printf '%s\n' "$*" >> "$HOME/sinks"
+    command rm "$@" # SAFE: production safe_remove validates isolated fixture paths before this mock
+}
+register_dry_run_cleanup_target() { printf '%s\n' "$*" >> "$HOME/previews"; }
+first_rc=0
+safe_remove "$target" true || first_rc=$?
+second_rc=0
+safe_remove "$next" true 1 || second_rc=$?
+printf 'CASE=%s/%s/%s DRY=%s\n' "$kind" "$scripted_rc" "$stage" "$MOLE_DRY_RUN"
+printf 'FIRST=%s SECOND=%s CANCEL=%s TARGET=%s NEXT=%s\n' \
+    "$first_rc" "$second_rc" "$MOLE_CLEAN_CANCEL_STATUS" \
+    "$(test -e "$target" && echo kept || echo removed)" \
+    "$(test -e "$next" && echo kept || echo removed)"
+[[ -s "$HOME/probes" ]] || exit 1
+if [[ "$stage" == visibility ]]; then
+    grep -q -- '-F pu -p 1' "$HOME/probes" || exit 1
+else
+    grep -qF -- "$target" "$HOME/probes" || exit 1
+fi
+if [[ "$stage" == final ]]; then
+    [[ -f "$HOME/sized" ]] || exit 1
+fi
+if [[ "$MOLE_DRY_RUN" == 1 ]]; then
+    [[ ! -s "$HOME/sinks" ]] || exit 1
+    grep -qF -- "$next" "$HOME/previews" || exit 1
+    if grep -qF -- "$target" "$HOME/previews"; then exit 1; fi
+elif [[ "$scripted_rc" == 124 ]]; then
+    grep -qF -- "$next" "$HOME/sinks" || exit 1
+    if grep -qF -- "$target" "$HOME/sinks"; then exit 1; fi
+else
+    [[ ! -s "$HOME/sinks" ]] || exit 1
+fi
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    if [[ "$scripted_rc" == 124 ]]; then
+        local next_state=removed
+        [[ "$dry_run" == 0 ]] || next_state=kept
+        [[ "$output" == *"FIRST=1 SECOND=0 CANCEL=0 TARGET=kept NEXT=$next_state"* ]] || { echo "$output"; return 1; }
+    else
+        [[ "$output" == *"FIRST=$scripted_rc SECOND=$scripted_rc CANCEL=$scripted_rc TARGET=kept NEXT=kept"* ]] || { echo "$output"; return 1; }
+    fi
+}
+
+# Keep the no-auth guard enabled in the environment. Only the loaded helper's
+# test-mode early return is bypassed, with every privileged boundary mocked.
+check_find_delete_cancellation() {
+    local helper="$1" stage="$2" probe_rc="$3" dry_run="$4"
+    local fixture="$TEST_DIR/find-cancel-$helper-$stage-$probe_rc-$dry_run"
+    mkdir -p "$fixture"
+    touch "$fixture/first.log" "$fixture/middle.db" "$fixture/last.log"
+    run env PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$fixture" \
+        HELPER="$helper" STAGE="$stage" PROBE_RC="$probe_rc" \
+        MOLE_DRY_RUN="$dry_run" MOLE_TEST_NO_AUTH=1 \
+        /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+[[ "$STAGE" != pending ]] || MOLE_CLEAN_CANCEL_STATUS=$PROBE_RC
+should_protect_path() { return 1; }
+is_path_whitelisted() { return 1; }
+record_dry_run_cleanup_target() {
+    [[ "$STAGE" != preview ]] || return "$PROBE_RC"
+    printf 'PREVIEW:%s\n' "$1"
+}
+safe_remove() { printf 'REMOVE:%s\n' "$1"; }
+safe_sudo_remove() { printf 'REMOVE:%s\n' "$1"; }
+get_path_size_kb() {
+    [[ "$STAGE" != size ]] || return "$PROBE_RC"
+    printf '1\n'
+}
+_mole_sqlite_database_in_use() {
+    [[ "$STAGE" == validation ]] || return 1
+    return "$PROBE_RC"
+}
+if [[ "$STAGE" == validation_timeout ]]; then
+    validate_path_for_deletion() {
+        if [[ "$1" == "$TARGET_DIR/middle.db" ]]; then
+            printf 'VALIDATION_TIMEOUT\n'
+            return 124
+        fi
+        return 0
+    }
+fi
+emit_scan() {
+    printf '%s\0%s\0%s\0' "$TARGET_DIR/first.log" "$TARGET_DIR/middle.db" "$TARGET_DIR/last.log"
+    [[ "$STAGE" != scan ]] || return "$PROBE_RC"
+}
+run_with_timeout() {
+    [[ "$2" == find ]] || return 99
+    emit_scan
+}
+if [[ "$HELPER" == sudo ]]; then
+    helper_source=$(declare -f safe_sudo_find_delete)
+    # shellcheck disable=SC2016 # Match the literal production guard.
+    test_guard='[[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]'
+    [[ "$helper_source" == *"$test_guard"* ]] || exit 1
+    helper_source=${helper_source/"$test_guard"/false}
+    eval "$helper_source"
+    sudo() { printf 'UNEXPECTED_SUDO\n' >&2; return 99; }
+    _mole_bounded_sudo_until() {
+        [[ "$STAGE" != preflight ]] || return "$PROBE_RC"
+        [[ "$*" != *'test -L'* ]]
+    }
+    _mole_materialize_bounded_sudo_find() { emit_scan > "$1"; }
+    _mole_privileged_path_has_mutable_ancestor() { return 1; }
+    _mole_bounded_sudo() {
+        shift
+        case "$2" in
+            du)
+                [[ "$STAGE" != size ]] || return "$PROBE_RC"
+                printf '1\n'
+                ;;
+            "$STAT_BSD")
+                [[ "$STAGE" != identity ]] || return "$PROBE_RC"
+                printf 'IDENTITY:%s\n' "${*: -1}" >> "$TARGET_DIR/trace"
+                printf '1:2:3\n'
+                ;;
+            xargs)
+                printf 'BATCH\n' >> "$TARGET_DIR/trace"
+                # Consume the producer's pipe before returning, like xargs.
+                cat > /dev/null
+                # Acknowledge the mocked batch without executing its command.
+                printf '%s\0%s\0' "$TARGET_DIR/first.log" "$TARGET_DIR/last.log"
+                ;;
+            *) return 99 ;;
+        esac
+    }
+    helper_name=safe_sudo_find_delete
+else
+    helper_name=safe_find_delete
+fi
+: > "$TARGET_DIR/trace"
+rc=0
+"$helper_name" "$TARGET_DIR" '*' 0 f || rc=$?
+printf 'RC=%s STICKY=%s\n' "$rc" "${MOLE_CLEAN_CANCEL_STATUS:-0}"
+cat "$TARGET_DIR/trace"
+printf 'NO_AUTH=%s\n' "$MOLE_TEST_NO_AUTH"
+SCRIPT
+    printf 'find/delete case %s/%s/%s/%s, exit %s\n%s\n' \
+        "$helper" "$stage" "$probe_rc" "$dry_run" "$status" "$output"
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"NO_AUTH=1"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_SUDO"* ]] || return 1
+    [ -f "$fixture/first.log" ] || return 1
+    [ -f "$fixture/middle.db" ] || return 1
+    [ -f "$fixture/last.log" ] || return 1
+    if [[ "$stage" == validation_timeout || ("$stage" == validation && "$probe_rc" -lt 128) ]]; then
+        [[ "$output" == *"RC=0 STICKY=0"* ]] || return 1
+        [[ "$output" == *"BATCH"* ]] || return 1
+        [[ "$output" == *"IDENTITY:$fixture/first.log"* ]] || return 1
+        [[ "$output" == *"IDENTITY:$fixture/last.log"* ]] || return 1
+        [[ "$output" != *"IDENTITY:$fixture/middle.db"* ]] || return 1
+        if [[ "$stage" == validation_timeout ]]; then
+            [[ "$output" == *"VALIDATION_TIMEOUT"* ]] || return 1
+        fi
+    else
+        local expected_sticky=0
+        [[ "$probe_rc" -lt 128 ]] || expected_sticky=$probe_rc
+        [[ "$output" == *"RC=$probe_rc STICKY=$expected_sticky"* ]] || return 1
+        [[ "$output" != *"BATCH"* ]] || return 1
+        [[ "$output" != *"PREVIEW:"* ]] || return 1
+        [[ "$output" != *"REMOVE:"* ]] || return 1
+        [[ "$output" != *"IDENTITY:$fixture/last.log"* ]] || return 1
+        if [[ "$stage" == validation ]]; then
+            [[ "$output" == *"IDENTITY:$fixture/first.log"* ]] || return 1
+        fi
+    fi
 }
 
 @test "validate_path_for_deletion rejects empty path" {
@@ -140,22 +344,30 @@ teardown() {
     run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$TEST_DIR/valid'"
     [ "$status" -eq 0 ]
 
-    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$HOME/Library/Caches/com.example.app/cache.db'"
+    # This case checks path syntax, not machine-wide owner/lsof visibility.
+    run /bin/bash -c "
+        source '$PROJECT_ROOT/lib/core/common.sh'
+        _mole_should_refuse_live_user_cache_path() { return 1; }
+        _mole_sqlite_database_in_use() { return 1; }
+        validate_path_for_deletion '$HOME/Library/Caches/com.example.app/cache.db'
+    "
     [ "$status" -eq 0 ]
 }
 
 @test "validate_path_for_deletion allows protected input-method names in Trash (#1517)" {
-    mkdir -p "$HOME/.Trash"
-    touch "$HOME/.Trash/com.sogou.inputmethod.sogou.plist"
-    touch "$HOME/.Trash/com.tencent.inputmethod.QQInput.plist"
+    # The verdict is string-based on HOME. The test HOME lives inside the
+    # checkout, and a checkout under /private/tmp hits the temp-root allowlist
+    # before the protection check, so use a synthetic home outside every
+    # allowlisted root. Nothing is created there.
+    local home="/Users/mole-test-home-1517"
 
-    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$HOME/.Trash/com.sogou.inputmethod.sogou.plist'"
+    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; HOME='$home'; validate_path_for_deletion '$home/.Trash/com.sogou.inputmethod.sogou.plist'"
     [ "$status" -eq 0 ]
 
-    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$HOME/.Trash/com.tencent.inputmethod.QQInput.plist'"
+    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; HOME='$home'; validate_path_for_deletion '$home/.Trash/com.tencent.inputmethod.QQInput.plist'"
     [ "$status" -eq 0 ]
 
-    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$HOME/Library/Preferences/com.sogou.inputmethod.sogou.plist'"
+    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; HOME='$home'; validate_path_for_deletion '$home/Library/Preferences/com.sogou.inputmethod.sogou.plist'"
     [ "$status" -eq 1 ]
 }
 
@@ -204,6 +416,22 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
+@test "validate_path_for_deletion judges a Data volume path by the root path that reaches it (#1814)" {
+    # A synthetic.conf link such as /src -> System/Volumes/Data/src needs root
+    # and a reboot, so drive the same rule through the firmlinks every Mac has.
+    # Nothing exists at these paths; the verdict is policy only.
+    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '/System/Volumes/Data/Users/mole-test-home-1814/src/app/node_modules'"
+    [ "$status" -eq 0 ]
+
+    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '/System/Volumes/Data/private/tmp/mole-old-artifact'"
+    [ "$status" -eq 0 ]
+
+    # The volume's own System tree is not the directory the root calls /System.
+    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '/System/Volumes/Data/System/Library/Caches/com.example' 2>&1"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"critical system path"* ]]
+}
+
 @test "validate_path_for_deletion accepts CoreSimulator system cache children" {
     run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '/Library/Developer/CoreSimulator/Caches/dyld'"
     [ "$status" -eq 0 ]
@@ -242,6 +470,27 @@ teardown() {
     done
 
     run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '/private/var/db/powerlog/Library/PerfPowerTelemetry/BackgroundProcessing/ArchivedBackgroundProcessingDB.BGSQL'"
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_path_for_deletion rejects the live database of every power telemetry store" {
+    local root="/private/var/db/powerlog/Library/PerfPowerTelemetry"
+    local xcode_db="$root/XcodeOrganizer/CurrentXcodeOrganizerDB.XCSQL"
+    local path=""
+
+    # A user's operations.log showed the Xcode Organizer store removed as a
+    # 7-day-old file; mtime never proves PerfPowerServices closed it.
+    for path in "$xcode_db" "$xcode_db-wal" "$xcode_db-shm" \
+        "$root/ExtendedPersistence/CurrentExtendedPersistenceDB.EPSQL" \
+        "/private/var/db/powerlog/library/perfpowertelemetry/XcodeOrganizer/CurrentXcodeOrganizerDB.XCSQL"; do
+        run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$path'"
+        [ "$status" -eq 1 ] || {
+            echo "accepted: $path"
+            return 1
+        }
+    done
+
+    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$root/XcodeOrganizer/ArchivedXcodeOrganizerDB.XCSQL'"
     [ "$status" -eq 0 ]
 }
 
@@ -338,7 +587,7 @@ printf 'RC=%s\n' "$validation_rc"
 EOF
 
     [ "$status" -eq 0 ] || return 1
-    [[ "$output" == *"RC=124"* ]]
+    [[ "$output" == "RC=1" ]]
 }
 
 @test "validate_path_for_deletion checks every supported SQLite name inside a cache directory (#1439)" {
@@ -463,6 +712,52 @@ EOF
     [[ "$output" == *"RC=1 TRACE=visibility,"* ]]
 }
 
+@test "validate_path_for_deletion gates Homebrew partial downloads on lsof too (#1594)" {
+    local partial="$HOME/Library/Caches/Homebrew/downloads/abc123--Some App.dmg.incomplete"
+    mkdir -p "$(dirname "$partial")"
+    printf 'partial\n' > "$partial"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" partial="$partial" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+trace_file=$(mktemp)
+lsof() {
+    case " $* " in
+        *" -p 1 "*) printf 'visibility\n' >> "$trace_file"; return 1 ;;
+        *) printf 'target\n' >> "$trace_file"; return 1 ;;
+    esac
+}
+run_with_timeout() { shift; "$@"; }
+validation_rc=0
+validate_path_for_deletion "$partial" || validation_rc=$?
+printf 'RC=%s TRACE=%s\n' "$validation_rc" "$(tr '\n' ',' < "$trace_file")"
+command rm -f "$trace_file"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=1 TRACE=visibility,"* ]]
+}
+
+@test "a finished Homebrew download is not treated as a partial (#1594)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+brew="$HOME/Library/Caches/Homebrew/downloads"
+# The gate covers in-flight transfers only; a completed artifact and a nested
+# path stay ordinary cache so the sweep keeps reclaiming them.
+_mole_is_incomplete_download_path "$brew/abc--App.dmg.incomplete" && echo "INCOMPLETE:yes"
+_mole_is_incomplete_download_path "$brew/abc--App.dmg" || echo "FINISHED:no"
+_mole_is_incomplete_download_path "$brew/nested/abc--App.dmg.incomplete" || echo "NESTED:no"
+_mole_is_incomplete_download_path "$HOME/Downloads/pending.crdownload" && echo "BROWSER:yes"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"INCOMPLETE:yes"* ]] || return 1
+    [[ "$output" == *"FINISHED:no"* ]] || return 1
+    [[ "$output" == *"NESTED:no"* ]] || return 1
+    [[ "$output" == *"BROWSER:yes"* ]]
+}
+
 @test "complete lsof mode accepts only a root-owned pid 1 record (#1471)" {
     local record_state
     for record_state in root nonroot; do
@@ -547,6 +842,74 @@ EOF
 
     [ "$status" -eq 0 ] || return 1
     [[ "$output" == *"STATE=2"* ]] || return 1
+}
+
+@test "a stuck bundle identifier read times out and counts as unreadable" {
+    # The owner-process probe also runs at the final deletion step, so an
+    # unbounded plutil on a dataless ~/Applications bundle would hang the
+    # clean. A timed-out read must land on the same "unreadable" answer that
+    # callers already treat as busy.
+    local bundle="$HOME/Applications/Stuck.app"
+    local stub_dir="$HOME/stuck-plutil-bin"
+    mkdir -p "$bundle/Contents" "$stub_dir"
+    printf '#!/bin/bash\nsleep 30\n' > "$stub_dir/plutil"
+    chmod +x "$stub_dir/plutil"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bundle="$bundle" \
+        PATH="$stub_dir:$PATH" MOLE_TIMEOUT_QUICK_DETECT_SEC=1 \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+started=$SECONDS
+rc=0
+_mole_app_bundle_identifier "$bundle" || rc=$?
+printf 'RC=%s ID=[%s] ELAPSED=%s\n' "$rc" "$_MOLE_APP_BUNDLE_ID" "$((SECONDS - started))"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=1 ID=[]"* ]] || { echo "$output"; return 1; }
+    local elapsed="${output##*ELAPSED=}"
+    [[ "$elapsed" -lt 10 ]] || { echo "$output"; return 1; }
+}
+
+@test "the debug flag never changes an open-handle verdict (#1439)" {
+    # The probe folds lsof stderr into the buffer whose emptiness is what makes
+    # rc=1 mean "conclusively idle". run_with_timeout traces to that same stream
+    # under MO_DEBUG=1, so --debug left the buffer never empty and downgraded
+    # every probe to "could not tell". Measured before the fix: 10 of 25 real
+    # cache databases flipped from cleanable to kept, which means the flag meant
+    # to explain a run was quietly changing it. The stub below reproduces the
+    # trace on purpose; a stub that swallows it cannot see this class at all.
+    local idle="$HOME/Library/Caches/example.idle/Cache.db"
+    mkdir -p "$(dirname "$idle")"
+    printf 'idle\n' > "$idle"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" idle="$idle" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_MOLE_COMPLETE_LSOF_MODE=direct
+lsof() { return 1; }
+run_with_timeout() {
+    local duration="$1"
+    shift
+    if [[ "${MO_DEBUG:-0}" == "1" ]]; then
+        echo "[TIMEOUT] Running with ${duration}s timeout: $*" >&2
+    fi
+    "$@"
+}
+export MO_DEBUG=0
+quiet=0
+_mole_paths_have_open_handle "$idle" || quiet=$?
+export MO_DEBUG=1
+loud=0
+_mole_paths_have_open_handle "$idle" || loud=$?
+printf 'QUIET=%s LOUD=%s\n' "$quiet" "$loud"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"QUIET=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"LOUD=1"* ]] || { echo "$output"; return 1; }
 }
 
 @test "safe_remove rechecks incomplete downloads at the final deletion boundary (#1471)" {
@@ -823,11 +1186,7 @@ validate_path_for_deletion "$cache_dir" || validation_rc=$?
 printf 'PROBE=%s RC=%s\n' "$probe_rc" "$validation_rc"
 EOF
         [ "$status" -eq 0 ] || return 1
-        if [[ "$probe_rc" -eq 124 ]]; then
-            [[ "$output" == *"PROBE=124 RC=124"* ]] || return 1
-        else
-            [[ "$output" == *"PROBE=2 RC=1"* ]] || return 1
-        fi
+        [[ "$output" == *"PROBE=$probe_rc RC=1"* ]] || return 1
     done
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc <<'EOF'
@@ -1181,17 +1540,40 @@ EOF
     [ "$status" -eq 0 ]
 }
 
+@test "should_protect_path keeps Google identity and Clearcut state (#1607)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+should_protect_path "$HOME/Library/Caches/GIPPseudonymousID" || exit 1
+should_protect_path "$HOME/Library/Caches/GIPPseudonymousID/device-id" || exit 1
+should_protect_path "$HOME/Library/Caches/CCTClearcutLogger" || exit 1
+should_protect_path "$HOME/Library/Caches/CCTClearcutLogger/queue.dat" || exit 1
+if should_protect_path "$HOME/Library/Caches/ordinary-app/junk"; then
+    exit 1
+fi
+EOF
+    [ "$status" -eq 0 ]
+}
+
 @test "should_protect_path allows only the measured WeChat container cache leaves" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 wechat="$HOME/Library/Containers/com.tencent.xinWeChat/Data"
-! should_protect_path "$wechat/Documents/app_data/log/wechat.log"
-! should_protect_path "$wechat/.wxapplet/WMPF/cache.bin"
+! should_protect_path "$wechat/Documents/app_data/log/wechat.log" || exit 1
+! should_protect_path "$wechat/.wxapplet/WMPF/cache.bin" || exit 1
 should_protect_path "$wechat/Documents/xwechat_files/account/db_storage/message.db"
 should_protect_path "$wechat/Documents/app_data/radium/users/account/state.db"
 should_protect_path "$wechat/Documents/app_data/log"
 should_protect_path "$wechat/.wxapplet/WMPF"
+web="$wechat/Documents/app_data/radium/web/profiles/multitab_a1"
+! should_protect_path "$web/Cache/data_0" || exit 1
+! should_protect_path "$web/Service Worker/CacheStorage/index" || exit 1
+should_protect_path "$web/Cache" || exit 1
+should_protect_path "$web/IndexedDB/site.db" || exit 1
+should_protect_path "$web/WebStorage/store" || exit 1
+should_protect_path "$web/Service Worker/ScriptCache/a" || exit 1
+should_protect_path "$wechat/Documents/app_data/radium/web/profiles/Cache/x" || exit 1
 EOF
 
     [ "$status" -eq 0 ]
@@ -1220,11 +1602,11 @@ is_endpoint_security_cache_path "/private/var/folders/aa/bb/C/com.jamfsoftware.s
 is_endpoint_security_cache_path "/private/var/folders/aa/bb/X/com.cisco.anyconnect.gui.code_sign_clone"
 is_endpoint_security_cache_path "/private/var/folders/aa/bb/X/com.cisco.secureclient.gui.code_sign_clone"
 # A normal third-party app's cache is not an EDR cache.
-! is_endpoint_security_cache_path "/private/var/folders/aa/bb/C/com.example.App/com.apple.metalfe"
+! is_endpoint_security_cache_path "/private/var/folders/aa/bb/C/com.example.App/com.apple.metalfe" || exit 1
 # Non-security Cisco products (e.g. Webex) are not matched; only the secure-access clients are.
-! is_endpoint_security_cache_path "/private/var/folders/aa/bb/X/com.cisco.webex.code_sign_clone"
+! is_endpoint_security_cache_path "/private/var/folders/aa/bb/X/com.cisco.webex.code_sign_clone" || exit 1
 # Paths outside var/folders are out of scope for this predicate.
-! is_endpoint_security_cache_path "/Applications/Falcon.app"
+! is_endpoint_security_cache_path "/Applications/Falcon.app" || exit 1
 # A non-Darwin path that merely contains "var/folders" must NOT match (anchored).
 ! is_endpoint_security_cache_path "/Users/me/project/var/folders/com.crowdstrike.fixture/cache"
 EOF
@@ -1334,14 +1716,14 @@ EOF
 #!/bin/bash
 if [[ "$*" == *"$TARGET_FILE"* ]]; then
     printf 'rm %s\n' "$*" >> "$MOLE_RM_TRACE"
-    exec sleep 4
+    exec sleep 6
 fi
 exec /bin/rm "$@"
 MOCK
     chmod +x "$mock_bin/rm"
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_FILE="$target_file" \
-        PATH="$mock_bin:$PATH" MOLE_RM_TRACE="$trace" MOLE_TIMEOUT_DISK_VERIFY_SEC=1 \
+        PATH="$mock_bin:$PATH" MOLE_RM_TRACE="$trace" MOLE_TIMEOUT_DISK_VERIFY_SEC=2 \
         /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -1358,10 +1740,11 @@ SCRIPT
         return 1
     }
     [[ "$output" == *"RC=124"* ]] || return 1
+    [[ -f "$trace" ]] || { echo "$output"; return 1; }
     [[ "$(< "$trace")" == *"$target_file"* ]] || return 1
     local elapsed="${output##*ELAPSED=}"
     [[ "$elapsed" =~ ^[0-9]+$ ]] || return 1
-    [ "$elapsed" -lt 3 ]
+    [ "$elapsed" -lt 5 ]
     [ -e "$target_file" ]
 }
 
@@ -1472,6 +1855,175 @@ EOF
 @test "safe_find_delete validates base directory" {
     run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; safe_find_delete '/nonexistent' '*.tmp' 7 'f' 2>&1"
     [ "$status" -eq 1 ]
+}
+
+@test "safe_find_delete preserves scan signals in real and dry-run cleanup" {
+    local dry_run signal
+    for dry_run in 0 1; do
+        for signal in 130 143; do
+            check_find_delete_cancellation user scan "$signal" "$dry_run" || return 1
+        done
+    done
+}
+
+@test "safe_find_delete preserves dry-run sizing signals" {
+    check_find_delete_cancellation user size 130 1 || return 1
+    check_find_delete_cancellation user size 143 1
+}
+
+@test "safe_find_delete read-only timeouts remain local" {
+    check_find_delete_cancellation user scan 124 0 || return 1
+    check_find_delete_cancellation user size 124 1
+}
+
+@test "safe_sudo_find_delete preserves scan signals in real and dry-run cleanup" {
+    local dry_run signal
+    for dry_run in 0 1; do
+        for signal in 130 143; do
+            check_find_delete_cancellation sudo scan "$signal" "$dry_run" || return 1
+        done
+    done
+}
+
+@test "safe_sudo_find_delete preserves dry-run sizing signals" {
+    check_find_delete_cancellation sudo size 130 1 || return 1
+    check_find_delete_cancellation sudo size 143 1
+}
+
+@test "safe_sudo_find_delete read-only timeouts remain local" {
+    check_find_delete_cancellation sudo scan 124 0 || return 1
+    check_find_delete_cancellation sudo size 124 1
+}
+
+@test "safe_sudo_find_delete stops accumulated batches on validation signals" {
+    check_find_delete_cancellation sudo validation 130 0 || return 1
+    check_find_delete_cancellation sudo validation 143 0
+}
+
+@test "safe_sudo_find_delete ordinary validation refusals remain local" {
+    check_find_delete_cancellation sudo validation 0 0 || return 1
+    check_find_delete_cancellation sudo validation 2 0
+}
+
+@test "safe_sudo_find_delete validation timeout skips only its target" {
+    check_find_delete_cancellation sudo validation_timeout 124 0
+}
+
+@test "safe_find_delete preserves preview validation signals" {
+    check_find_delete_cancellation user preview 130 1 || return 1
+    check_find_delete_cancellation user preview 143 1
+}
+
+@test "safe_sudo_find_delete preserves preview validation signals" {
+    check_find_delete_cancellation sudo preview 130 1 || return 1
+    check_find_delete_cancellation sudo preview 143 1
+}
+
+@test "safe_find_delete stops before work after sticky cancellation" {
+    check_find_delete_cancellation user pending 130 0
+}
+
+@test "safe_sudo_find_delete stops before work after sticky cancellation" {
+    check_find_delete_cancellation sudo pending 130 0
+}
+
+@test "safe_sudo_find_delete preserves preflight signals" {
+    check_find_delete_cancellation sudo preflight 130 0 || return 1
+    check_find_delete_cancellation sudo preflight 143 0
+}
+
+@test "safe_sudo_find_delete preserves identity signals" {
+    check_find_delete_cancellation sudo identity 130 0 || return 1
+    check_find_delete_cancellation sudo identity 143 0
+}
+
+@test "safe_find_delete dry run records each target once without removal fallthrough (#1865)" {
+    local target_dir="$TEST_DIR/find-dry-run-once"
+    mkdir -p "$target_dir"
+    touch "$target_dir/file1.log" "$target_dir/file2.log"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$target_dir" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/clean.sh"
+
+export MOLE_DRY_RUN=1
+trace_file="$TARGET_DIR/trace.txt"
+: > "$trace_file"
+
+safe_remove() {
+    printf 'REMOVE:%s\n' "$1" >> "$trace_file"
+}
+
+rc=0
+safe_find_delete "$TARGET_DIR" "*.log" 0 f || rc=$?
+printf 'RC=%s\n' "$rc"
+printf 'COUNT=%s\n' "${#DRY_RUN_SEEN_IDENTITIES[@]}"
+SCRIPT
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=0"* ]] || return 1
+    [[ "$output" == *"COUNT=2"* ]] || return 1
+    [ ! -s "$target_dir/trace.txt" ] || return 1
+    [ -f "$target_dir/file1.log" ] || return 1
+    [ -f "$target_dir/file2.log" ] || return 1
+}
+
+@test "safe_sudo_find_delete dry run records targets once and tracks count (#1865)" {
+    local target_dir="$TEST_DIR/sudo-find-dry-run-once"
+    mkdir -p "$target_dir"
+    touch "$target_dir/file1.log" "$target_dir/file2.log"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$target_dir" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/clean.sh"
+
+helper_source=$(declare -f safe_sudo_find_delete)
+# shellcheck disable=SC2016 # Match the literal production guard.
+test_guard='[[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]'
+helper_source=${helper_source/"$test_guard"/false}
+eval "$helper_source"
+
+_mole_privileged_path_has_mutable_ancestor() { return 1; }
+sudo() {
+    [[ "${1:-}" == "-n" ]] && shift
+    case "${1:-}" in
+        test)
+            shift
+            command test "$@"
+            ;;
+        find)
+            printf '%s\0%s\0' "$TARGET_DIR/file1.log" "$TARGET_DIR/file2.log"
+            ;;
+        du)
+            printf '4\t%s\n' "${@: -1}"
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+trace_file="$TARGET_DIR/trace.txt"
+: > "$trace_file"
+safe_sudo_remove() {
+    printf 'SUDO_REMOVE:%s\n' "$1" >> "$trace_file"
+}
+
+export MOLE_DRY_RUN=1
+rc=0
+safe_sudo_find_delete "$TARGET_DIR" "*.log" 0 f 1 || rc=$?
+printf 'RC=%s\n' "$rc"
+printf 'COUNT=%s\n' "$MOLE_SAFE_SUDO_FIND_DELETE_COUNT"
+printf 'IDENTITIES=%s\n' "${#DRY_RUN_SEEN_IDENTITIES[@]}"
+SCRIPT
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=0"* ]] || return 1
+    [[ "$output" == *"COUNT=2"* ]] || return 1
+    [[ "$output" == *"IDENTITIES=2"* ]] || return 1
+    [ ! -s "$target_dir/trace.txt" ] || return 1
+    [ -f "$target_dir/file1.log" ] || return 1
+    [ -f "$target_dir/file2.log" ] || return 1
 }
 
 @test "safe_sudo_remove refuses symlink paths" {
@@ -1815,58 +2367,70 @@ SCRIPT
 @test "safe_sudo_find_delete discards partial output when sudo find times out" {
     local target_dir="$TEST_DIR/sudo-find-partial-timeout-target"
     local mock_bin="$TEST_DIR/sudo-find-partial-timeout-bin"
-    local trace="$TEST_DIR/sudo-find-partial-timeout.trace"
-    mkdir -p "$target_dir" "$mock_bin"
+    local trace_dir="$TEST_DIR/sudo-find-partial-timeout-trace"
+    mkdir -p "$target_dir" "$mock_bin" "$trace_dir"
     touch "$target_dir/old.log"
 
+    # The sudo shell function below answers every call. A real sudo stays
+    # unreachable: anything that slips past it to PATH lands here and fails.
     cat > "$mock_bin/sudo" <<'MOCK'
 #!/bin/bash
-set -u
-printf '%s\n' "$*" >> "$MOLE_SUDO_FIND_TRACE"
-[[ "${1:-}" == "-n" ]] && shift
-case "${1:-}" in
-    test)
-        shift
-        /bin/test "$@"
-        ;;
-    true)
-        exit 0
-        ;;
-    find)
-        printf '%s\0' "$TARGET_DIR/old.log"
-        exec sleep 4
-        ;;
-    xargs | rm)
-        printf 'UNEXPECTED_DELETE:%s\n' "$*" >> "$MOLE_SUDO_FIND_TRACE"
-        exit 99
-        ;;
-    *)
-        exit 99
-        ;;
-esac
+printf '%s\n' "$*" >> "$MOLE_SUDO_FIND_TRACE_DIR/real-sudo"
+exit 99
 MOCK
     chmod +x "$mock_bin/sudo"
 
+    # Like safe_find_delete's partial-scan case: the stub leaves what the
+    # bounded wrapper leaves on expiry (the printed prefix, then status 124)
+    # instead of racing a mock's startup against a one-second budget. The
+    # second pass is the positive control: a completed scan must reach the
+    # privileged delete batch.
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$target_dir" \
-        PATH="$mock_bin:$PATH" MOLE_SUDO_FIND_TRACE="$trace" \
-        MOLE_TIMEOUT_DISK_VERIFY_SEC=1 MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 \
-        /bin/bash --noprofile --norc <<'SCRIPT'
+        PATH="$mock_bin:$PATH" MOLE_SUDO_FIND_TRACE_DIR="$trace_dir" \
+        MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 MO_NO_OPLOG=1 /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
-rc=0
-safe_sudo_find_delete "$TARGET_DIR" "*.log" "0" "f" "1" || rc=$?
-printf 'RC=%s\n' "$rc"
+_mole_privileged_path_has_mutable_ancestor() { return 1; }
+sudo() {
+    printf '%s\n' "$*" >> "$MOLE_SUDO_FIND_TRACE_DIR/scan-$SCAN_RC"
+    [[ "${1:-}" == "-n" ]] && shift
+    case "${1:-}" in
+        true) return 0 ;;
+        test)
+            shift
+            /bin/test "$@"
+            ;;
+        find)
+            printf '%s\0' "$TARGET_DIR/old.log"
+            return "$SCAN_RC"
+            ;;
+        /*) "$@" ;;
+        xargs)
+            cat > /dev/null
+            return 0
+            ;;
+        *) return 99 ;;
+    esac
+}
+for SCAN_RC in 124 0; do
+    rc=0
+    safe_sudo_find_delete "$TARGET_DIR" "*.log" "0" "f" "1" || rc=$?
+    printf 'SCAN_RC=%s RC=%s\n' "$SCAN_RC" "$rc"
+done
 SCRIPT
 
     [ "$status" -eq 0 ] || {
         echo "$output"
         return 1
     }
-    [[ "$output" == *"RC=124"* ]] || return 1
-    local trace_content
-    trace_content=$(< "$trace")
-    [[ "$trace_content" == *"-n find $target_dir -maxdepth 1 -name *.log -type f -print0"* ]] || return 1
-    [[ "$trace_content" != *"UNEXPECTED_DELETE"* ]] || return 1
+    [ ! -e "$trace_dir/real-sudo" ] || return 1
+    [[ "$output" == *"SCAN_RC=124 RC=124"* ]] || return 1
+    local timed_out_calls completed_calls
+    timed_out_calls=$(< "$trace_dir/scan-124")
+    completed_calls=$(< "$trace_dir/scan-0")
+    [[ "$timed_out_calls" == *"-n find $target_dir -maxdepth 1 -name *.log -type f -print0"* ]] || return 1
+    [[ "$timed_out_calls" != *"xargs"* ]] || return 1
+    [[ "$completed_calls" == *"-n xargs -0"* ]] || return 1
     [[ -e "$target_dir/old.log" ]]
 }
 
@@ -2137,7 +2701,7 @@ SCRIPT
     local target_file="$target_dir/old.log"
     mkdir -p "$target_dir"
     touch "$target_file"
-    touch -t "$(date -v-8d '+%Y%m%d%H%M.%S')" "$target_file"
+    touch -t "$(/bin/date -v-8d '+%Y%m%d%H%M.%S')" "$target_file"
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$target_dir" TARGET_FILE="$target_file" \
         MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 /bin/bash --noprofile --norc <<'SCRIPT'
@@ -2392,6 +2956,7 @@ active_db="/private/var/db/powerlog/Library/PerfPowerTelemetry/BackgroundProcess
 active_dot_alias="${active_db%/*}/./${active_db##*/}"
 active_case_alias="${active_db%/*}/currentbackgroundprocessingdb.bgsql"
 archived_db="/private/var/db/powerlog/Library/PerfPowerTelemetry/BackgroundProcessing/ArchivedBackgroundProcessingDB.BGSQL"
+xcode_db="/private/var/db/powerlog/Library/PerfPowerTelemetry/XcodeOrganizer/CurrentXcodeOrganizerDB.XCSQL"
 
 should_protect_path() { return 1; }
 is_path_whitelisted() { return 1; }
@@ -2410,7 +2975,7 @@ sudo() {
             [[ "${2:-}" == "-d" ]]
             ;;
         find)
-            printf '%s\0' "$active_db" "$active_db-wal" "$active_db-shm" "$active_dot_alias" "$active_case_alias" "$archived_db"
+            printf '%s\0' "$active_db" "$active_db-wal" "$active_db-shm" "$active_dot_alias" "$active_case_alias" "$archived_db" "$xcode_db"
             ;;
         */stat)
             printf '1:2:3\n'
@@ -2440,7 +3005,8 @@ SCRIPT
     [[ "$output" == *"REMOVED /private/var/db/powerlog/Library/PerfPowerTelemetry/BackgroundProcessing/ArchivedBackgroundProcessingDB.BGSQL (batch)"* ]] || return 1
     [[ "$output" != *"CurrentBackgroundProcessingDB.BGSQL"* ]] || return 1
     [[ "$output" != *"currentbackgroundprocessingdb.bgsql"* ]] || return 1
-    [[ "$output" != *"/./CurrentBackgroundProcessingDB.BGSQL"* ]]
+    [[ "$output" != *"/./CurrentBackgroundProcessingDB.BGSQL"* ]] || return 1
+    [[ "$output" != *"CurrentXcodeOrganizerDB.XCSQL"* ]]
 }
 
 @test "safe_sudo_find_delete batches file removals into one xargs rm" {
@@ -2452,6 +3018,8 @@ SCRIPT
     cat > "$script" <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
+: > "$OPERATIONS_LOG_FILE"
+log_operation_session_start clean
 TRACE="$TARGET_DIR/sudo.trace"
 > "$TRACE"
 
@@ -2502,6 +3070,7 @@ printf 'XARGS_CALLS=%s\n' "$(grep -c 'SUDO:-n xargs' "$TRACE" || true)"
 cat "$TRACE"
 echo "--OPLOG--"
 cat "$HOME/Library/Logs/mole/operations.log" 2> /dev/null || true
+log_operation_session_end clean 2 0
 exit 0
 SCRIPT
     chmod +x "$script"
@@ -2518,6 +3087,16 @@ SCRIPT
     [[ "$output" == *"REMOVED $target_dir/a.log (batch)"* ]] || return 1
     [[ "$output" == *"REMOVED $target_dir/b.log (batch)"* ]] || return 1
     [[ "$output" != *"INTERACTIVE_SUDO"* ]] || return 1
+
+    run env HOME="$HOME" MOLE_TEST_NO_AUTH=1 "$PROJECT_ROOT/mole" history --json
+    [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+    printf '%s\n' "$output" | python3 -c '
+import json, sys
+sessions = json.load(sys.stdin)["sessions"]
+assert len(sessions) == 1, sessions
+assert sessions[0]["run_id"], sessions
+assert sessions[0]["actions"]["removed"] == 2, sessions
+'
 }
 
 @test "safe_sudo_find_delete reports a failed batch without logging REMOVED" {
@@ -2553,7 +3132,12 @@ sudo() {
             printf '%s\0' "$TARGET_DIR/a.log" "$TARGET_DIR/b.log"
             ;;
         xargs)
+            cat > /dev/null
+            printf 'batch failure\n' > "$TARGET_DIR/batch.failed"
             return 1
+            ;;
+        "$STAT_BSD")
+            "$@"
             ;;
         *)
             return 1
@@ -2579,6 +3163,7 @@ SCRIPT
     [ "$status" -eq 0 ]
     [[ "$output" == *"RC=1"* ]] || return 1
     [[ "$output" == *"A_SURVIVED"* ]] || return 1
+    [ -s "$target_dir/batch.failed" ] || return 1
     # Scope to this test's paths: the oplog HOME is shared across tests and
     # earlier batch tests legitimately log their own "(batch)" lines.
     [[ "$output" != *"REMOVED $target_dir/a.log (batch)"* ]] || return 1
@@ -2692,6 +3277,7 @@ sudo() {
             ;;
         xargs)
             # Simulate a batch failure without deleting anything.
+            cat > /dev/null
             return 1
             ;;
         du)
@@ -2892,7 +3478,7 @@ SCRIPT
     touch "$old_file"
     touch "$new_file"
 
-    touch -t "$(date -v-8d '+%Y%m%d%H%M.%S' 2>/dev/null || date -d '8 days ago' '+%Y%m%d%H%M.%S')" "$old_file" 2>/dev/null || true
+    touch -t "$(/bin/date -v-8d '+%Y%m%d%H%M.%S' 2>/dev/null || date -d '8 days ago' '+%Y%m%d%H%M.%S')" "$old_file" 2>/dev/null || true
 
     run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; safe_find_delete '$TEST_DIR' '*.tmp' 7 'f'"
     [ "$status" -eq 0 ]
@@ -2903,44 +3489,49 @@ SCRIPT
 @test "safe_find_delete discards a timed-out partial scan" {
     local target_dir="$TEST_DIR/find-partial-target"
     local target_file="$target_dir/old.tmp"
-    local mock_bin="$TEST_DIR/find-partial-bin"
     local trace="$TEST_DIR/find-partial.trace"
-    mkdir -p "$target_dir" "$mock_bin"
+    mkdir -p "$target_dir"
     touch "$target_file"
 
-    cat > "$mock_bin/find" <<'MOCK'
-#!/bin/bash
-printf 'find %s\n' "$*" >> "$MOLE_FIND_TRACE"
-printf '%s\0' "$TARGET_FILE"
-exec sleep 4
-MOCK
-    chmod +x "$mock_bin/find"
-
+    # run_with_timeout is replaced by what it leaves behind on expiry: the
+    # prefix the child printed, then status 124. A real mock find under a
+    # real budget raced its own startup against the clock, and the real
+    # wrapper has its own cases in core_timeout.bats. The second pass is the
+    # positive control: the same output with status 0 must reach the delete.
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$target_dir" \
-        TARGET_FILE="$target_file" MOLE_FIND_TRACE="$trace" PATH="$mock_bin:$PATH" \
-        MOLE_TIMEOUT_DISK_VERIFY_SEC=1 /bin/bash --noprofile --norc <<'SCRIPT'
+        TARGET_FILE="$target_file" MOLE_FIND_TRACE="$trace" \
+        MOLE_TIMEOUT_DISK_VERIFY_SEC=7 /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
-safe_remove() {
-    printf 'UNEXPECTED_DELETE:%s\n' "$1"
-    return 99
+run_with_timeout() {
+    printf '%s\n' "$*" >> "$MOLE_FIND_TRACE"
+    printf '%s\0' "$TARGET_FILE"
+    return "$SCAN_RC"
 }
-rc=0
-safe_find_delete "$TARGET_DIR" "*.tmp" "0" "f" || rc=$?
-printf 'RC=%s\n' "$rc"
+safe_remove() {
+    printf 'DELETE:%s\n' "$1"
+}
+for SCAN_RC in 124 0; do
+    rc=0
+    safe_find_delete "$TARGET_DIR" "*.tmp" "0" "f" || rc=$?
+    printf 'SCAN_RC=%s RC=%s\n' "$SCAN_RC" "$rc"
+done
 SCRIPT
 
     [ "$status" -eq 0 ] || return 1
-    [[ "$(< "$trace")" == *"$target_dir -maxdepth 5 -name *.tmp -type f -print0"* ]] || return 1
-    [[ "$output" == *"RC=124"* ]] || return 1
-    [[ "$output" != *"UNEXPECTED_DELETE"* ]] || return 1
-    [ -e "$target_file" ]
+    local first_call
+    read -r first_call < "$trace"
+    [[ "$first_call" == "7 find $target_dir -maxdepth 5 -name *.tmp -type f -print0" ]] || return 1
+    [[ "$output" == *"SCAN_RC=124 RC=124"* ]] || return 1
+    local timed_out_pass="${output%%SCAN_RC=124 RC=124*}"
+    [[ "$timed_out_pass" != *"DELETE:"* ]] || return 1
+    [[ "$output" == *"DELETE:$target_file"*"SCAN_RC=0 RC=0"* ]]
 }
 
 @test "safe_find_delete works when app protection is not loaded" {
     local old_file="$TEST_DIR/file-ops-only.tmp"
     touch "$old_file"
-    touch -t "$(date -v-8d '+%Y%m%d%H%M.%S' 2>/dev/null || date -d '8 days ago' '+%Y%m%d%H%M.%S')" "$old_file" 2>/dev/null || true
+    touch -t "$(/bin/date -v-8d '+%Y%m%d%H%M.%S' 2>/dev/null || date -d '8 days ago' '+%Y%m%d%H%M.%S')" "$old_file" 2>/dev/null || true
 
     run /bin/bash --noprofile --norc <<EOF
 set -euo pipefail
@@ -3031,13 +3622,162 @@ EOF
 	[[ "$output" == *"HELPER=0"* ]]
 }
 
+# Shape 2 reads every "Brave Origin Nightly" line as com.brave.Browser.nightly:
+# same vendor, same last label, different app, so one channel kept the other's
+# cache busy for as long as it ran. A line whose executable lives in an app
+# bundle, at any depth below an application root, is attributed by that
+# bundle's identifier instead, taken from the first field in line order. The
+# owner's own bundle (even when a later argument names another app), a nested
+# app that extends the owner's id, an executable named after the label (the
+# AcCoreConsole shape) and an unreadable bundle all still count. The comm
+# column is the 16-byte kernel name, as ps prints it.
+@test "cache owner probe attributes an app bundle's lines by its identifier" {
+    local apps="$HOME/Applications"
+    local name id
+    while IFS='|' read -r name id; do
+        mkdir -p "$apps/$name/Contents/MacOS"
+        [[ -z "$id" ]] || /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $id" \
+            "$apps/$name/Contents/Info.plist" > /dev/null
+    done <<'APPS'
+Brave Browser Nightly.app|com.brave.Browser.nightly
+Browsers/Brave Origin Nightly.app|com.brave.Browser.origin.nightly
+Karabiner-Elements.app|org.pqrs.Karabiner-Elements
+Autodesk Fusion.app|com.autodesk.fusion360
+Broken.app|
+APPS
+    # Any readable bundle under /Applications stands in for an unrelated app
+    # that a later argument can name.
+    local installed="" candidate
+    for candidate in /Applications/*.app; do
+        plutil -extract CFBundleIdentifier raw -o - "$candidate/Contents/Info.plist" > /dev/null 2>&1 || continue
+        installed="$candidate"
+        break
+    done
+    [[ -n "$installed" ]] || skip "no readable app bundle under /Applications"
+    local origin="$apps/Browsers/Brave Origin Nightly.app/Contents/MacOS/Brave Origin Nightly"
+    local origin_helper="$apps/Browsers/Brave Origin Nightly.app/Contents/Frameworks/Brave Origin Nightly Framework.framework/Versions/154.1.98.11/Helpers/Brave Origin Nightly Helper (Renderer).app/Contents/MacOS/Brave Origin Nightly Helper (Renderer)"
+    local nightly="$apps/Brave Browser Nightly.app/Contents/MacOS/Brave Browser Nightly"
+    local settings="$apps/Karabiner-Elements.app/Contents/Resources/Karabiner-Elements Settings.app/Contents/MacOS/Karabiner-Elements Settings"
+    local console="$apps/Autodesk Fusion.app/Contents/MacOS/AcCoreConsole"
+    local broken="$apps/Broken.app/Contents/MacOS/Brave Nightly Beta"
+    printf '  PID  PPID COMM ARGS\n  701     1 %s %s\n  702     1 %s %s --type=renderer\n' \
+        "${origin:0:16}" "$origin" "${origin_helper:0:16}" "$origin_helper" > "$HOME/table-sibling"
+    printf '  PID  PPID COMM ARGS\n  701     1 %s %s\n  703     1 %s %s\n' \
+        "${origin:0:16}" "$origin" "${nightly:0:16}" "$nightly" > "$HOME/table-owner"
+    printf '  PID  PPID COMM ARGS\n  704     1 %s %s %s/Contents/MacOS/Unrelated\n' \
+        "${nightly:0:16}" "$nightly" "$installed" > "$HOME/table-later"
+    printf '  PID  PPID COMM ARGS\n  705     1 %s %s\n' "${settings:0:16}" "$settings" > "$HOME/table-nested"
+    printf '  PID  PPID COMM ARGS\n  706     1 %s %s\n' "${console:0:16}" "$console" > "$HOME/table-helper"
+    printf '  PID  PPID COMM ARGS\n  707     1 %s %s\n' "${broken:0:16}" "$broken" > "$HOME/table-broken"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/file_ops.sh"
+ps() { cat "$HOME/$TABLE"; }
+probe() {
+    local state=0
+    _mole_reset_process_snapshot
+    TABLE="$1"
+    _mole_user_cache_owner_process_state "$2" || state=$?
+    printf '%s %s=%s\n' "$1" "$2" "$state"
+}
+probe table-sibling com.brave.Browser.nightly
+probe table-sibling com.brave.Browser.origin.nightly
+probe table-owner com.brave.Browser.nightly
+probe table-later com.brave.Browser.nightly
+probe table-nested org.pqrs.Karabiner-Elements.Settings
+probe table-helper com.autodesk.AcCoreConsole
+probe table-broken com.brave.Browser.nightly
+printf '  PID PPID COMM ARGS\n  708 1 /opt/BraveNightly /opt/BraveNightly --label Brave --channel Nightly --open %s/Contents/MacOS/Other\n' "$HOME/Applications/Brave Browser Nightly.app" > "$HOME/table-outside"
+probe table-outside com.brave.Browser.origin.nightly
+printf '  PID PPID COMM ARGS\n  709 1 /Applications/Br /Applications/BraveLauncher --label Brave --channel Nightly --open %s/Contents/MacOS/Other\n' "$HOME/Applications/Brave Browser Nightly.app" > "$HOME/table-launcher"
+probe table-launcher com.brave.Browser.origin.nightly
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"table-sibling com.brave.Browser.nightly=1"* ]] || return 1
+    [[ "$output" == *"table-sibling com.brave.Browser.origin.nightly=0"* ]] || return 1
+    [[ "$output" == *"table-owner com.brave.Browser.nightly=0"* ]] || return 1
+    [[ "$output" == *"table-later com.brave.Browser.nightly=0"* ]] || return 1
+    [[ "$output" == *"table-nested org.pqrs.Karabiner-Elements.Settings=0"* ]] || return 1
+    [[ "$output" == *"table-helper com.autodesk.AcCoreConsole=0"* ]] || return 1
+    [[ "$output" == *"table-outside com.brave.Browser.origin.nightly=0"* ]] || return 1
+    [[ "$output" == *"table-launcher com.brave.Browser.origin.nightly=0"* ]] || return 1
+    [[ "$output" == *"table-broken com.brave.Browser.nightly=0"* ]]
+}
+
+@test "cache owner probe attributes a rewritten argv by the executable ps reports" {
+    # Helpers can rewrite argv so no bundle path is left in the args column.
+    # `ps -o comm=` as the last column still names the full executable, which
+    # is what the owner probe attributes by; a pid missing from that read keeps
+    # the argv heuristic, which stays busy for a line it cannot place.
+    local case_home="$HOME/rewritten-argv"
+    local apps="$case_home/Applications"
+    local name id
+    rm -rf "$case_home"
+    while IFS='|' read -r name id; do
+        mkdir -p "$apps/$name/Contents/MacOS"
+        /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $id" \
+            "$apps/$name/Contents/Info.plist" > /dev/null
+    done <<'APPS'
+Brave Browser Nightly.app|com.brave.Browser.nightly
+Brave Origin Nightly.app|com.brave.Browser.origin.nightly
+Autodesk Fusion.app|com.autodesk.fusion360
+APPS
+    local origin_helper="$apps/Brave Origin Nightly.app/Contents/MacOS/Brave Origin Nightly Helper"
+    local nightly="$apps/Brave Browser Nightly.app/Contents/MacOS/Brave Browser Nightly"
+    local console="$apps/Autodesk Fusion.app/Contents/MacOS/AcCoreConsole"
+    printf '  PID  PPID COMM ARGS\n  801     1 %s Brave Origin Nightly Helper --type=renderer\n' \
+        "${origin_helper:0:16}" > "$case_home/rewritten-table"
+    printf '  801 %s\n' "$origin_helper" > "$case_home/rewritten-exe"
+    : > "$case_home/rewritten-exe-missing"
+    printf '  PID  PPID COMM ARGS\n  802     1 %s Brave Browser Nightly --restore\n' \
+        "${nightly:0:16}" > "$case_home/owner-table"
+    printf '  802 %s\n' "$nightly" > "$case_home/owner-exe"
+    printf '  PID  PPID COMM ARGS\n  803     1 %s AcCoreConsole --vendor autodesk\n' \
+        "${console:0:16}" > "$case_home/helper-table"
+    printf '  803 %s\n' "$console" > "$case_home/helper-exe"
+
+    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/file_ops.sh"
+ps() {
+    case "$*" in
+        *comm=*) cat "$HOME/$EXE" ;;
+        *) cat "$HOME/$TABLE" ;;
+    esac
+}
+probe() {
+    local state=0
+    _mole_reset_process_snapshot
+    TABLE="$1"
+    EXE="$2"
+    _mole_user_cache_owner_process_state "$3" || state=$?
+    printf '%s/%s %s=%s\n' "$1" "$2" "$3" "$state"
+}
+probe rewritten-table rewritten-exe com.brave.Browser.nightly
+probe rewritten-table rewritten-exe-missing com.brave.Browser.nightly
+probe owner-table owner-exe com.brave.Browser.nightly
+probe helper-table helper-exe com.autodesk.AcCoreConsole
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"rewritten-table/rewritten-exe com.brave.Browser.nightly=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"rewritten-table/rewritten-exe-missing com.brave.Browser.nightly=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"owner-table/owner-exe com.brave.Browser.nightly=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"helper-table/helper-exe com.autodesk.AcCoreConsole=0"* ]]
+}
+
 @test "cache owner probes reuse one process table snapshot" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/file_ops.sh"
 ps_calls=$(mktemp)
 ps() {
-	printf 'call\n' >> "$ps_calls"
+	printf '%s\n' "$*" >> "$ps_calls"
 	cat <<'TABLE'
   PID  PPID COMM             ARGS
   601     1 /Applications/Example.app/Contents/MacOS/Example /Applications/Example.app/Contents/MacOS/Example com.example.First
@@ -3047,17 +3787,21 @@ first_state=0
 _mole_user_cache_owner_process_state "com.example.First" || first_state=$?
 second_state=0
 _mole_user_cache_owner_process_state "com.example.Second" || second_state=$?
-call_count=$(wc -l < "$ps_calls" | tr -d ' ')
+# One snapshot is one table read plus one executable-path read.
+table_calls=$(grep -c 'pid,ppid,comm,args' "$ps_calls" || true)
+exe_calls=$(grep -c 'pid=,comm=' "$ps_calls" || true)
+call_count="${table_calls}+${exe_calls}"
 command rm -f "$ps_calls"
 printf 'FIRST=%s SECOND=%s CALLS=%s STATE=%s\n' \
 	"$first_state" "$second_state" "$call_count" "$_MOLE_PROCESS_TABLE_STATE"
 EOF
 
 	[ "$status" -eq 0 ] || return 1
-	[[ "$output" == "FIRST=0 SECOND=1 CALLS=1 STATE=ok" ]] || return 1
+	[[ "$output" == "FIRST=0 SECOND=1 CALLS=1+1 STATE=ok" ]] || return 1
 }
 
 @test "safe_remove refreshes process evidence at the final deletion boundary" {
+	mole_test_fake_command lsof 'exit 1'
 	local cache_dir="$HOME/Library/Caches/com.example.LateHelper"
 	local target_file="$cache_dir/Cache.db"
 	mkdir -p "$cache_dir"
@@ -3074,7 +3818,6 @@ _mole_user_cache_owner_process_state() {
 	printf 'call\n' >> "$owner_calls"
 	[[ -f "$owner_live" ]]
 }
-lsof() { return 1; }
 get_path_size_kb() {
 	touch "$owner_live"
 	printf '1\n'
@@ -3141,4 +3884,164 @@ EOF
         return 1
     }
     [[ "$output" == *"UNREADABLE=2"* ]]
+}
+
+@test "SQLite handle timeout keeps the file without cancelling later cleanup (#1595)" {
+    local database="$TEST_DIR/timeout.sqlite"
+    printf 'database' > "$database"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" database="$database" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+_MOLE_COMPLETE_LSOF_MODE=direct
+_mole_run_complete_lsof() { return 124; }
+rc=0
+safe_remove "$database" true || rc=$?
+printf 'RC=%s CANCEL=%s EXISTS=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS" "$(test -f "$database" && echo yes || echo no)"
+next="${database%.sqlite}.log"
+printf 'stale' > "$next"
+safe_remove "$next" true 0 || exit 1
+[[ ! -e "$next" ]] || exit 1
+printf 'LATER_REMOVED\n'
+EOF
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=1 CANCEL=0 EXISTS=yes"* ]] || return 1
+    [[ "$output" == *"LATER_REMOVED"* ]]
+}
+
+@test "SQLite handle interruption still cancels cleanup (#1595)" {
+    local database="$TEST_DIR/interrupted.sqlite"
+    printf 'database' > "$database"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" database="$database" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+_MOLE_COMPLETE_LSOF_MODE=direct
+_mole_run_complete_lsof() { return 130; }
+rc=0
+safe_remove "$database" true || rc=$?
+printf 'RC=%s CANCEL=%s EXISTS=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS" "$(test -f "$database" && echo yes || echo no)"
+EOF
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=130 CANCEL=130 EXISTS=yes"* ]]
+}
+
+@test "SQLite timeout after sizing keeps the file without cancellation (#1595)" {
+    local database="$TEST_DIR/final-timeout.sqlite"
+    printf 'database' > "$database"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" database="$database" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+_MOLE_COMPLETE_LSOF_MODE=direct
+_mole_run_complete_lsof() {
+    [[ -e "${database}.sized" ]] && return 124
+    return 1
+}
+oplog_enabled() { return 0; }
+get_path_size_kb() { touch "${database}.sized"; printf '1\n'; }
+rc=0
+safe_remove "$database" true || rc=$?
+printf 'RC=%s CANCEL=%s EXISTS=%s SIZED=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS" \
+    "$(test -f "$database" && echo yes || echo no)" "$(test -f "${database}.sized" && echo yes || echo no)"
+EOF
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=1 CANCEL=0 EXISTS=yes SIZED=yes"* ]]
+}
+
+
+@test "container probe timeout keeps its target and permits later cleanup (#1653)" {
+    local stage
+    for stage in visibility query final; do
+        check_handle_probe_outcome container 124 "$stage" || return 1
+    done
+}
+
+@test "group container probe timeout keeps its target and permits later cleanup (#1653)" {
+    local stage
+    for stage in visibility query final; do
+        check_handle_probe_outcome group 124 "$stage" || return 1
+    done
+}
+
+@test "download probe timeout keeps its target and permits later cleanup (#1653)" {
+    local stage
+    for stage in visibility query final; do
+        check_handle_probe_outcome download 124 "$stage" || return 1
+    done
+}
+
+@test "handle probe timeouts keep targets out of dry-run previews (#1653)" {
+    local kind stage
+    for kind in container group download; do
+        for stage in visibility query final; do
+            check_handle_probe_outcome "$kind" 124 "$stage" 1 || return 1
+        done
+    done
+}
+
+@test "handle probe signals remain sticky and prevent a later eligible sink (#1653)" {
+    local kind stage scripted_rc
+    for kind in container group download; do
+        for stage in visibility query final; do
+            for scripted_rc in 130 143; do
+                check_handle_probe_outcome "$kind" "$scripted_rc" "$stage" || return 1
+            done
+        done
+    done
+}
+
+@test "read-only handle timeouts retain paths without cancelling cleanup (#1653)" {
+    local cache_dir="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/Timeout"
+    mkdir -p "$cache_dir"
+    touch "$cache_dir/payload"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+lsof() { return 1; }
+run_with_timeout() { return "$PROBE_STATUS"; }
+for probe in _mole_paths_have_open_handle _mole_container_cache_has_open_handle; do
+    for visibility in direct unknown; do
+        for PROBE_STATUS in 124 130 143; do
+            if [[ "$visibility" == direct ]]; then
+                _MOLE_COMPLETE_LSOF_MODE=direct
+            else
+                unset _MOLE_COMPLETE_LSOF_MODE
+            fi
+            rc=0
+            "$probe" "$cache_dir" || rc=$?
+            printf '%s:%s:%s=%s\n' "$probe" "$visibility" "$PROBE_STATUS" "$rc"
+            [[ "$PROBE_STATUS" != 124 || "$rc" == 2 ]] || exit 1
+            [[ "$PROBE_STATUS" == 124 || "$rc" == "$PROBE_STATUS" ]] || exit 1
+        done
+    done
+done
+EOF
+    [ "$status" -eq 0 ] || return 1
+    [[ -e "$cache_dir/payload" ]] || return 1
+}
+
+@test "_mole_regex_escape matches names literally without undefined ERE escapes" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+name='com.foo-bar App (x)+[y]{1}^$|?*\z'
+escaped=$(_mole_regex_escape "$name")
+# A backslash may only precede an ERE metacharacter; `\-` or `\ ` is undefined
+# and GNU grep warns "stray \" on every match.
+stray=$(printf '%s' "$escaped" | LC_ALL=C sed 's/\\[][(){}.^$*+?|\\]//g' | LC_ALL=C grep -c '\\' || true)
+[[ "$stray" == 0 ]] || { echo "undefined escape left: $escaped"; exit 1; }
+for grep_bin in /usr/bin/grep /opt/homebrew/opt/grep/libexec/gnubin/grep; do
+    [[ -x "$grep_bin" ]] || continue
+    err=$(printf '%s\n' "$name" | LC_ALL=C "$grep_bin" -E -- "^${escaped}\$" 2>&1 > /dev/null) || { echo "$grep_bin missed the literal"; exit 1; }
+    [[ -z "$err" ]] || { echo "$grep_bin warned: $err"; exit 1; }
+    ! printf '%s\n' 'comXfoo-bar App (x)+[y]{1}^$|?*\z' | LC_ALL=C "$grep_bin" -qE -- "^${escaped}\$" 2> /dev/null ||
+        { echo "$grep_bin treated . as a wildcard"; exit 1; }
+done
+EOF
+
+    [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
 }
