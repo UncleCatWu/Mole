@@ -478,8 +478,8 @@ opt_diag_get_swapusage() {
 }
 
 opt_diag_get_mem_free_pct() {
-    if [[ -n "${MOLE_OPTIMIZE_MEM_FREE_PCT:-}" ]]; then
-        printf '%s\n' "$MOLE_OPTIMIZE_MEM_FREE_PCT"
+    if [[ -n "${MOLE_OPTIMIZE_MEM_FREE_SAMPLE:-}" ]]; then
+        printf '%s\n' "$MOLE_OPTIMIZE_MEM_FREE_SAMPLE"
         return 0
     fi
     memory_pressure 2> /dev/null | awk -F': ' '/free percentage/ {gsub(/%/,"",$2); print int($2)}' | tail -1
@@ -537,10 +537,6 @@ function opt_secs(t,   n, a, p, d, first, h, m, s) {
 }
 '
 
-opt_diag_time_to_seconds() {
-    printf '%s\n' "${1:-}" | awk "$MOLE_OPT_DIAG_TIME_AWK"'{ printf "%d\n", opt_secs($0) }'
-}
-
 # Swap pressure, and the processes actually responsible for it. Silent when
 # memory is healthy.
 opt_diag_memory_pressure() {
@@ -566,7 +562,6 @@ opt_diag_memory_pressure() {
     # bytes_to_human, not integer GB: sysctl reports megabytes, so "used / 1024"
     # printed "swap 0GB of 1GB used (88%)" on a machine with a small swap file.
     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Memory pressure: swap $(bytes_to_human_kb "$((swap_used * 1024))") of $(bytes_to_human_kb "$((swap_total * 1024))") used (${swap_pct}%), ${free_pct}% free"
-    echo -e "  ${GRAY}${ICON_REVIEW}${NC} High load with little CPU activity is usually this, not compute"
 
     # Name the actual holders. Simulator runtimes ship duplicate daemons whose
     # rows would otherwise crowd out the real offenders.
@@ -671,7 +666,7 @@ opt_diag_runaway_process() {
     while IFS=$'\t' read -r pid comm cpu_hours run_hours pct; do
         [[ -n "$pid" ]] || continue
         echo -e "  ${YELLOW}${ICON_WARNING}${NC} ${comm} has burned ${cpu_hours}h CPU over ${run_hours}h of runtime (~${pct}% sustained)"
-        echo -e "  ${GRAY}${ICON_REVIEW}${NC} A stuck run loop. Restarting it usually clears it: ${NC}kill -TERM ${pid}${GRAY} (launchd respawns system daemons)${NC}"
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Sustained for its whole lifetime; if it is not doing real work: ${NC}kill -TERM ${pid}${NC}"
         found=0
     done < <(opt_diag_get_proctime_sample | head -400 |
         awk -v floor="$pct_floor" -v minh="$min_hours" "$MOLE_OPT_DIAG_TIME_AWK"'

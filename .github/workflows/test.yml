@@ -29,6 +29,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Provision Go modules for offline tests
+        run: go mod download
+
       - name: Run test script
         env:
           MOLE_PERF_BYTES_TO_HUMAN_LIMIT_MS: "6000"
@@ -38,7 +41,6 @@ jobs:
           # Emits a "Slowest test files" table at the end of the run. Parallel
           # TAP output cannot be attributed to a file, so without this a single
           # slow file that sets the whole job's wall clock stays invisible.
-          MOLE_TEST_REPORT_DIR: ${{ runner.temp }}/bats-report
           BATS_FORMATTER: tap
           LANG: en_US.UTF-8
           LC_ALL: en_US.UTF-8
@@ -64,12 +66,14 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Provision Go modules for offline tests
+        run: go mod download
+
       - name: Smoke load on ${{ matrix.os }}
         run: |
-          echo "Testing on ${{ matrix.os }}..."
-          bash -n mole
-          source lib/core/common.sh
-          echo "✓ Successfully loaded on ${{ matrix.os }}"
+          /bin/bash scripts/test_sandbox.sh /bin/bash -c '
+            bash -n mole && source lib/core/common.sh && echo "✓ Successfully loaded"
+          '
 
       - name: Run core bats subset
         env:
@@ -79,7 +83,7 @@ jobs:
           LANG: en_US.UTF-8
           LC_ALL: en_US.UTF-8
         run: |
-          bats tests/core_safe_functions.bats \
+          /bin/bash scripts/test_sandbox.sh bats tests/core_safe_functions.bats \
                tests/core_common.bats \
                tests/core_timeout.bats \
                tests/regression.bats \
@@ -125,4 +129,4 @@ jobs:
           BATS_FORMATTER: tap
           LANG: en_US.UTF-8
           LC_ALL: en_US.UTF-8
-        run: bats tests/core_safe_functions.bats tests/purge.bats tests/installer.bats
+        run: /bin/bash scripts/test_sandbox.sh bats tests/core_safe_functions.bats tests/purge.bats tests/installer.bats

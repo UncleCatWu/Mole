@@ -1,0 +1,140 @@
+// Test-only native inputs. Loaded exclusively by the guarded private overlay.
+package main
+
+import (
+    "context"
+    "fmt"
+    "os"
+    "path/filepath"
+    "strings"
+    "sync"
+    "time"
+
+    "github.com/shirou/gopsutil/v4/cpu"
+    "github.com/shirou/gopsutil/v4/disk"
+    "github.com/shirou/gopsutil/v4/host"
+    "github.com/shirou/gopsutil/v4/load"
+    "github.com/shirou/gopsutil/v4/mem"
+    "github.com/shirou/gopsutil/v4/net"
+)
+
+var statusFixtureRoot string
+var statusFixtureHome string
+var statusFixtureStarted time.Time
+var statusFixtureTraceMu sync.Mutex
+
+func init() {
+    root, token := os.Getenv("MOLE_TEST_RUN_ROOT"), os.Getenv("MOLE_TEST_BOUNDARY_TOKEN")
+    physical, err := filepath.EvalSymlinks(root)
+    recorded, readErr := os.ReadFile(filepath.Join(root, ".test-boundary"))
+    home := os.Getenv("HOME")
+    physicalHome, homeErr := filepath.EvalSymlinks(home)
+    if err != nil || readErr != nil || homeErr != nil || physicalHome != home ||
+        !strings.HasPrefix(home, root + string(os.PathSeparator)) || root == "/" || physical != root || token == "" ||
+        os.Getenv("MOLE_TEST_SANDBOX_ACTIVE") != token || strings.TrimSpace(string(recorded)) != token {
+        fmt.Fprintln(os.Stderr, "status native fixture refused: private sandbox boundary required")
+        os.Exit(16)
+    }
+    statusFixtureRoot, statusFixtureHome, statusFixtureStarted = root, home, time.Now()
+    runCmd = statusFixtureCommand
+    commandExists = func(name string) bool {
+        switch name {
+        case "pmset", "ioreg", "system_profiler", "diskutil":
+            return true
+        default:
+            return false
+        }
+    }
+    cpuCountsFunc = func(bool) (int, error) { return 2, nil }
+    cpuLoadFunc = func() (*load.AvgStat, error) { return &load.AvgStat{Load1: 1.5, Load5: 1, Load15: .5}, nil }
+    cpuTimesFunc = func(bool) ([]cpu.TimesStat, error) {
+        elapsed := time.Since(statusFixtureStarted).Seconds()
+        return []cpu.TimesStat{
+            {CPU: "cpu0", User: elapsed * .25, Idle: elapsed * .75},
+            {CPU: "cpu1", User: elapsed * .25, Idle: elapsed * .75},
+        }, nil
+    }
+    diskPartitionsFunc = func(bool) ([]disk.PartitionStat, error) {
+        return []disk.PartitionStat{{Device: "/dev/disk0s1", Mountpoint: "/fixture", Fstype: "hfs"}}, nil
+    }
+    diskUsageFunc = func(path string) (*disk.UsageStat, error) {
+        if path != "/fixture" { return nil, fmt.Errorf("unexpected fixture disk path %q", path) }
+        return &disk.UsageStat{Path: path, Total: 8 << 30, Used: 2 << 30, Free: 6 << 30, UsedPercent: 25}, nil
+    }
+    diskIOCountersFunc = func(...string) (map[string]disk.IOCountersStat, error) {
+        elapsed := time.Since(statusFixtureStarted).Seconds()
+        return map[string]disk.IOCountersStat{"fixture": {Name: "fixture", ReadBytes: uint64(elapsed * (1 << 20)), WriteBytes: uint64(elapsed * (1 << 19))}}, nil
+    }
+    ioCountersFunc = func(bool) ([]net.IOCountersStat, error) {
+        elapsed := time.Since(statusFixtureStarted).Seconds()
+        return []net.IOCountersStat{{Name: "fixture0", BytesRecv: uint64(elapsed * (1 << 20)), BytesSent: uint64(elapsed * (1 << 19))}}, nil
+    }
+}
+
+func statusFixtureHostInfo() (*host.InfoStat, error) {
+    return &host.InfoStat{Hostname: "mole-private-cli-fixture", Platform: "darwin", PlatformVersion: "fixture", Uptime: 3600, Procs: 1}, nil
+}
+
+func statusFixtureMemory() (*mem.VirtualMemoryStat, error) {
+    return &mem.VirtualMemoryStat{Total: 1 << 30, Used: 1 << 29, Available: 1 << 29, UsedPercent: 50, Cached: 1 << 20}, nil
+}
+
+func statusFixtureSwap() (*mem.SwapMemoryStat, error) { return &mem.SwapMemoryStat{}, nil }
+
+func statusFixtureInterfaces() ([]net.InterfaceStat, error) {
+    return []net.InterfaceStat{{Name: "fixture0", Addrs: []net.InterfaceAddr{{Addr: "192.0.2.1/24"}}}}, nil
+}
+
+func statusFixtureCommand(ctx context.Context, name string, args ...string) (string, error) {
+    if err := ctx.Err(); err != nil { return "", err }
+    key := name + " " + strings.Join(args, " ")
+    statusFixtureTraceMu.Lock()
+    trace, err := os.OpenFile(filepath.Join(statusFixtureRoot, "status-provider-trace"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+    if err == nil { _, err = fmt.Fprintln(trace, key); closeErr := trace.Close(); if err == nil { err = closeErr } }
+    statusFixtureTraceMu.Unlock()
+    if err != nil { return "", err }
+    if name == "ps" {
+        if _, err := os.Stat(filepath.Join(statusFixtureHome, "status-provider-failure")); err == nil {
+            return "", fmt.Errorf("intentional status fixture ps failure")
+        } else if !os.IsNotExist(err) { return "", err }
+    }
+    switch key {
+    case "ps -Aceo pid=,ppid=,state=,pcpu=,pmem=,rss=,comm= -r":
+        return "101 1 S 12.5 3.125 32768 FixtureWorker\n", nil
+    case "ps aux":
+        return "USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND\nfixture 101 12.5 3.125 65536 32768 ?? S 12:00 0:00 FixtureWorker\n", nil
+    case "sysctl -n hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu":
+        return "2\n0\n", nil
+    case "memory_pressure ":
+        return "System-wide memory free percentage: normal\n", nil
+    case "pmset -g batt":
+        return "Now drawing from 'Battery Power'\n -InternalBattery-0 75%; discharging; 2:00 remaining present: true\n", nil
+    case "ioreg -rn AppleSmartBattery":
+        return "\"CycleCount\" = 30\n\"DesignCapacity\" = 100\n\"NominalChargeCapacity\" = 90\n\"Temperature\" = 3000\n", nil
+    case "system_profiler SPPowerDataType -json":
+        return `{"SPPowerDataType":[]}`, nil
+    case "system_profiler SPPowerDataType":
+        return "Condition: Normal\n", nil
+    case "system_profiler SPHardwareDataType":
+        return "Model Name: Fixture Mac\nChip: Fixture CPU\n", nil
+    case "system_profiler -detailLevel mini SPDisplaysDataType":
+        return "Refresh Rate: 60 Hz\n", nil
+    case "system_profiler -json SPDisplaysDataType":
+        return `{"SPDisplaysDataType":[{"_name":"Fixture GPU","sppci_cores":"2"}]}`, nil
+    case "system_profiler SPBluetoothDataType":
+        return "Bluetooth:\n", nil
+    case "sw_vers -productVersion":
+        return "fixture\n", nil
+    case "powermetrics --samplers gpu_power -i 500 -n 1":
+        return "GPU HW active residency: 12.00%\n", nil
+    case "diskutil info disk0":
+        return "Internal: Yes\nSMART Status: Verified\n", nil
+    case "diskutil info -plist /fixture":
+        return `<?xml version="1.0"?><plist version="1.0"><dict><key>TotalSize</key><integer>8589934592</integer></dict></plist>`, nil
+    case "scutil --proxy":
+        return "<dictionary> {}\n", nil
+    default:
+        _ = os.WriteFile(filepath.Join(statusFixtureHome, "status-provider-unsupported"), []byte(key), 0600)
+        return "", fmt.Errorf("unsupported status native fixture command: %s", key)
+    }
+}

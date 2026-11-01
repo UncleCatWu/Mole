@@ -14,11 +14,36 @@ teardown_file() {
 	fi
 }
 
-@test "optimize dry-run summary reports outcomes instead of catalog size" {
-	run env HOME="$TEST_HOME" MOLE_TEST_NO_AUTH=1 MOLE_ASSUME_VPN_ACTIVE=0 NO_COLOR=1 "$PROJECT_ROOT/mole" optimize --dry-run
+install_database_process_fixture() {
+    local fixture_home="$1"
+    mkdir -p "$fixture_home/bin"
+    cat >"$fixture_home/bin/pgrep" <<'EOF'
+#!/bin/bash
+case "$*" in
+    "-x Mail" | "-x Safari" | "-x Messages")
+        printf '%s\n' "$*" >> "$HOME/database-process-probes"
+        exit "${DATABASE_PROCESS_STATUS:-1}"
+        ;;
+    *) exit 2 ;;
+ esac
+EOF
+    chmod +x "$fixture_home/bin/pgrep"
+}
 
-	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-	[[ "$output" =~ Would\ apply\ [0-9]+\ optimizations ]] || { echo "$output"; return 1; }
+@test "optimize dry-run summary reports outcomes instead of catalog size" {
+    install_database_process_fixture "$TEST_HOME"
+    run env HOME="$TEST_HOME" MOLE_TEST_NO_AUTH=1 MOLE_ASSUME_VPN_ACTIVE=0 NO_COLOR=1 PATH="$TEST_HOME/bin:$PATH" "$PROJECT_ROOT/mole" optimize --dry-run
+
+    [[ "$status" -eq 0 ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" =~ Would\ apply\ [0-9]+\ optimizations ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$(wc -l <"$TEST_HOME/database-process-probes" | tr -d ' ')" == 3 ]] || return 1
+    [[ "$output" == *"No databases found to optimize"* ]] || return 1
 	local applied_count="${BASH_REMATCH[0]#Would apply }"
 	applied_count="${applied_count% optimizations}"
 	[[ "$output" != *"Would apply 23 optimizations"* ]] || return 1
@@ -27,9 +52,26 @@ teardown_file() {
 	[[ "$output" != *"System fully optimized"* ]] || return 1
 
 	run env HOME="$TEST_HOME" "$PROJECT_ROOT/mole" history --json
-	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+    [[ "$status" -eq 0 ]] || {
+        echo "$output"
+        return 1
+    }
 	[[ "$output" == *"\"items\": $applied_count"* ]] || return 1
 	[[ "$output" == *"\"failed_tasks\": 0"* ]] || return 1
+}
+
+@test "optimize summary retains unknown database process failure" {
+    local fixture_home="$TEST_HOME/unknown-process"
+    install_database_process_fixture "$fixture_home"
+    run env HOME="$fixture_home" MOLE_TEST_NO_AUTH=1 MOLE_ASSUME_VPN_ACTIVE=0 NO_COLOR=1 \
+        DATABASE_PROCESS_STATUS=2 PATH="$fixture_home/bin:$PATH" "$PROJECT_ROOT/mole" optimize --dry-run
+    [[ "$status" == 1 ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"Failed to inspect active apps before database optimization"* ]] || return 1
+    [[ "$output" == *"1 failed"* ]] || return 1
+    [[ "$(cat "$fixture_home/database-process-probes")" == "-x Mail" ]] || return 1
 }
 
 @test "optimize failure reaches terminal exit and history contracts" {

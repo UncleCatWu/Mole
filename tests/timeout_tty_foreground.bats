@@ -11,11 +11,11 @@ setup() {
 # terminal's original owner: restoring the terminal to that dead process group
 # suspended the next prompt read with SIGTTIN (issues #1222, #1218).
 @test "run_with_timeout: concurrent perl helpers keep the terminal with the script (#1222)" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect || ! -x /usr/bin/perl ]]; then
-		skip "macOS expect/perl required"
+	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
+		skip "macOS perl required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/timeout_tty_concurrent.exp" "$PROJECT_ROOT"
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" concurrent
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"READ:typed-value"* ]]

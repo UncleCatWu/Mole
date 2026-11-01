@@ -736,6 +736,7 @@ EOF
     [[ "$elapsed" =~ ^[0-9]+$ ]] || return 1
     (( elapsed < 5 ))
     [[ "$output" == *"Project caches · skipped 1 slow/incomplete root scan"* ]] || return 1
+    [[ "$output" == *"Project caches · kept ~/SlowProjects (scan timed out)"* ]] || { echo "$output"; return 1; }
 
 	rm -rf "$HOME/.config/mole" "$HOME/SlowProjects" "$fake_bin"
 }

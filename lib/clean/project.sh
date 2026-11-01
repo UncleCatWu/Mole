@@ -162,9 +162,7 @@ write_purge_config() {
     local tmp_file
     tmp_file=$(mktemp_file "mole-purge-paths") || return 1
 
-    if ! cat > "$tmp_file" << EOF; then
-$header
-EOF
+    if ! printf '%s\n' "$header" > "$tmp_file"; then
         rm -f "$tmp_file" 2> /dev/null || true
         return 1
     fi
@@ -500,9 +498,72 @@ is_protected_vendor_dir() {
 }
 
 # Check if an artifact should be protected from purge
+# Names do not prove rebuildability: target/deploy carries Anchor keys,
+# and build/coverage can contain tracked source. Reused at discovery and sink.
+# Returns 0 when authored content is present, 1 when the walk completed and
+# found none, 2 when a probe timed out or failed. A 2 is not evidence either
+# way: callers keep the candidate but must say so instead of dropping it.
+# Signal-like statuses propagate to stop purge; Git fatal 128 stays unknown.
+purge_artifact_has_authored_content() {
+    local path="${1%/}"
+    [[ -d "$path" ]] || return 1
+    # A configured root can cross a symlink before reaching the candidate.
+    # Git ancestry must follow the actual repository, not the alias spelling.
+    local content_probe_rc=0
+    path=$(cd "$path" 2> /dev/null && /bin/pwd -P) || content_probe_rc=$?
+    [[ $content_probe_rc -lt 128 ]] || return "$content_probe_rc"
+    [[ $content_probe_rc -eq 0 ]] || return 2
+    local evidence=""
+    # Do not follow links or read key contents. This walks the whole artifact
+    # when nothing matches, so it takes the tree-walk budget, not the
+    # command-probe one.
+    content_probe_rc=0
+    evidence=$(run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" /usr/bin/find "$path" \
+        \( -name .git -o -name '*-keypair.json' \) -print -quit 2> /dev/null) || content_probe_rc=$?
+    [[ $content_probe_rc -lt 128 ]] || return "$content_probe_rc"
+    [[ $content_probe_rc -eq 0 ]] || return 2
+    [[ -z "$evidence" ]] || return 0
+
+    local ancestor="$path"
+    while [[ "$ancestor" != "/" && -n "$ancestor" ]]; do
+        if [[ -e "$ancestor/.git" || -L "$ancestor/.git" ]]; then
+            # Ignore inherited Git routing; inspect this directory's own repo.
+            content_probe_rc=0
+            evidence=$(run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" \
+                env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+                GIT_OPTIONAL_LOCKS=0 GIT_LITERAL_PATHSPECS=1 \
+                git -c core.fsmonitor=false --git-dir="$ancestor/.git" --work-tree="$ancestor" -C "$path" ls-files -- . 2> /dev/null) || content_probe_rc=$?
+            # Git's fatal repository errors exit 128, not a signal. Keep that
+            # target unverified; all higher statuses conservatively stop purge.
+            if [[ $content_probe_rc -ge 128 && $content_probe_rc -ne 128 ]]; then
+                return "$content_probe_rc"
+            fi
+            [[ $content_probe_rc -eq 0 ]] || return 2
+            [[ -n "$evidence" ]]
+            return $?
+        fi
+        ancestor="${ancestor%/*}"
+    done
+    return 1
+}
+
+# Set by is_protected_purge_artifact: true when the verdict came from an
+# unfinished content probe rather than evidence.
+PURGE_PROTECTION_UNVERIFIED=false
+
 is_protected_purge_artifact() {
     local path="${1%/}"
     local base="${path##*/}"
+
+    PURGE_PROTECTION_UNVERIFIED=false
+    local authored_rc=0
+    purge_artifact_has_authored_content "$path" || authored_rc=$?
+    [[ $authored_rc -lt 128 ]] || return "$authored_rc"
+    if [[ $authored_rc -eq 2 ]]; then
+        PURGE_PROTECTION_UNVERIFIED=true
+        return 0
+    fi
+    [[ $authored_rc -ne 0 ]] || return 0
 
     case "$base" in
         bin)
@@ -527,10 +588,25 @@ is_protected_purge_artifact() {
     return 1
 }
 
+# One command owns one ephemeral progress/accounting directory. A shared cache
+# marker lets another purge look like Ctrl-C and mixes reclaimed totals.
+# The calling command keeps this variable dynamically scoped into its workers.
+mole_purge_init_run_state() {
+    _MOLE_PURGE_STATE_DIR=$(create_temp_dir) || return 1
+    printf '0\n' > "$_MOLE_PURGE_STATE_DIR/purge_stats" || return 1
+    printf '0\n' > "$_MOLE_PURGE_STATE_DIR/purge_count" || return 1
+    : > "$_MOLE_PURGE_STATE_DIR/purge_scanning" || return 1
+    _MOLE_PURGE_LAST_STATE_DIR="$_MOLE_PURGE_STATE_DIR"
+}
+
 # Scan purge targets using fd (fast) or pruned find.
 scan_purge_targets() {
     local search_path="$1"
     local output_file="$2"
+    local _MOLE_PURGE_STATE_DIR="${_MOLE_PURGE_STATE_DIR:-}"
+    if [[ -z "$_MOLE_PURGE_STATE_DIR" ]]; then
+        mole_purge_init_run_state || return 1
+    fi
     local target_output="${output_file}.targets"
     local tag_output="${output_file}.tags"
     local processed_output="${output_file}.processed"
@@ -565,7 +641,7 @@ scan_purge_targets() {
     local scan_stage_timeout=""
 
     # Update current scanning path
-    local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+    local stats_dir="$_MOLE_PURGE_STATE_DIR"
     echo "$search_path" > "$stats_dir/purge_scanning" 2> /dev/null || true
 
     emit_valid_cachedir_tag_dirs() {
@@ -816,7 +892,12 @@ filter_protected_artifacts() {
         if [[ "$deadline" =~ ^[0-9]+$ && $SECONDS -ge $deadline ]]; then
             return 124
         fi
-        if ! is_protected_purge_artifact "$item"; then
+        # An unfinished probe is not evidence either way. Keep the candidate
+        # visible; the in-process recheck before the menu reports it.
+        local protection_rc=0
+        is_protected_purge_artifact "$item" || protection_rc=$?
+        [[ $protection_rc -lt 128 ]] || return "$protection_rc"
+        if [[ $protection_rc -ne 0 || "$PURGE_PROTECTION_UNVERIFIED" == "true" ]]; then
             echo "$item"
         fi
     done
@@ -931,7 +1012,10 @@ purge_target_activity_still_safe() {
 _mole_purge_final_remove_guard() {
     local path="$1"
     is_safe_configured_purge_artifact "$path" || return 1
-    is_protected_purge_artifact "$path" && return 1
+    local protection_rc=0
+    is_protected_purge_artifact "$path" || protection_rc=$?
+    [[ $protection_rc -lt 128 ]] || return "$protection_rc"
+    [[ $protection_rc -ne 0 ]] || return 1
     purge_target_activity_still_safe "$path" "${_MOLE_PURGE_FINAL_ACTIVITY_STATE:-uncertain}" || return $?
 
     _mole_path_matches_identity \
@@ -1630,11 +1714,22 @@ confirm_purge_cleanup() {
 # work to failure. Signals and deletion-phase timeouts stop the run immediately.
 # PURGE_RUN_OUTCOME: completed, incomplete, no_candidates, cancelled, scan_failed.
 clean_project_artifacts() {
+    if [[ ! -t 0 && "${MOLE_DRY_RUN:-0}" != "1" && "${MOLE_PURGE_YES:-0}" != "1" ]]; then
+        PURGE_RUN_OUTCOME="cancelled"
+        echo "Purge requires confirmation. Run mo purge in a terminal, or use --dry-run to preview and --yes to confirm unattended cleanup." >&2
+        return 1
+    fi
+    local _MOLE_PURGE_STATE_DIR="${_MOLE_PURGE_STATE_DIR:-}"
+    if [[ -z "$_MOLE_PURGE_STATE_DIR" ]]; then
+        mole_purge_init_run_state || return 1
+    fi
+    _MOLE_PURGE_LAST_STATE_DIR="$_MOLE_PURGE_STATE_DIR"
     PURGE_RUN_OUTCOME="completed"
     [[ ${PURGE_DISCOVERY_STATUS:-0} -eq 0 ]] || PURGE_RUN_OUTCOME="incomplete"
     PURGE_UNKNOWN_SIZE_COUNT=0
     local -a all_found_items=()
     local -a safe_to_clean=()
+    local -a uninspected_paths=()
     local -a safe_recent_flags=()
     local -a safe_activity_states=()
     local -a safe_expected_parents=()
@@ -1667,7 +1762,7 @@ clean_project_artifacts() {
             rm -f "$temp" "${temp}.targets" "${temp}.tags" "${temp}.processed" "${temp}.errors" 2> /dev/null || true
         done
         # Clean up purge scanning file
-        local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+        local stats_dir="$_MOLE_PURGE_STATE_DIR"
         rm -f "$stats_dir/purge_scanning" 2> /dev/null || true
         echo ""
         exit 130
@@ -1808,7 +1903,8 @@ clean_project_artifacts() {
     done
 
     if [[ $scan_interrupt_status -ge 128 ]]; then
-        local interrupted_stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+        PURGE_RUN_OUTCOME="cancelled"
+        local interrupted_stats_dir="$_MOLE_PURGE_STATE_DIR"
         rm -f "$interrupted_stats_dir/purge_scanning" 2> /dev/null || true
         local interrupted_temp
         for interrupted_temp in "${scan_temps[@]+"${scan_temps[@]}"}"; do
@@ -1823,7 +1919,7 @@ clean_project_artifacts() {
     fi
 
     # Stop the scanning monitor (removes purge_scanning file to signal completion)
-    local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+    local stats_dir="$_MOLE_PURGE_STATE_DIR"
     rm -f "$stats_dir/purge_scanning" 2> /dev/null || true
 
     # Give monitor process time to exit and clear its output
@@ -1988,8 +2084,20 @@ clean_project_artifacts() {
             debug_log "Skipping purge target whose scan identity changed: $item"
             continue
         fi
-        if is_protected_purge_artifact "$item"; then
-            debug_log "Skipping purge target that became protected after scanning: $item"
+        local protection_rc=0
+        is_protected_purge_artifact "$item" || protection_rc=$?
+        if [[ $protection_rc -ge 128 ]]; then
+            PURGE_RUN_OUTCOME="cancelled"
+            [[ ! -t 1 ]] || stop_inline_spinner
+            return "$protection_rc"
+        fi
+        if [[ $protection_rc -eq 0 ]]; then
+            if [[ "$PURGE_PROTECTION_UNVERIFIED" == "true" ]]; then
+                PURGE_RUN_OUTCOME="incomplete"
+                uninspected_paths+=("$item")
+            else
+                debug_log "Skipping purge target that became protected after scanning: $item"
+            fi
             continue
         fi
 
@@ -2002,6 +2110,9 @@ clean_project_artifacts() {
     if [[ -t 1 ]]; then
         stop_inline_spinner
     fi
+    for item in "${uninspected_paths[@]+"${uninspected_paths[@]}"}"; do
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Could not inspect ${item/#$HOME/~}; kept" >&2
+    done
     if [[ ${#safe_to_clean[@]} -eq 0 ]]; then
         echo -e "${GRAY}No eligible project artifacts to purge${NC}"
         [[ "$PURGE_RUN_OUTCOME" != "incomplete" ]] && PURGE_RUN_OUTCOME="no_candidates"
@@ -2522,7 +2633,7 @@ clean_project_artifacts() {
 
     # Clean selected items
     echo ""
-    local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+    local stats_dir="$_MOLE_PURGE_STATE_DIR"
     local cleaned_count=0
     local dry_run_mode="${MOLE_DRY_RUN:-0}"
     for idx in "${selected_indices[@]}"; do
@@ -2570,8 +2681,20 @@ clean_project_artifacts() {
             debug_log "Skipping purge target outside configured safe roots: ${item_path:-<empty>}"
             continue
         fi
-        if is_protected_purge_artifact "$item_path"; then
-            debug_log "Skipping purge target that became protected after review: $item_path"
+        local protection_rc=0
+        is_protected_purge_artifact "$item_path" || protection_rc=$?
+        if [[ $protection_rc -ge 128 ]]; then
+            PURGE_RUN_OUTCOME="cancelled"
+            echo "$cleaned_count" > "$stats_dir/purge_count"
+            [[ ! -t 1 ]] || stop_inline_spinner
+            return "$protection_rc"
+        fi
+        if [[ $protection_rc -eq 0 ]]; then
+            if [[ "$PURGE_PROTECTION_UNVERIFIED" == "true" ]]; then
+                echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (could not inspect contents; re-run mo purge to review it again)"
+            else
+                debug_log "Skipping purge target that became protected after review: $item_path"
+            fi
             continue
         fi
         local activity_status=0

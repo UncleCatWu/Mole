@@ -2258,6 +2258,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/dev.sh"
 stop_section_spinner() { :; }
+# Signals real processes when not stubbed; tests/clean_automation_browsers.bats owns it.
+clean_dev_automation_browsers() { :; }
 clean_sqlite_temp_files() { :; }
 clean_dev_npm() { echo "npm"; }
 clean_homebrew() { echo "brew"; }

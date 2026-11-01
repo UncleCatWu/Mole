@@ -224,18 +224,21 @@ setup() {
     [[ $duration -lt 7 ]]
 }
 
-@test "run_with_timeout: perl fallback cleans child when its caller dies" {
+_assert_perl_owner_death() {
     if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
         skip "macOS perl required"
     fi
 
-    local child_pid_file="$BATS_TEST_TMPDIR/timeout-child.pid"
+    local death_signal="$1"
+    local child_pid_file="$BATS_TEST_TMPDIR/timeout-child-$death_signal.pid"
+    local perl_pid_file="$BATS_TEST_TMPDIR/timeout-perl-$death_signal.pid"
     local caller_pid=""
     local perl_pid=""
     local child_pid=""
+    local perl_ppid="" child_ppid="" caller_status=0
 
     /bin/bash "$PROJECT_ROOT/tests/timeout_parent_death_fixture.sh" \
-        "$PROJECT_ROOT" "$child_pid_file" > /dev/null 2>&1 &
+        "$PROJECT_ROOT" "$child_pid_file" "$perl_pid_file" > /dev/null 2>&1 &
     caller_pid=$!
 
     for _ in {1..50}; do
@@ -247,14 +250,17 @@ setup() {
         return 1
     }
 
-    child_pid=$(cat "$child_pid_file")
-    perl_pid=$(pgrep -P "$caller_pid" -x perl 2> /dev/null | head -1 || true)
+    read -r child_pid child_ppid < "$child_pid_file"
+    # The exec-only fixture launcher records its actual Perl PID; process-list
+    # discovery is unavailable under the private kernel policy.
+    read -r perl_pid perl_ppid < "$perl_pid_file"
     [[ "$child_pid" =~ ^[0-9]+$ && "$perl_pid" =~ ^[0-9]+$ ]] || {
         kill -KILL "$caller_pid" "$child_pid" 2> /dev/null || true
         return 1
     }
+    [[ "$perl_ppid" == "$caller_pid" && "$child_ppid" == "$perl_pid" ]] || return 1
 
-    kill -TERM "$caller_pid"
+    kill -"$death_signal" "$caller_pid"
     for _ in {1..50}; do
         if ! kill -0 "$perl_pid" 2> /dev/null && ! kill -0 "$child_pid" 2> /dev/null; then
             break
@@ -268,9 +274,16 @@ setup() {
         kill -KILL "$perl_pid" "$child_pid" 2> /dev/null || true
     fi
     kill -KILL "$caller_pid" 2> /dev/null || true
-    wait "$caller_pid" 2> /dev/null || true
+    wait "$caller_pid" 2> /dev/null || caller_status=$?
 
-    [ "$leaked" -eq 0 ]
+    [ "$leaked" -eq 0 ] || return 1
+    [ "$caller_status" -eq 143 ] || return 1
+    printf 'CALLER_SIGNAL=%s CALLER_PID=%s PERL_PID=%s TIMED_CHILD_PID=%s PPID_CHAIN=bound DESCENDANTS=gone\n' \
+        "$death_signal" "$caller_pid" "$perl_pid" "$child_pid"
+}
+
+@test "run_with_timeout: perl fallback cleans child when its caller dies" {
+    _assert_perl_owner_death TERM
 }
 
 # setsid() in the perl fallback strips the controlling terminal, which breaks
@@ -287,22 +300,22 @@ setup() {
 }
 
 @test "run_with_timeout: perl fallback keeps tty reads in foreground (#1201)" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect || ! -x /usr/bin/perl ]]; then
-		skip "macOS expect/perl required"
+	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
+		skip "macOS perl required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/timeout_tty_read.exp" "$PROJECT_ROOT"
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" read
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"READ:typed-value"* ]]
 }
 
 @test "run_with_timeout: perl fallback restores tty after timeout (#1201)" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect || ! -x /usr/bin/perl ]]; then
-		skip "macOS expect/perl required"
+	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
+		skip "macOS perl required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/timeout_tty_restore.exp" "$PROJECT_ROOT"
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" restore
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"TIMEOUT:124"* ]] || return 1
@@ -323,11 +336,11 @@ _tty_bg_field() {
 }
 
 @test "run_with_timeout: perl fallback hands tty to child when stdin is a tty (#1201/#1222)" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect || ! -x /usr/bin/perl ]]; then
-		skip "macOS expect/perl required"
+	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
+		skip "macOS perl required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/timeout_tty_background.exp" "$PROJECT_ROOT" tty
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" background tty
 
 	[ "$status" -eq 0 ] || return 1
 	local child fg caller
@@ -341,11 +354,11 @@ _tty_bg_field() {
 }
 
 @test "run_with_timeout: perl fallback keeps tty with caller when stdin is /dev/null (#1222)" {
-	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/expect || ! -x /usr/bin/perl ]]; then
-		skip "macOS expect/perl required"
+	if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/perl ]]; then
+		skip "macOS perl required"
 	fi
 
-	run /usr/bin/expect "$PROJECT_ROOT/tests/timeout_tty_background.exp" "$PROJECT_ROOT" devnull
+	run python3 -B "$PROJECT_ROOT/tests/support/tty_fixture.py" "$PROJECT_ROOT" background devnull
 
 	[ "$status" -eq 0 ] || return 1
 	local child fg caller
@@ -368,10 +381,16 @@ _tty_bg_field() {
 	# Parallel scan workers.
 	run grep -nE 'process_app_metadata[[:space:]].*<[[:space:]]*/dev/null[[:space:]]*&[[:space:]]*$' "$PROJECT_ROOT/bin/uninstall.sh"
 	[ "$status" -eq 0 ] || return 1
-	# Post-uninstall work: Homebrew autoremove and LaunchServices/Dock refresh.
-	run grep -cE '^[[:space:]]*\)[[:space:]]*>[[:space:]]*/dev/null[[:space:]]+2>&1[[:space:]]+<[[:space:]]*/dev/null[[:space:]]*&[[:space:]]*$' "$PROJECT_ROOT/lib/uninstall/batch.sh"
+	# The remaining post-uninstall timeout family is LaunchServices/Dock;
+	# dependency autoremove was removed from uninstall's authorization scope.
+	run awk '
+        /^[[:space:]]*#/ { next }
+        /refresh_launch_services_after_uninstall > \/dev\/null/ { in_worker = 1; remaining = 8 }
+        in_worker && /\) > \/dev\/null 2>&1 < \/dev\/null &/ { found = 1; exit }
+        in_worker && --remaining <= 0 { exit }
+        END { exit(found ? 0 : 1) }
+    ' "$PROJECT_ROOT/lib/uninstall/batch.sh"
 	[ "$status" -eq 0 ] || return 1
-	[ "$output" -ge 2 ] || return 1
 }
 
 @test "run_with_timeout: shell fallback preserves caller INT trap" {
@@ -388,23 +407,10 @@ _tty_bg_field() {
 }
 
 @test "run_with_timeout: shell fallback cleans up watchdog sleep" {
-    /bin/bash -c "
-        set -euo pipefail
-        source '$PROJECT_ROOT/lib/core/timeout.sh'
-        MO_TIMEOUT_BIN=''
-        MO_TIMEOUT_PERL_BIN=''
-        run_with_timeout 287 true
-        sleep 0.1
-        leaked=''
-        for pid in \$(pgrep -x sleep 2>/dev/null || true); do
-            command_line=\$(ps -p \"\$pid\" -o command= 2>/dev/null || true)
-            if [[ \"\$command_line\" == 'sleep 287' ]]; then
-                leaked=\"\$pid\"
-                kill \"\$pid\" 2>/dev/null || true
-            fi
-        done
-        [[ -z \"\$leaked\" ]] || return 1
-    "
+    run /bin/bash "$PROJECT_ROOT/tests/support/timeout_watchdog_fixture.sh" \
+        "$PROJECT_ROOT" "$BATS_TEST_TMPDIR/watchdog"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WATCHDOG_CLEANUP=production-kill"* && "$output" == *"CHILD=gone UNKNOWN_ARGS=2"* ]] || return 1
 }
 
 # A directory-sizing `du` on a stalled network mount or a huge tree wedges the

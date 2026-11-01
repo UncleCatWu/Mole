@@ -102,36 +102,55 @@ setup() {
 
     result=$(get_file_owner "$test_file")
     current_user=$(whoami)
+    current_uid=$(/usr/bin/id -u)
+    [[ "$current_uid" =~ ^[0-9]+$ ]] || return 1
+    [[ "$(/usr/bin/stat -f%u "$test_file")" == "$current_uid" ]] || return 1
+
+    # Without directory-service Mach lookup, BSD stat returns its numeric
+    # owner as (UID), while whoami returns UID. Both identify this fixture.
+    if [[ "$current_user" == "$current_uid" ]]; then
+        current_user="($current_uid)"
+    fi
 
     [ "$result" = "$current_user" ]
 }
 
 @test "create_temp_file and cleanup_temp_files work efficiently" {
-    local start end elapsed
-    local limit_ms="${MOLE_PERF_CREATE_TEMP_FILE_LIMIT_MS:-3000}"
-
-    declare -a MOLE_TEMP_DIRS=()
-
-    start=$(date +%s%N)
-    for i in {1..50}; do
-        create_temp_file > /dev/null
-    done
-    end=$(date +%s%N)
-
-    elapsed=$(( (end - start) / 1000000 ))
-
-    [ "$elapsed" -lt "$limit_ms" ]
-
-    [ "${#MOLE_TEMP_FILES[@]}" -eq 50 ]
-
-    start=$(date +%s%N)
-    cleanup_temp_files
-    end=$(date +%s%N)
-
-    elapsed=$(( (end - start) / 1000000 ))
-    [ "$elapsed" -lt "$limit_ms" ]
-
-    [ "${#MOLE_TEMP_FILES[@]}" -eq 0 ]
+    # Measure the production helper without Bats DEBUG tracing or application
+    # test-context traversal. env -i inherits the runner's kernel confinement,
+    # private HOME/TMPDIR, and denial PATH; it cannot acquire extra access.
+    _mole_test_guard_mutation_path "${TMPDIR%/}/benchmark-fixture" || return 1
+    run env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR%/}" USER="$USER" \
+        PROJECT_ROOT="$PROJECT_ROOT" LIMIT_MS="${MOLE_PERF_CREATE_TEMP_FILE_LIMIT_MS:-3000}" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/base.sh"
+start=$(date +%s%N)
+for i in {1..50}; do
+    create_temp_file > /dev/null
+done
+end=$(date +%s%N)
+elapsed=$(((end - start) / 1000000))
+printf 'CREATE_TEMP_ELAPSED_MS=%s LIMIT_MS=%s\n' "$elapsed" "$LIMIT_MS"
+[[ "$elapsed" -lt "$LIMIT_MS" ]] || exit 1
+[[ "${#MOLE_TEMP_FILES[@]}" == 50 ]] || exit 1
+created_files=("${MOLE_TEMP_FILES[@]}")
+for file in "${created_files[@]}"; do
+    [[ -f "$file" && "$file" == "$TMPDIR/"* ]] || exit 1
+done
+start=$(date +%s%N)
+cleanup_temp_files
+end=$(date +%s%N)
+elapsed=$(((end - start) / 1000000))
+printf 'CLEAN_TEMP_ELAPSED_MS=%s LIMIT_MS=%s\n' "$elapsed" "$LIMIT_MS"
+[[ "$elapsed" -lt "$LIMIT_MS" ]] || exit 1
+[[ "${#MOLE_TEMP_FILES[@]}" == 0 ]] || exit 1
+for file in "${created_files[@]}"; do
+    [[ ! -e "$file" ]] || exit 1
+done
+EOF
+    printf '%s\n' "$output" >&3
+    [[ "$status" == 0 ]] || return 1
 }
 
 @test "mktemp_file creates files with correct prefix" {

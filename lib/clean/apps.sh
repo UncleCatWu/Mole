@@ -45,9 +45,19 @@ clean_ds_store_tree() {
 
     local delete_rc=0
     while IFS= read -r -d '' ds_file; do
+        if ! _mole_snapshot_path_identity "$ds_file"; then
+            continue
+        fi
+        local ds_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+        local ds_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+        local ds_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
         local size
         size=$(get_file_size "$ds_file")
         if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+            if ! _mole_path_matches_identity \
+                "$ds_file" "$ds_parent" "$ds_parent_id" "$ds_target_id"; then
+                continue
+            fi
             local preview_size_kb=$(((size + 1023) / 1024))
             local preview_rc=0
             record_dry_run_cleanup_target "$ds_file" "$preview_size_kb" 1 true || preview_rc=$?
@@ -60,7 +70,9 @@ clean_ds_store_tree() {
         fi
         if [[ "$DRY_RUN" != "true" ]]; then
             local remove_rc=0
-            safe_remove "$ds_file" true 2> /dev/null || remove_rc=$?
+            safe_remove "$ds_file" true "" "" \
+                "$ds_parent" "$ds_parent_id" "$ds_target_id" \
+                2> /dev/null || remove_rc=$?
             if [[ $remove_rc -eq 124 || $remove_rc -ge 128 ]]; then
                 delete_rc=$remove_rc
                 break
@@ -484,10 +496,11 @@ is_bundle_orphaned() {
             # the piped form yielded empty output and was cached as "not
             # installed", so a transient Spotlight stall marked a live app as
             # an orphan and deleted its data. On timeout/error, keep the app
-            # and do not poison the cache.
+            # and do not poison the cache. Returning 124 here used to cancel
+            # the rest of `mo clean` (#1584). A signal still cancels.
             local app_exists _mdfind_rc=0
             app_exists=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$bundle_id'" 2> /dev/null) || _mdfind_rc=$?
-            if [[ $_mdfind_rc -eq 124 || $_mdfind_rc -ge 128 ]]; then
+            if [[ $_mdfind_rc -ge 128 ]]; then
                 return "$_mdfind_rc"
             elif [[ $_mdfind_rc -ne 0 ]]; then
                 return 1
@@ -539,7 +552,7 @@ is_claude_vm_bundle_orphaned() {
         # On mdfind timeout/error keep the app (see is_bundle_orphaned).
         local app_exists _mdfind_rc=0
         app_exists=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$claude_bundle_id'" 2> /dev/null) || _mdfind_rc=$?
-        if [[ $_mdfind_rc -eq 124 || $_mdfind_rc -ge 128 ]]; then
+        if [[ $_mdfind_rc -ge 128 ]]; then
             return "$_mdfind_rc"
         elif [[ $_mdfind_rc -ne 0 ]]; then
             return 1
@@ -679,69 +692,71 @@ clean_orphaned_app_data() {
         run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" find "$claude_support_dir" \
             -maxdepth 3 -name "*.bundle" -type d -print0 \
             > "$claude_scan_file" 2> /dev/null || claude_scan_rc=$?
-        if [[ $claude_scan_rc -ne 0 ]]; then
+        if [[ $claude_scan_rc -ge 128 ]]; then
             rm -f -- "$claude_scan_file" 2> /dev/null || true  # SAFE: exact tracked temp file created above
             rm -f -- "$installed_bundles" 2> /dev/null || true # SAFE: exact tracked temp file created above
             return "$claude_scan_rc"
         fi
         local claude_result_rc=0
-        while IFS= read -r -d '' claude_vm_bundle; do
-            local claude_orphan_rc=0
-            is_claude_vm_bundle_orphaned \
-                "$claude_vm_bundle" "$installed_bundles" || claude_orphan_rc=$?
-            if [[ $claude_orphan_rc -eq 124 || $claude_orphan_rc -ge 128 ]]; then
-                claude_result_rc=$claude_orphan_rc
-                break
-            elif [[ $claude_orphan_rc -eq 0 ]]; then
-                if is_path_whitelisted "$claude_vm_bundle"; then
-                    debug_log "Skipping whitelisted orphan: $claude_vm_bundle"
-                    continue
-                fi
-                local _ORPHAN_CANDIDATE_IDENTITY=""
-                local _ORPHAN_CANDIDATE_PARENT=""
-                local _ORPHAN_CANDIDATE_PARENT_ID=""
-                local _ORPHAN_CANDIDATE_TARGET_ID=""
-                local claude_vm_snapshot_rc=0
-                orphan_cleanup_candidate_snapshot \
-                    "$claude_vm_bundle" || claude_vm_snapshot_rc=$?
-                if [[ $claude_vm_snapshot_rc -eq 124 || $claude_vm_snapshot_rc -ge 128 ]]; then
-                    claude_result_rc=$claude_vm_snapshot_rc
+        if [[ $claude_scan_rc -eq 0 ]]; then
+            while IFS= read -r -d '' claude_vm_bundle; do
+                local claude_orphan_rc=0
+                is_claude_vm_bundle_orphaned \
+                    "$claude_vm_bundle" "$installed_bundles" || claude_orphan_rc=$?
+                if [[ $claude_orphan_rc -ge 128 ]]; then
+                    claude_result_rc=$claude_orphan_rc
                     break
-                elif [[ $claude_vm_snapshot_rc -ne 0 || -z "$_ORPHAN_CANDIDATE_IDENTITY" ]]; then
-                    continue
-                fi
-                local claude_vm_identity="$_ORPHAN_CANDIDATE_IDENTITY"
-                local claude_vm_parent="$_ORPHAN_CANDIDATE_PARENT"
-                local claude_vm_parent_id="$_ORPHAN_CANDIDATE_PARENT_ID"
-                local claude_vm_target_id="$_ORPHAN_CANDIDATE_TARGET_ID"
-                local claude_vm_size_kb
-                local claude_vm_size_rc=0
-                claude_vm_size_kb=$(get_path_size_kb "$claude_vm_bundle") || claude_vm_size_rc=$?
-                if [[ $claude_vm_size_rc -eq 124 || $claude_vm_size_rc -ge 128 ]]; then
-                    claude_result_rc=$claude_vm_size_rc
-                    break
-                fi
-                if [[ -n "$claude_vm_size_kb" && "$claude_vm_size_kb" != "0" ]]; then
-                    local _ORPHAN_CLEANUP_EXPECTED_IDENTITY="$claude_vm_identity"
-                    local _ORPHAN_CLEANUP_EXPECTED_PARENT="$claude_vm_parent"
-                    local _ORPHAN_CLEANUP_EXPECTED_PARENT_ID="$claude_vm_parent_id"
-                    local _ORPHAN_CLEANUP_EXPECTED_TARGET_ID="$claude_vm_target_id"
-                    local _ORPHAN_CLEANUP_BUNDLE_ID="com.anthropic.claudefordesktop"
-                    local _ORPHAN_CLEANUP_KIND="claude"
-                    local claude_clean_rc=0
-                    safe_clean_guarded orphan_cleanup_candidate_still_eligible \
-                        "$claude_vm_bundle" \
-                        "Orphaned Claude workspace VM" || claude_clean_rc=$?
-                    if [[ $claude_clean_rc -eq 124 || $claude_clean_rc -ge 128 ]]; then
-                        claude_result_rc=$claude_clean_rc
+                elif [[ $claude_orphan_rc -eq 0 ]]; then
+                    if is_path_whitelisted "$claude_vm_bundle"; then
+                        debug_log "Skipping whitelisted orphan: $claude_vm_bundle"
+                        continue
+                    fi
+                    local _ORPHAN_CANDIDATE_IDENTITY=""
+                    local _ORPHAN_CANDIDATE_PARENT=""
+                    local _ORPHAN_CANDIDATE_PARENT_ID=""
+                    local _ORPHAN_CANDIDATE_TARGET_ID=""
+                    local claude_vm_snapshot_rc=0
+                    orphan_cleanup_candidate_snapshot \
+                        "$claude_vm_bundle" || claude_vm_snapshot_rc=$?
+                    if [[ $claude_vm_snapshot_rc -ge 128 ]]; then
+                        claude_result_rc=$claude_vm_snapshot_rc
                         break
-                    elif [[ $claude_clean_rc -eq 0 ]]; then
-                        orphaned_count=$((orphaned_count + 1))
-                        total_orphaned_kb=$((total_orphaned_kb + claude_vm_size_kb))
+                    elif [[ $claude_vm_snapshot_rc -ne 0 || -z "$_ORPHAN_CANDIDATE_IDENTITY" ]]; then
+                        continue
+                    fi
+                    local claude_vm_identity="$_ORPHAN_CANDIDATE_IDENTITY"
+                    local claude_vm_parent="$_ORPHAN_CANDIDATE_PARENT"
+                    local claude_vm_parent_id="$_ORPHAN_CANDIDATE_PARENT_ID"
+                    local claude_vm_target_id="$_ORPHAN_CANDIDATE_TARGET_ID"
+                    local claude_vm_size_kb
+                    local claude_vm_size_rc=0
+                    claude_vm_size_kb=$(get_path_size_kb "$claude_vm_bundle") || claude_vm_size_rc=$?
+                    if [[ $claude_vm_size_rc -ge 128 ]]; then
+                        claude_result_rc=$claude_vm_size_rc
+                        break
+                    fi
+                    if [[ -n "$claude_vm_size_kb" && "$claude_vm_size_kb" != "0" ]]; then
+                        local _ORPHAN_CLEANUP_EXPECTED_IDENTITY="$claude_vm_identity"
+                        local _ORPHAN_CLEANUP_EXPECTED_PARENT="$claude_vm_parent"
+                        local _ORPHAN_CLEANUP_EXPECTED_PARENT_ID="$claude_vm_parent_id"
+                        local _ORPHAN_CLEANUP_EXPECTED_TARGET_ID="$claude_vm_target_id"
+                        local _ORPHAN_CLEANUP_BUNDLE_ID="com.anthropic.claudefordesktop"
+                        local _ORPHAN_CLEANUP_KIND="claude"
+                        local claude_clean_rc=0
+                        safe_clean_guarded orphan_cleanup_candidate_still_eligible \
+                            "$claude_vm_bundle" \
+                            "Orphaned Claude workspace VM" || claude_clean_rc=$?
+                        if [[ $claude_clean_rc -eq 124 || $claude_clean_rc -ge 128 ]]; then
+                            claude_result_rc=$claude_clean_rc
+                            break
+                        elif [[ $claude_clean_rc -eq 0 ]]; then
+                            orphaned_count=$((orphaned_count + 1))
+                            total_orphaned_kb=$((total_orphaned_kb + claude_vm_size_kb))
+                        fi
                     fi
                 fi
-            fi
-        done < "$claude_scan_file"
+            done < "$claude_scan_file"
+        fi
         rm -f -- "$claude_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
         if [[ $claude_result_rc -ne 0 ]]; then
             rm -f -- "$installed_bundles" 2> /dev/null || true # SAFE: exact tracked temp file created above
@@ -798,7 +813,7 @@ clean_orphaned_app_data() {
                     bundle_id="${bundle_id%.plist}"
                     local orphan_rc=0
                     is_bundle_orphaned "$bundle_id" "$match" "$installed_bundles" || orphan_rc=$?
-                    if [[ $orphan_rc -eq 124 || $orphan_rc -ge 128 ]]; then
+                    if [[ $orphan_rc -ge 128 ]]; then
                         rm -f -- "$installed_bundles" 2> /dev/null || true # SAFE: exact tracked temp file created above
                         return "$orphan_rc"
                     elif [[ $orphan_rc -eq 0 ]]; then
@@ -813,7 +828,7 @@ clean_orphaned_app_data() {
                         local candidate_snapshot_rc=0
                         orphan_cleanup_candidate_snapshot \
                             "$match" || candidate_snapshot_rc=$?
-                        if [[ $candidate_snapshot_rc -eq 124 || $candidate_snapshot_rc -ge 128 ]]; then
+                        if [[ $candidate_snapshot_rc -ge 128 ]]; then
                             rm -f -- "$installed_bundles" 2> /dev/null || true # SAFE: exact tracked temp file created above
                             return "$candidate_snapshot_rc"
                         elif [[ $candidate_snapshot_rc -ne 0 || -z "$_ORPHAN_CANDIDATE_IDENTITY" ]]; then
@@ -826,7 +841,7 @@ clean_orphaned_app_data() {
                         local size_kb
                         local size_rc=0
                         size_kb=$(get_path_size_kb "$match") || size_rc=$?
-                        if [[ $size_rc -eq 124 || $size_rc -ge 128 ]]; then
+                        if [[ $size_rc -ge 128 ]]; then
                             rm -f -- "$installed_bundles" 2> /dev/null || true # SAFE: exact tracked temp file created above
                             return "$size_rc"
                         fi
@@ -1901,7 +1916,7 @@ _container_stub_app_exists() {
             # live app's service/container as an orphan; do not cache.
             local app_found _mdfind_rc=0
             app_found=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$bundle_id'" 2> /dev/null) || _mdfind_rc=$?
-            if [[ $_mdfind_rc -eq 124 || $_mdfind_rc -ge 128 ]]; then
+            if [[ $_mdfind_rc -ge 128 ]]; then
                 return "$_mdfind_rc"
             elif [[ $_mdfind_rc -ne 0 ]]; then
                 return 0

@@ -1397,14 +1397,26 @@ opt_shared_file_list_repair() {
         optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
         return 0
     fi
+    local scan_stderr=""
+    if ! scan_stderr=$(mktemp_file "optimize-shared-file-lists-errors"); then
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to prepare shared file list diagnostics"
+        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+        return 0
+    fi
     local scan_rc=0
     run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" find "$sfl_dir" \
         \( -name "*.sfl2" -o -name "*.sfl3" \) -type f \
         ! -path "*ApplicationRecentDocuments*" -print0 \
-        > "$scan_file" 2> /dev/null || scan_rc=$?
+        > "$scan_file" 2> "$scan_stderr" || scan_rc=$?
     if [[ $scan_rc -ne 0 ]]; then
         : > "$scan_file" || true
         [[ $scan_rc -eq 124 || $scan_rc -ge 128 ]] && return "$scan_rc"
+        if LC_ALL=C command grep -qE 'Operation not permitted|Permission denied' "$scan_stderr"; then
+            local display_dir="~${sfl_dir#"$HOME"}"
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Shared file lists skipped (access denied; files kept): $display_dir"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_SKIPPED"
+            return 0
+        fi
         echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to scan shared file lists"
         scan_failed=1
     fi
@@ -1699,11 +1711,16 @@ _login_item_name_matches() {
     [[ -z "$actual" ]] && return 1
 
     local actual_nospace="${actual// /}"
-    [[ "$actual" == "$expected" ]] && return 0
-    [[ "$actual_nospace" == "$expected_nospace" ]] && return 0
-    [[ -n "$expected_stripped" && "$actual_nospace" == "$expected_stripped" ]] && return 0
-
-    return 1
+    local nocasematch_state
+    nocasematch_state=$(shopt -p nocasematch || true)
+    shopt -s nocasematch
+    local matched=false
+    if [[ "$actual" == "$expected" || "$actual_nospace" == "$expected_nospace" ||
+        (-n "$expected_stripped" && "$actual_nospace" == "$expected_stripped") ]]; then
+        matched=true
+    fi
+    eval "$nocasematch_state"
+    [[ "$matched" == "true" ]]
 }
 
 _login_item_build_metadata_inventory() {
@@ -1904,6 +1921,10 @@ _login_item_app_exists() {
             ! IFS= read -r -d '' executable; then
             record_complete=false
             break
+        fi
+        if [[ ! -e "$app_path" && ! -L "$app_path" ]]; then
+            probe_uncertain=true
+            continue
         fi
         app_basename="${app_path##*/}"
         app_basename="${app_basename%.[aA][pP][pP]}"

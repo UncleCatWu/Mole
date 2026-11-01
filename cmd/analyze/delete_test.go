@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -11,7 +12,7 @@ import (
 )
 
 func TestTrashPathWithProgress(t *testing.T) {
-	skipIfFinderUnavailable(t)
+	useFixtureTrash(t)
 
 	parent := t.TempDir()
 	target := filepath.Join(parent, "target")
@@ -46,7 +47,7 @@ func TestTrashPathWithProgress(t *testing.T) {
 }
 
 func TestDeleteMultiplePathsCmdHandlesParentChild(t *testing.T) {
-	skipIfFinderUnavailable(t)
+	useFixtureTrash(t)
 
 	base := t.TempDir()
 	parent := filepath.Join(base, "parent")
@@ -564,6 +565,7 @@ func TestValidatePathWithChineseAndSpecialChars(t *testing.T) {
 // trashTimeout and then failed. trash(8) needs no Finder, so it must be tried
 // first and must actually move the file.
 func TestMoveToTrashViaBinaryMovesFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	if _, err := os.Stat(trashBinary); err != nil {
 		t.Skipf("%s not present on this macOS version", trashBinary)
 	}
@@ -587,6 +589,24 @@ func TestMoveToTrashViaBinaryMovesFile(t *testing.T) {
 		t.Fatalf("failed to resolve user home: %v", err)
 	}
 	trashCopy := filepath.Join(home, ".Trash", filepath.Base(target))
+	// Apple trash(8) consults the account's actual home on some systems,
+	// regardless of HOME. Use a positive fixture mover rather than that binary.
+	if err := os.MkdirAll(filepath.Dir(trashCopy), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	originalRunner := trashBinaryRunner
+	t.Cleanup(func() { trashBinaryRunner = originalRunner })
+	called := false
+	trashBinaryRunner = func(ctx context.Context, path string) ([]byte, error) {
+		called = true
+		if path != target || !filepath.IsAbs(path) {
+			t.Fatalf("unexpected Trash argument: %q", path)
+		}
+		if _, bounded := ctx.Deadline(); !bounded {
+			t.Fatal("Trash command has no deadline")
+		}
+		return nil, os.Rename(path, trashCopy)
+	}
 	if _, err := os.Lstat(trashCopy); !os.IsNotExist(err) {
 		t.Fatalf("refusing Trash probe basename collision at %s", trashCopy)
 	}
@@ -596,6 +616,9 @@ func TestMoveToTrashViaBinaryMovesFile(t *testing.T) {
 
 	if err := moveToTrashViaBinary(target); err != nil {
 		t.Fatalf("moveToTrashViaBinary failed: %v", err)
+	}
+	if !called {
+		t.Fatal("positive control: fixture Trash runner was not invoked")
 	}
 
 	if _, err := os.Lstat(target); !os.IsNotExist(err) {

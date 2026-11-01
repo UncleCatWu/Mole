@@ -4,6 +4,11 @@
 
 set -euo pipefail
 
+_MOLE_BASE_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/core/test_boundary.sh
+source "$_MOLE_BASE_SOURCE_DIR/test_boundary.sh"
+_mole_test_require_context || return $?
+
 # Prevent multiple sourcing
 if [[ -n "${MOLE_BASE_LOADED:-}" ]]; then
     return 0
@@ -657,6 +662,8 @@ ensure_user_dir() {
         target_path="${target_path/#\~/$HOME}"
     fi
 
+    _mole_test_guard_mutation_path "$target_path" || return $?
+
     mkdir -p "$target_path" 2> /dev/null || true
 
     if ! is_root_user; then
@@ -724,7 +731,8 @@ ensure_user_file() {
         target_path="${target_path/#\~/$HOME}"
     fi
 
-    ensure_user_dir "$(dirname "$target_path")"
+    _mole_test_guard_mutation_path "$target_path" || return $?
+    ensure_user_dir "$(dirname "$target_path")" || return $?
     touch "$target_path" 2> /dev/null || true
 
     if ! is_root_user; then
@@ -931,6 +939,7 @@ probe_temp_root() {
     local probe=""
 
     path=$(normalize_temp_root "$raw_path") || return 1
+    _mole_test_guard_mutation_path "$path/.mole-probe" || return $?
 
     if [[ "$allow_create" == "true" ]]; then
         ensure_user_dir "$path"
@@ -952,6 +961,8 @@ prune_stale_mole_temp_files() {
     local root="${1:-}"
     local invoking_home=""
     local max_age_minutes="${MOLE_TEMP_STALE_MINUTES:-1440}"
+
+    _mole_test_guard_mutation_path "$root/.mole-prune" || return $?
 
     [[ "$max_age_minutes" =~ ^[0-9]+$ ]] || max_age_minutes=1440
     [[ -n "$root" && -d "$root" && ! -L "$root" ]] || return 0
@@ -1003,6 +1014,7 @@ initialize_mole_temp_registry_path() {
 
 ensure_mole_temp_registry_file() {
     initialize_mole_temp_registry_path || return 1
+    _mole_test_guard_mutation_path "$MOLE_TEMP_REGISTRY_FILE" || return $?
 
     case "$MOLE_TEMP_REGISTRY_FILE" in
         "${MOLE_RESOLVED_TMPDIR%/}"/mole.registry.*) ;;
@@ -1017,6 +1029,10 @@ ensure_mole_temp_registry_file() {
 }
 
 ensure_mole_temp_root() {
+    _mole_test_require_context || return $?
+    if [[ -n "${MOLE_RESOLVED_TMPDIR:-}" ]]; then
+        _mole_test_guard_mutation_path "$MOLE_RESOLVED_TMPDIR/.mole-probe" || return $?
+    fi
     if is_root_user; then
         # Whole-command sudo must not reuse TMPDIR or the invoking user's cache
         # for root-written registries and command output. Keep all root temp
@@ -1027,6 +1043,7 @@ ensure_mole_temp_root() {
         [[ -d "$root_home" && ! -L "$root_home" && -O "$root_home" ]] || return 1
 
         local root_temp="$root_home/.cache/mole/tmp"
+        _mole_test_guard_mutation_path "$root_temp" || return $?
         mkdir -p "$root_temp" 2> /dev/null || return 1
         chmod 700 "$root_home/.cache" "$root_home/.cache/mole" "$root_temp" 2> /dev/null || true
         root_temp=$(cd -P "$root_temp" 2> /dev/null && pwd) || return 1
@@ -1068,6 +1085,7 @@ ensure_mole_temp_root() {
     fi
 
     [[ -n "$resolved" ]] || resolved="/tmp"
+    _mole_test_guard_mutation_path "$resolved/.mole-probe" || return $?
     MOLE_RESOLVED_TMPDIR="$resolved"
     export MOLE_RESOLVED_TMPDIR
     initialize_mole_temp_registry_path || true
@@ -1075,21 +1093,21 @@ ensure_mole_temp_root() {
 }
 
 prepare_mole_tmpdir() {
-    ensure_mole_temp_root
+    ensure_mole_temp_root || return $?
     export TMPDIR="$MOLE_RESOLVED_TMPDIR"
     printf '%s\n' "$MOLE_RESOLVED_TMPDIR"
 }
 
 mole_temp_path_template() {
     local prefix="${1:-mole}"
-    ensure_mole_temp_root
+    ensure_mole_temp_root || return $?
     printf '%s/%s.XXXXXX\n' "$MOLE_RESOLVED_TMPDIR" "$prefix"
 }
 
 # Create tracked temporary file
 create_temp_file() {
     local temp
-    ensure_mole_temp_root
+    ensure_mole_temp_root || return $?
     temp=$(mktemp "$MOLE_RESOLVED_TMPDIR/mole.XXXXXX") || return 1
     register_temp_file "$temp"
     echo "$temp"
@@ -1098,7 +1116,7 @@ create_temp_file() {
 # Create tracked temporary directory
 create_temp_dir() {
     local temp
-    ensure_mole_temp_root
+    ensure_mole_temp_root || return $?
     temp=$(mktemp -d "$MOLE_RESOLVED_TMPDIR/mole.XXXXXX") || return 1
     register_temp_dir "$temp"
     echo "$temp"
@@ -1144,12 +1162,14 @@ cleanup_temp_files() {
     local file
     if [[ ${#MOLE_TEMP_FILES[@]} -gt 0 ]]; then
         for file in "${MOLE_TEMP_FILES[@]}"; do
+            _mole_test_guard_mutation_path "$file" || return $?
             [[ -f "$file" ]] && rm -f "$file" 2> /dev/null || true
         done
     fi
 
     if [[ ${#MOLE_TEMP_DIRS[@]} -gt 0 ]]; then
         for file in "${MOLE_TEMP_DIRS[@]}"; do
+            _mole_test_guard_mutation_path "$file" || return $?
             [[ -d "$file" ]] && rm -rf "$file" 2> /dev/null || true # SAFE: cleanup_temp_files
         done
     fi
@@ -1163,6 +1183,7 @@ cleanup_temp_files() {
             [[ -n "$registered_path" ]] || continue
             [[ "$registered_path" == "${MOLE_RESOLVED_TMPDIR%/}/"* ]] || continue
             [[ ! "$registered_path" =~ (^|/)\.\.(\/|$) ]] || continue
+            _mole_test_guard_mutation_path "$registered_path" || return $?
 
             if [[ -d "$registered_path" && ! -L "$registered_path" ]]; then
                 rm -rf "$registered_path" 2> /dev/null || true # SAFE: mktemp dir registered under resolved Mole temp root

@@ -5,6 +5,13 @@
 
 set -euo pipefail
 
+# User state and installed tools must never run with inherited root privileges.
+# Individual maintenance operations request administrator access themselves.
+if [[ "$EUID" -eq 0 ]]; then
+    printf '%s\n' 'Run Mole without sudo; it requests administrator access when needed.' >&2
+    exit 1
+fi
+
 export LC_ALL=C
 export LANG=C
 
@@ -138,7 +145,6 @@ PROJECT_ARTIFACT_HINT_ESTIMATE_PARTIAL=false
 declare -a DRY_RUN_SEEN_IDENTITIES=()
 DRY_RUN_TOTAL_PARTIAL=false
 declare -a DEFERRED_CLEANUP_FAMILIES=()
-DEFERRED_CLEANUP_FAMILIES_FILE=""
 
 # shellcheck disable=SC2329
 note_activity() {
@@ -163,26 +169,7 @@ defer_cleanup_family() {
     fi
 
     DEFERRED_CLEANUP_FAMILIES+=("$family")
-    if [[ -n "${DEFERRED_CLEANUP_FAMILIES_FILE:-}" &&
-        -f "$DEFERRED_CLEANUP_FAMILIES_FILE" &&
-        ! -L "$DEFERRED_CLEANUP_FAMILIES_FILE" ]]; then
-        printf '%s\0' "$family" >> "$DEFERRED_CLEANUP_FAMILIES_FILE"
-    fi
     debug_log "Deferred cleanup while active: $family"
-}
-
-# Replay file-backed deferred-family records before rendering the summary.
-# defer_cleanup_family writes through DEFERRED_CLEANUP_FAMILIES_FILE when set.
-sync_deferred_cleanup_families() {
-    local record_file="${DEFERRED_CLEANUP_FAMILIES_FILE:-}"
-    local family
-    [[ -n "$record_file" && -f "$record_file" && ! -L "$record_file" ]] || return 0
-
-    DEFERRED_CLEANUP_FAMILIES_FILE=""
-    while IFS= read -r -d '' family; do
-        defer_cleanup_family "$family"
-    done < "$record_file"
-    DEFERRED_CLEANUP_FAMILIES_FILE="$record_file"
 }
 
 format_deferred_cleanup_families() {
@@ -215,6 +202,18 @@ register_dry_run_cleanup_target() {
     return 0
 }
 
+# Optional, caller-scoped identity guard at the final preview admission.
+_mole_check_dry_run_final_guard() {
+    local guard="${_MOLE_DRY_RUN_FINAL_GUARD:-}" guard_rc=0
+    [[ -n "$guard" ]] || return 0
+    declare -f "$guard" > /dev/null 2>&1 || return 2
+    "$guard" "$1" || guard_rc=$?
+    if [[ $guard_rc -ne 0 ]]; then
+        _mole_record_clean_cancellation "$guard_rc"
+        return "$guard_rc"
+    fi
+}
+
 # Append one candidate to the dry-run ledger. Final rendering deduplicates the
 # shared file, so timeout subprocess paths survive without an O(n²) hot loop.
 # Fields are NUL-delimited to preserve whitespace in paths.
@@ -234,6 +233,7 @@ append_dry_run_cleanup_target() {
     [[ "$item_count" =~ ^[0-9]+$ && "$item_count" -gt 0 ]] || item_count=1
     [[ "$size_known" == "true" || "$size_known" == "false" ]] || size_known=false
 
+    _mole_check_dry_run_final_guard "$path" || return $?
     if [[ -n "${CLEAN_PREVIEW_LEDGER_FILE:-}" && -f "$CLEAN_PREVIEW_LEDGER_FILE" && ! -L "$CLEAN_PREVIEW_LEDGER_FILE" ]]; then
         printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
             "$identity" "$size_kb" "$item_count" "$size_known" "${CURRENT_SECTION:-Uncategorized}" "$path" \
@@ -245,6 +245,7 @@ append_dry_run_cleanup_target() {
     # start_cleanup has not prepared the full ledger.
     if [[ -n "${EXPORT_LIST_FILE:-}" ]]; then
         ensure_user_file "$EXPORT_LIST_FILE"
+        _mole_check_dry_run_final_guard "$path" || return $?
         if [[ "$size_known" == "true" ]]; then
             echo "$path  # $(bytes_to_human "$((size_kb * 1024))")" >> "$EXPORT_LIST_FILE"
         else
@@ -299,6 +300,7 @@ record_dry_run_cleanup_target() {
         fi
     fi
 
+    _mole_check_dry_run_final_guard "$path" || return $?
     if [[ -z "${CLEAN_PREVIEW_LEDGER_FILE:-}" || ! -f "$CLEAN_PREVIEW_LEDGER_FILE" ]]; then
         register_dry_run_cleanup_target "$path" || return 1
     fi
@@ -419,7 +421,7 @@ render_clean_preview_from_ledger() {
     total_size_cleaned=$known_size_kb
     files_cleaned=$rendered_items
     total_items=$rendered_categories
-    if [[ "$unknown_size_count" -gt 0 ]]; then
+    if [[ "$unknown_size_count" -gt 0 || "${_MOLE_CLEAN_INVENTORY_PARTIAL:-false}" == "true" ]]; then
         DRY_RUN_TOTAL_PARTIAL=true
     else
         DRY_RUN_TOTAL_PARTIAL=false
@@ -1455,6 +1457,7 @@ start_cleanup() {
     MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS=""
     export MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS
     _MOLE_CLEAN_SECTION_DEADLINE=""
+    _MOLE_CLEAN_INVENTORY_PARTIAL=false
     log_operation_session_start "clean"
     DRY_RUN_SEEN_IDENTITIES=()
     DRY_RUN_TOTAL_PARTIAL=false
@@ -1654,7 +1657,6 @@ perform_cleanup() {
     files_cleaned=0
     total_size_cleaned=0
     DEFERRED_CLEANUP_FAMILIES=()
-    DEFERRED_CLEANUP_FAMILIES_FILE=$(create_temp_file 2> /dev/null || true)
 
     local had_errexit=0
     [[ $- == *e* ]] && had_errexit=1
@@ -1825,8 +1827,6 @@ perform_cleanup() {
         render_clean_preview_from_ledger
     fi
 
-    sync_deferred_cleanup_families
-
     local summary_heading=""
     local summary_status="success"
     if [[ $cleanup_cancel_rc -eq 124 ]]; then
@@ -1888,8 +1888,8 @@ perform_cleanup() {
         printf 'Free space: %s%s\n' "$(format_free_space_kb "$final_kb")" "$delta_note"
     }
 
-    if [[ $total_size_cleaned -gt 0 ||
-        ("$DRY_RUN" == "true" && ("$DRY_RUN_TOTAL_PARTIAL" == "true" || $files_cleaned -gt 0)) ]]; then
+    if [[ $total_size_cleaned -gt 0 || $files_cleaned -gt 0 ||
+        ("$DRY_RUN" == "true" && "$DRY_RUN_TOTAL_PARTIAL" == "true") ]]; then
         local freed_size_human
         freed_size_human=$(bytes_to_human_kb "$total_size_cleaned")
 
@@ -1916,31 +1916,23 @@ perform_cleanup() {
             } >> "$EXPORT_LIST_FILE"
 
         else
-            local summary_line="Tracked cleanup: ${GREEN}${freed_size_human}${NC}"
-
-            if [[ $files_cleaned -gt 0 && $total_items -gt 0 ]]; then
-                summary_line+=" | Items cleaned: $files_cleaned | Categories: $total_items"
-            elif [[ $files_cleaned -gt 0 ]]; then
-                summary_line+=" | Items cleaned: $files_cleaned"
-            elif [[ $total_items -gt 0 ]]; then
-                summary_line+=" | Categories: $total_items"
-            fi
-
-            summary_details+=("$summary_line")
-
-            # Movie comparison only if >= 1GB
-            if ((total_size_cleaned >= MOLE_ONE_GIB_KB)); then
-                local freed_gb=$((total_size_cleaned / MOLE_ONE_GIB_KB))
-                local movies=$((freed_gb * 10 / 45))
-
-                if [[ $movies -gt 0 ]]; then
-                    if [[ $movies -eq 1 ]]; then
-                        summary_details+=("Equivalent to ~$movies 4K movie of storage.")
-                    else
-                        summary_details+=("Equivalent to ~$movies 4K movies of storage.")
-                    fi
+            if [[ ${MOLE_CLEAN_SIZING_TIMEOUTS:-0} -gt 0 ]]; then
+                if [[ $total_size_cleaned -gt 0 ]]; then
+                    freed_size_human="At least $freed_size_human"
+                else
+                    freed_size_human="Partially measured"
                 fi
             fi
+            local summary_line="Tracked cleanup: ${GREEN}${freed_size_human}${NC}"
+
+            if [[ $files_cleaned -gt 0 ]]; then
+                summary_line+=" | Items cleaned: $files_cleaned"
+            fi
+
+            if [[ "${_MOLE_CLEAN_INVENTORY_PARTIAL:-false}" == "true" ]]; then
+                summary_line+=" | Scan incomplete"
+            fi
+            summary_details+=("$summary_line")
 
             local free_space_line
             while IFS= read -r free_space_line; do
@@ -1948,17 +1940,21 @@ perform_cleanup() {
             done < <(emit_free_space_summary "$initial_free_space_kb")
         fi
     else
-        summary_status="info"
-        if [[ ${#DEFERRED_CLEANUP_FAMILIES[@]} -gt 0 ]]; then
-            if [[ "$DRY_RUN" == "true" ]]; then
-                summary_details+=("No additional reclaimable space detected.")
+        if [[ $cleanup_cancel_rc -eq 0 ]]; then
+            summary_status="info"
+            if [[ ${#DEFERRED_CLEANUP_FAMILIES[@]} -gt 0 || ${MOLE_CLEAN_REMOVAL_TIMEOUTS:-0} -gt 0 ]]; then
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    summary_details+=("No additional reclaimable space detected.")
+                else
+                    summary_details+=("No additional space freed.")
+                fi
+            elif [[ "${_MOLE_CLEAN_INVENTORY_PARTIAL:-false}" == "true" ]]; then
+                summary_details+=("Cleanup scan incomplete; no additional space freed.")
+            elif [[ "$DRY_RUN" == "true" ]]; then
+                summary_details+=("No significant reclaimable space detected, system already clean.")
             else
-                summary_details+=("No additional space freed.")
+                summary_details+=("System was already clean; no additional space freed.")
             fi
-        elif [[ "$DRY_RUN" == "true" ]]; then
-            summary_details+=("No significant reclaimable space detected, system already clean.")
-        else
-            summary_details+=("System was already clean; no additional space freed.")
         fi
         local free_space_line
         while IFS= read -r free_space_line; do
@@ -1987,13 +1983,12 @@ perform_cleanup() {
     fi
 
     if [[ ${MOLE_CLEAN_SIZING_TIMEOUTS:-0} -gt 0 ]]; then
-        summary_details+=("${GRAY}${ICON_WARNING}${NC} Some items exceeded the ${MOLE_TIMEOUT_DISK_VERIFY_SEC}s size-check budget and were counted as 0, so the total is under-reported. Raise ${GRAY}MOLE_TIMEOUT_DISK_VERIFY_SEC${NC} to measure them.")
+        debug_log "Some items exceeded the ${MOLE_TIMEOUT_DISK_VERIFY_SEC}s size-check budget; the tracked total is partially measured."
     fi
 
-    if [[ ${MOLE_CLEAN_REMOVAL_TIMEOUTS:-0} -gt 0 ]]; then
-        # Name the timed-out paths so the note is actionable without opening
-        # the operation log. Cap the list: a pathological disk can time out on
-        # many items and the note must stay one line.
+    if [[ ${MOLE_CLEAN_REMOVAL_TIMEOUTS:-0} -gt 0 && "${MO_DEBUG:-}" == "1" ]]; then
+        # Per-item timeouts belong in diagnostics; the operation log retains
+        # every failed path. Keep the debug preview bounded too.
         local removal_timeout_note="item(s) exceeded the ${MOLE_TIMEOUT_DISK_VERIFY_SEC}s removal budget and may be only partly removed"
         local -a removal_timeout_paths=()
         local removal_timeout_path
@@ -2019,7 +2014,7 @@ perform_cleanup() {
             fi
             removal_timeout_note+=": ${removal_timeout_list}"
         fi
-        summary_details+=("${GRAY}${ICON_WARNING}${NC} ${MOLE_CLEAN_REMOVAL_TIMEOUTS} ${removal_timeout_note}. Run clean again, or raise ${GRAY}MOLE_TIMEOUT_DISK_VERIFY_SEC${NC} for slower disks.")
+        debug_log "${MOLE_CLEAN_REMOVAL_TIMEOUTS} ${removal_timeout_note}."
     fi
 
     if [[ $had_errexit -eq 1 ]]; then
@@ -2035,15 +2030,6 @@ perform_cleanup() {
     return "$cleanup_cancel_rc"
 }
 
-run_with_shell_timeout() {
-    local duration="$1"
-    shift || true
-    # Functions (for example safe_clean) are available only in the current shell.
-    # Force the shell fallback path so timeout can execute shell functions directly.
-    MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN="" run_with_timeout "$duration" "$@"
-}
-
-# shellcheck disable=SC2329  # Invoked indirectly via run_with_timeout fallback.
 run_cloud_and_office_cleanup() {
     local cleanup_rc=0
     local pending_clean_cancel=0

@@ -177,7 +177,6 @@ for fn in clean_finder_metadata clean_app_caches clean_browsers \
     show_project_artifact_hint_notice; do
     eval "$fn() { return 0; }"
 done
-run_with_shell_timeout() { return 0; }
 perform_cleanup
 EOF
 

@@ -16,11 +16,11 @@
   <img src="./docs/img/big-mole.png" alt="Mole cleanup results" width="1000" />
 </p>
 
-> 💡 Prefer a native app? [Mole for Mac](https://mole.fit/) brings cleanup, app management, maintenance, disk maps, and live status into one lightweight, VoiceOver-ready app. One license covers 2 Macs with lifetime updates and a 14-day refund. The CLI stays free and open source.
+> 💡 This repo is the free open-source CLI (`mo`). Prefer a native app? [Mole for Mac](https://mole.fit/) is a separate download: cleanup, app management, maintenance, disk maps, and live status in one lightweight, VoiceOver-ready app. One license covers 2 Macs with lifetime updates and a 14-day refund. `brew install mole` installs the CLI only.
 
 ## Features
 
-- **All-in-one toolkit**: Combines CleanMyMac, AppCleaner, DaisyDisk, and iStat Menus in a **single binary**
+- **All-in-one CLI toolkit**: Combines CleanMyMac, AppCleaner, DaisyDisk, and iStat Menus style workflows in a **single terminal binary**
 - **Deep cleaning**: Removes caches, logs, leftovers, and orphaned app data to **reclaim gigabytes of space**
 - **Smart uninstaller**: Removes apps plus launch agents, preferences, and **hidden remnants**
 - **Disk insights**: Visualizes usage, finds large files, **rebuilds caches**, and refreshes system services
@@ -119,6 +119,7 @@ Prefer a walkthrough? Watch the [Mole tutorial video](https://www.youtube.com/wa
 Mole can remove files, so it validates paths, protects shared and system-owned locations, and asks for confirmation when an action needs it. When Mole cannot prove an item is safe to change, it skips or refuses it.
 
 - `clean`, `uninstall`, `purge`, `installer`, and `remove` can delete files. Review them with `--dry-run` first, and add `--debug` when needed.
+- Run Mole without `sudo`; it requests administrator access only when needed.
 - `mo analyze` moves selected items to Trash after confirmation.
 - Cleanup activity is recorded in `~/Library/Logs/mole/operations.log`; review it with `mo history` or disable it with `MO_NO_OPLOG=1`.
 - Protect caches with `mo clean --whitelist`, or maintenance items with `mo optimize --whitelist`.
@@ -155,7 +156,6 @@ Clean Your Mac
 ➤ Developer tools
   ✓ npm cache · cleaned
   ◎ pnpm cache · skipped (pnpm busy)
-  ✓ Xcode runtime volumes · removed 2, 3 in use
 
 ======================================================================
 Cleanup complete
@@ -329,7 +329,7 @@ Status also supports read-only alerts for processes that stay above a CPU thresh
 
 ### Purge
 
-`mo purge` finds rebuildable project artifacts such as `node_modules`, `target`, `.build`, `build`, and `dist`. It groups artifacts by project and permanently deletes only the items you confirm. Artifacts with file activity in the last 7 days, or activity Mole cannot verify, are unselected by default. Mole uses `fd` when available and falls back to `find`.
+`mo purge` finds rebuildable project artifacts such as `node_modules`, `target`, `.build`, `build`, and `dist`. It groups artifacts by project and permanently deletes only the items you confirm. Artifacts with file activity in the last 7 days, or activity Mole cannot verify, are unselected by default. Mole uses `fd` when available and falls back to `find`. Directories containing deployment keypair files, nested Git repositories, or Git-tracked files are protected. Non-interactive runs require `mo purge --yes`; use `mo purge --dry-run` to review the candidates first.
 
 Use Page Up/Down or `h`/`l` to move a page, `[`/`]` to jump between projects, and `X` to skip a project and advance. `/` searches project paths and artifact names; `n` finds the next match without changing selections. Enter opens the final path review. Reported space is an estimate; unmeasured artifacts and incomplete scans are identified explicitly.
 

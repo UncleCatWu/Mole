@@ -2,10 +2,9 @@
 """Exercise the real purge selector in a PTY using fabricated metadata only."""
 import fcntl
 import os
-import pty
+import sys
 import re
 import select
-import signal
 import struct
 import subprocess
 import tempfile
@@ -15,6 +14,8 @@ import unicodedata
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / 'tests/support'))
+from owned_pty import OwnedPair
 fixture = tempfile.TemporaryDirectory(prefix="mole-purge-menu-")
 home = Path(fixture.name)
 env = dict(
@@ -68,18 +69,14 @@ def fits(frame: bytes, rows: int, cols: int) -> None:
     overflow = [(width(line), line) for line in lines if width(line) > cols]
     assert not overflow, overflow
     assert len(lines) < rows, ('frame fills/overruns terminal', len(lines), rows)
-master, slave = pty.openpty()
+owned_pair = OwnedPair()
+master, slave = owned_pair.master, owned_pair.slave
 
 def resize(rows: int, cols: int) -> None:
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 resize(40, 120)
 
-def own_terminal() -> None:
-    os.setsid()
-    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-p = subprocess.Popen(['/bin/bash', '--noprofile', '--norc', '-c', script],
-                     stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=own_terminal)
-os.close(slave)
+p = owned_pair.spawn(['/bin/bash', '--noprofile', '--norc', '-c', script], env=env)
 pending = b''
 
 def receive(marker: bytes = b'\x1b[J') -> bytes:
@@ -94,6 +91,7 @@ def receive(marker: bytes = b'\x1b[J') -> bytes:
                 raise AssertionError(('terminal ended', p.poll(), pending[-1000:])) from exc
             assert chunk, ('EOF', pending[-1000:])
             pending += chunk
+            assert len(pending) <= 1024 * 1024, 'PTY frame exceeded 1 MiB'
     end = pending.index(marker) + len(marker)
     frame, pending = pending[:end], pending[end:]
     return frame
@@ -142,14 +140,7 @@ try:
     receive(b'TEST_CANCELLED')
     assert p.wait(timeout=2) == 0
 finally:
-    if p.poll() is None:
-        os.killpg(p.pid, signal.SIGTERM)
-        try:
-            p.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            os.killpg(p.pid, signal.SIGKILL)
-            p.wait(timeout=2)
-    os.close(master)
+    owned_pair.close()
 # Pipe EOF is deterministic; closing a PTY master instead tests SIGHUP handling.
 for input_bytes in (b'', b'/'):
     r = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', script], env=env,

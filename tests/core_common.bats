@@ -734,7 +734,7 @@ EOF
 }
 
 @test "start_inline_spinner ignores PATH-provided sleep in TTY mode" {
-    if ! /usr/bin/script -q /dev/null /bin/true > /dev/null 2>&1; then
+    if ! /usr/bin/script -q /dev/null /usr/bin/true < /dev/null > /dev/null 2>&1; then
         skip "script cannot allocate a TTY in this environment"
     fi
 
@@ -784,7 +784,7 @@ EOF
 }
 
 @test "update_inline_spinner_message swaps a live TTY spinner's text in place" {
-    if ! /usr/bin/script -q /dev/null /bin/true > /dev/null 2>&1; then
+    if ! /usr/bin/script -q /dev/null /usr/bin/true < /dev/null > /dev/null 2>&1; then
         skip "script cannot allocate a TTY in this environment"
     fi
 
@@ -815,7 +815,7 @@ EOF
 }
 
 @test "update_progress_if_needed updates spinner text without restarting it" {
-    if ! /usr/bin/script -q /dev/null /bin/true > /dev/null 2>&1; then
+    if ! /usr/bin/script -q /dev/null /usr/bin/true < /dev/null > /dev/null 2>&1; then
         skip "script cannot allocate a TTY in this environment"
     fi
 

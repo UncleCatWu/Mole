@@ -5,42 +5,37 @@ package main
 import (
 	"context"
 	"os"
-	"os/exec"
-	"strings"
+	"path/filepath"
 	"testing"
-	"time"
 )
 
-func skipIfFinderUnavailable(t *testing.T) {
+// useFixtureTrash supplies a positive mover without contacting Finder or the
+// account's real Trash. Every selected source is created by these tests.
+func useFixtureTrash(t *testing.T) {
 	t.Helper()
-
-	if os.Getenv("CI") != "" {
-		t.Skip("Skipping Finder-dependent test in CI")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	trash := filepath.Join(home, ".Trash")
+	if err := os.Mkdir(trash, 0700); err != nil {
+		t.Fatal(err)
 	}
-	if os.Getenv("MOLE_SKIP_FINDER_TESTS") == "1" {
-		t.Skip("Skipping Finder-dependent test via MOLE_SKIP_FINDER_TESTS")
-	}
-	if _, err := exec.LookPath("osascript"); err != nil {
-		t.Skipf("Skipping Finder-dependent test, osascript unavailable: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "osascript", "-e", `tell application "Finder" to get name`)
-	output, err := cmd.CombinedOutput()
-	text := strings.ToLower(string(output))
-	if ctx.Err() == context.DeadlineExceeded {
-		t.Skip("Skipping Finder-dependent test, Finder probe timed out")
-	}
-	if strings.Contains(text, "connection invalid") || strings.Contains(text, "can’t get application \"finder\"") || strings.Contains(text, "can't get application \"finder\"") {
-		t.Skipf("Skipping Finder-dependent test, Finder probe indicates unavailable session: %s", strings.TrimSpace(string(output)))
-	}
-	if err != nil {
-		reason := strings.TrimSpace(string(output))
-		if reason == "" {
-			reason = err.Error()
+	oldProbe, oldRunner := trashBinaryProbe, trashBinaryRunner
+	t.Cleanup(func() { trashBinaryProbe, trashBinaryRunner = oldProbe, oldRunner })
+	trashBinaryProbe = func() error { return nil }
+	calls := 0
+	trashBinaryRunner = func(ctx context.Context, path string) ([]byte, error) {
+		calls++
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("fixture Trash command is not bounded")
 		}
-		t.Skipf("Skipping Finder-dependent test, Finder unavailable: %s", reason)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, os.Rename(path, filepath.Join(trash, filepath.Base(path)))
 	}
+	t.Cleanup(func() {
+		if calls == 0 {
+			t.Error("positive control: fixture Trash mover was never called")
+		}
+	})
 }

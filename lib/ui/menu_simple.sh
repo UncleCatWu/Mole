@@ -3,6 +3,9 @@
 
 set -euo pipefail
 
+# shellcheck source=lib/ui/menu_traps.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/menu_traps.sh"
+
 # Terminal control functions
 enter_alt_screen() { tput smcup 2> /dev/null || true; }
 leave_alt_screen() { tput rmcup 2> /dev/null || true; }
@@ -90,7 +93,7 @@ paginated_multi_select() {
         original_stty=$(stty -g 2> /dev/null || echo "")
     fi
 
-    restore_terminal() {
+    _ms_restore_terminal() {
         show_cursor
         if [[ -n "${original_stty-}" ]]; then
             stty "${original_stty}" 2> /dev/null || stty sane 2> /dev/null || stty echo icanon 2> /dev/null || true
@@ -102,38 +105,34 @@ paginated_multi_select() {
         fi
     }
 
-    # Save the caller's EXIT/INT/TERM traps so cleanup restores rather than
+    # Save the caller's EXIT/INT/TERM traps so _ms_cleanup restores rather than
     # clears them; a bare `trap - EXIT` here drops an outer handler such as
     # bin/uninstall.sh's session-end oplog writer. See menu_paginated.sh.
     local _menu_saved_exit _menu_saved_int _menu_saved_term
     _menu_saved_exit=$(trap -p EXIT)
     _menu_saved_int=$(trap -p INT)
     _menu_saved_term=$(trap -p TERM)
-    # Uses :- defaults: cleanup() is the EXIT trap and may fire once more at
+    # Uses :- defaults: _ms_cleanup() is the EXIT trap and may fire once more at
     # shell exit after this function returned and the saved-trap locals are
     # gone. See menu_paginated.sh.
     # shellcheck disable=SC2329
-    _menu_restore_traps() {
-        if [[ -n "${_menu_saved_exit:-}" ]]; then eval "${_menu_saved_exit}"; else trap - EXIT; fi
-        if [[ -n "${_menu_saved_int:-}" ]]; then eval "${_menu_saved_int}"; else trap - INT; fi
-        if [[ -n "${_menu_saved_term:-}" ]]; then eval "${_menu_saved_term}"; else trap - TERM; fi
-    }
 
-    # Cleanup function
-    cleanup() {
-        _menu_restore_traps
-        restore_terminal
+    # Namespaced helpers keep the caller's cleanup function intact.
+    # Their dynamically scoped locals also survive a nested selector.
+    _ms_cleanup() {
+        mole_menu_restore_traps "${_menu_saved_exit:-}" "${_menu_saved_int:-}" "${_menu_saved_term:-}"
+        _ms_restore_terminal
     }
 
     # Interrupt handler
     # shellcheck disable=SC2329
-    handle_interrupt() {
-        cleanup
+    _ms_handle_interrupt() {
+        _ms_cleanup
         exit 130 # Standard exit code for Ctrl+C
     }
 
-    trap cleanup EXIT
-    trap handle_interrupt INT TERM
+    trap _ms_cleanup EXIT
+    trap _ms_handle_interrupt INT TERM
 
     # Setup terminal - preserve interrupt character
     stty -echo -icanon intr ^C 2> /dev/null || true
@@ -148,9 +147,9 @@ paginated_multi_select() {
 
     # Helper functions
     # shellcheck disable=SC2329
-    print_line() { printf "\r\033[2K%s\n" "$1" >&2; }
+    _ms_print_line() { printf "\r\033[2K%s\n" "$1" >&2; }
 
-    render_item() {
+    _ms_render_item() {
         local idx=$1 is_current=$2
         local checkbox="$ICON_EMPTY"
         [[ ${selected[idx]} == true ]] && checkbox="$ICON_SOLID"
@@ -163,7 +162,7 @@ paginated_multi_select() {
     }
 
     # Draw the complete menu
-    draw_menu() {
+    _ms_draw_menu() {
         # Recalculate items_per_page dynamically to handle window resize
         items_per_page=$(_ms_calculate_items_per_page)
 
@@ -217,7 +216,7 @@ paginated_multi_select() {
             [[ $i -lt 0 ]] && continue
             local is_current=false
             [[ $((i - start_idx)) -eq $cursor_pos ]] && is_current=true
-            render_item $i $is_current
+            _ms_render_item $i $is_current
         done
 
         # Fill empty slots to clear previous content
@@ -237,12 +236,12 @@ paginated_multi_select() {
 
     # Main interaction loop
     while true; do
-        draw_menu
+        _ms_draw_menu
         local key=$(read_key)
 
         case "$key" in
             "QUIT")
-                cleanup
+                _ms_cleanup
                 return 1
                 ;;
             "UP")
@@ -321,13 +320,13 @@ paginated_multi_select() {
                 fi
 
                 # Restore the caller's traps on normal exit (see above).
-                _menu_restore_traps
+                mole_menu_restore_traps "${_menu_saved_exit:-}" "${_menu_saved_int:-}" "${_menu_saved_term:-}"
 
                 # Store result in global variable
                 MOLE_SELECTION_RESULT="$final_result"
 
-                # Manually cleanup terminal before returning
-                restore_terminal
+                # Manually _ms_cleanup terminal before returning
+                _ms_restore_terminal
 
                 return 0
                 ;;

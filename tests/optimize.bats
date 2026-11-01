@@ -41,6 +41,9 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+# Username lookup is denied by the private kernel profile; bind the real
+# fixture owner exactly as BSD stat reports it under that profile.
+USER=$(/usr/bin/stat -f %Su "$HOME")
 
 stat() {
     printf '  File: "%s"\n    ID: 10000110000001a Namelen: ? Type: apfs\n' "$HOME"
@@ -1151,7 +1154,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 periodic() { true; }
 export -f periodic
-tmplog="$(mktemp /tmp/mole-test-daily.XXXXXX)"
+tmplog="$(mktemp "$TMPDIR/mole-test-daily.XXXXXX")"
 touch "$tmplog"
 MOLE_PERIODIC_LOG="$tmplog" execute_optimization periodic_maintenance
 [[ "$(optimize_outcome_count unchanged)" == "1" ]] || exit 1
@@ -1169,7 +1172,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 periodic() { true; }
 export -f periodic
-tmpdir="$(mktemp -d /tmp/mole-test-stat-path.XXXXXX)"
+tmpdir="$(mktemp -d "$TMPDIR/mole-test-stat-path.XXXXXX")"
 mkdir -p "$tmpdir/bin"
 cat > "$tmpdir/bin/stat" <<'STAT'
 #!/usr/bin/env bash
@@ -1195,7 +1198,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 periodic() { true; }
 export -f periodic
-tmplog="$(mktemp /tmp/mole-test-daily.XXXXXX)"
+tmplog="$(mktemp "$TMPDIR/mole-test-daily.XXXXXX")"
 touch -t "$(date -v-10d +%Y%m%d%H%M.%S)" "$tmplog"
 MOLE_PERIODIC_LOG="$tmplog" execute_optimization periodic_maintenance
 [[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
@@ -1213,7 +1216,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 periodic() { true; }
 export -f periodic
-MOLE_PERIODIC_LOG="/tmp/mole-test-nonexistent-daily.out" execute_optimization periodic_maintenance
+MOLE_PERIODIC_LOG="$HOME/mole-test-nonexistent-daily.out" execute_optimization periodic_maintenance
 [[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
 EOF
 
@@ -1302,7 +1305,7 @@ EOF
 		MOLE_OPTIMIZE_PS_SAMPLE_1=$'120 /Applications/AliEntSafe.app/Contents/Services/CloudShell.app/Contents/MacOS/CloudShell --type=event-capture\n35 /usr/libexec/syspolicyd\n20 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer' \
 		MOLE_OPTIMIZE_PS_SAMPLE_2=$'140 /Applications/AliEntSafe.app/Contents/Services/CloudShell.app/Contents/MacOS/CloudShell --type=event-processor\n30 /usr/libexec/syspolicyd\n18 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer' \
 		MOLE_OPTIMIZE_SWAPUSAGE='total = 8192.00M  used = 100.00M  free = 8092.00M' \
-		MOLE_OPTIMIZE_MEM_FREE_PCT=70 \
+		MOLE_OPTIMIZE_MEM_FREE_SAMPLE=70 \
 		MOLE_OPTIMIZE_RSS_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_VM_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_PROCTIME_SAMPLE=$'1 00:01 05:00 quietd' \
@@ -1324,7 +1327,7 @@ EOF
 		MOLE_OPTIMIZE_PS_SAMPLE_1=$'55 /usr/libexec/syspolicyd\n12 /usr/libexec/diskimagesiod' \
 		MOLE_OPTIMIZE_PS_SAMPLE_2=$'60 /usr/libexec/syspolicyd\n10 /Library/Developer/PrivateFrameworks/CoreSimulator.framework/Resources/bin/simdiskimaged' \
 		MOLE_OPTIMIZE_SWAPUSAGE='total = 8192.00M  used = 100.00M  free = 8092.00M' \
-		MOLE_OPTIMIZE_MEM_FREE_PCT=70 \
+		MOLE_OPTIMIZE_MEM_FREE_SAMPLE=70 \
 		MOLE_OPTIMIZE_RSS_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_VM_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_PROCTIME_SAMPLE=$'1 00:01 05:00 quietd' \
@@ -1350,7 +1353,7 @@ EOF
 		MOLE_OPTIMIZE_PS_SAMPLE_1=$'180 /Applications/AliEntSafe.app/Contents/Services/CloudShell.app/Contents/MacOS/CloudShell --type=event-capture' \
 		MOLE_OPTIMIZE_PS_SAMPLE_2=$'5 /Applications/AliEntSafe.app/Contents/Services/CloudShell.app/Contents/MacOS/CloudShell --type=event-capture' \
 		MOLE_OPTIMIZE_SWAPUSAGE='total = 8192.00M  used = 100.00M  free = 8092.00M' \
-		MOLE_OPTIMIZE_MEM_FREE_PCT=70 \
+		MOLE_OPTIMIZE_MEM_FREE_SAMPLE=70 \
 		MOLE_OPTIMIZE_RSS_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_VM_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_PROCTIME_SAMPLE=$'1 00:01 05:00 quietd' \
@@ -1371,7 +1374,7 @@ EOF
 		MOLE_OPTIMIZE_PS_SAMPLE_1=$'55 /usr/libexec/syspolicyd' \
 		MOLE_OPTIMIZE_PS_SAMPLE_2=$'60 /usr/libexec/syspolicyd' \
 		MOLE_OPTIMIZE_SWAPUSAGE='total = 8192.00M  used = 100.00M  free = 8092.00M' \
-		MOLE_OPTIMIZE_MEM_FREE_PCT=70 \
+		MOLE_OPTIMIZE_MEM_FREE_SAMPLE=70 \
 		MOLE_OPTIMIZE_RSS_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_VM_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_PROCTIME_SAMPLE=$'1 00:01 05:00 quietd' \
@@ -1398,7 +1401,7 @@ EOF
 		MOLE_OPTIMIZE_PS_SAMPLE_1=$'1 /usr/sbin/distnoted' \
 		MOLE_OPTIMIZE_PS_SAMPLE_2=$'1 /usr/sbin/distnoted' \
 		MOLE_OPTIMIZE_SWAPUSAGE='total = 8192.00M  used = 100.00M  free = 8092.00M' \
-		MOLE_OPTIMIZE_MEM_FREE_PCT=70 \
+		MOLE_OPTIMIZE_MEM_FREE_SAMPLE=70 \
 		MOLE_OPTIMIZE_RSS_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_VM_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_PROCTIME_SAMPLE=$'1 00:01 05:00 quietd' \
@@ -1423,7 +1426,7 @@ EOF
 		MOLE_OPTIMIZE_PS_SAMPLE_1=$'55 /usr/libexec/syspolicyd' \
 		MOLE_OPTIMIZE_PS_SAMPLE_2=$'60 /usr/libexec/syspolicyd' \
 		MOLE_OPTIMIZE_SWAPUSAGE='total = 8192.00M  used = 100.00M  free = 8092.00M' \
-		MOLE_OPTIMIZE_MEM_FREE_PCT=70 \
+		MOLE_OPTIMIZE_MEM_FREE_SAMPLE=70 \
 		MOLE_OPTIMIZE_RSS_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_VM_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_PROCTIME_SAMPLE=$'1 00:01 05:00 quietd' \
@@ -1457,7 +1460,7 @@ EOF
 		MOLE_OPTIMIZE_PS_SAMPLE_1=$'55 /usr/libexec/syspolicyd' \
 		MOLE_OPTIMIZE_PS_SAMPLE_2=$'60 /usr/libexec/syspolicyd' \
 		MOLE_OPTIMIZE_SWAPUSAGE='total = 8192.00M  used = 100.00M  free = 8092.00M' \
-		MOLE_OPTIMIZE_MEM_FREE_PCT=70 \
+		MOLE_OPTIMIZE_MEM_FREE_SAMPLE=70 \
 		MOLE_OPTIMIZE_RSS_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_VM_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_PROCTIME_SAMPLE=$'1 00:01 05:00 quietd' \
@@ -1482,7 +1485,7 @@ EOF
 		MOLE_OPTIMIZE_PS_SAMPLE_1=$'4 /usr/sbin/distnoted\n3 /usr/libexec/coreaudiod' \
 		MOLE_OPTIMIZE_PS_SAMPLE_2=$'5 /usr/sbin/distnoted\n2 /usr/libexec/coreaudiod' \
 		MOLE_OPTIMIZE_SWAPUSAGE='total = 8192.00M  used = 100.00M  free = 8092.00M' \
-		MOLE_OPTIMIZE_MEM_FREE_PCT=70 \
+		MOLE_OPTIMIZE_MEM_FREE_SAMPLE=70 \
 		MOLE_OPTIMIZE_RSS_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_VM_SAMPLE=$'1000 Finder' \
 		MOLE_OPTIMIZE_PROCTIME_SAMPLE=$'1 00:01 05:00 quietd' \
@@ -1677,7 +1680,25 @@ EOF
 	[[ "$output" == *"Legacy Overrides|legacy_overrides_audit|optimize_task"* ]] || return 1
 }
 
+# Login-item matching fixtures must not scan apps installed on the test host.
+setup_login_item_fixture() {
+	HOME="$HOME/login-item-$BATS_TEST_NUMBER"
+	export HOME
+	mkdir -p "$HOME/bin"
+	printf '#!/bin/bash\nexit 1\n' > "$HOME/bin/mdfind"
+	cat > "$HOME/bin/find" <<'EOF'
+#!/bin/bash
+case "$1" in
+    "$HOME"/*) exec /usr/bin/find "$@" ;;
+    *) exit 0 ;;
+esac
+EOF
+	chmod +x "$HOME/bin/mdfind" "$HOME/bin/find"
+	export PATH="$HOME/bin:$PATH"
+}
+
 @test "_login_item_app_exists finds nested helper app bundles" {
+	setup_login_item_fixture
 	local helper="$HOME/Applications/Roon.app/Contents/RoonServer.app"
 	mkdir -p "$helper"
 
@@ -1685,9 +1706,6 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-mdfind() { return 1; }
-sfltool() { return 1; }
-export -f mdfind sfltool
 if _login_item_app_exists "RoonServer"; then
     echo "found"
 fi
@@ -1698,6 +1716,7 @@ EOF
 }
 
 @test "_login_item_app_exists finds nested mixed-case app bundles" {
+	setup_login_item_fixture
 	local helper="$HOME/Applications/Roon.APP/Contents/RoonServer.APP"
 	mkdir -p "$helper"
 
@@ -1705,9 +1724,6 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-mdfind() { return 1; }
-sfltool() { return 1; }
-export -f mdfind sfltool
 if _login_item_app_exists "RoonServer"; then
     echo "found"
 fi
@@ -1718,6 +1734,7 @@ EOF
 }
 
 @test "_login_item_app_exists finds nested helper apps by bundle display name" {
+	setup_login_item_fixture
 	local helper="$HOME/Applications/Adobe Acrobat DC.app/Contents/Helpers/AdobeResourceSynchronizer.app"
 	mkdir -p "$helper/Contents"
 	cat > "$helper/Contents/Info.plist" <<'PLIST'
@@ -1737,9 +1754,6 @@ PLIST
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-mdfind() { return 1; }
-sfltool() { return 1; }
-export -f mdfind sfltool
 if _login_item_app_exists "Acrobat Collaboration Synchronizer"; then
     echo "found"
 fi
@@ -1750,6 +1764,7 @@ EOF
 }
 
 @test "_login_item_app_exists trusts an existing System Events login item path" {
+	setup_login_item_fixture
 	local helper="$HOME/Applications/Adobe Acrobat DC.app/Contents/Helpers/AdobeResourceSynchronizer.app"
 	mkdir -p "$helper"
 
@@ -1757,9 +1772,6 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-mdfind() { return 1; }
-sfltool() { return 1; }
-export -f mdfind sfltool
 if _login_item_app_exists "Acrobat Collaboration Synchronizer" "$HELPER_PATH" 2>&1; then
     echo "found"
 fi

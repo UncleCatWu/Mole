@@ -9,8 +9,11 @@ if [[ -n "${MOLE_MANAGE_REMOVE_LOADED:-}" ]]; then
 fi
 readonly MOLE_MANAGE_REMOVE_LOADED=1
 
+source "$(dirname "${BASH_SOURCE[0]}")/local_generation.sh"
+
 # Remove flow (Homebrew + manual + config/cache).
 remove_mole() {
+    mole_local_generation_management_guard remove || return "$?"
     local dry_run_mode="${1:-false}"
     local test_mode=false
     if [[ "${MOLE_TEST_MODE:-0}" == "1" ]]; then

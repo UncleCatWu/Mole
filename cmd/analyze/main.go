@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -78,7 +79,10 @@ func main() {
 	if *jsonMode {
 		runJSONMode(abs, isOverview)
 	} else {
-		runTUIMode(abs, isOverview)
+		if err := runTUIMode(abs, isOverview); err != nil {
+			fmt.Fprintf(os.Stderr, "analyzer error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -105,24 +109,38 @@ func resolveScanTarget(envPath string, args []string) (string, bool, error) {
 	return abs, false, nil
 }
 
-func runTUIMode(path string, isOverview bool) {
-	// Warm overview cache only when the user opens a specific directory.
-	// Overview mode already schedules the same measurements for the foreground UI;
-	// running the prefetcher there doubles the du/io workload on cold start.
+func runTUIMode(path string, isOverview bool) error {
+	m := newModel(path, isOverview)
+	// A single parent survives model copies and navigation generations. The
+	// program's quit/interrupt messages bypass Update, so cleanup belongs here.
+	defer m.lifecycle.stop()
+	var prefetchDone chan struct{}
 	if !isOverview {
-		prefetchCtx, prefetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer prefetchCancel()
-		go prefetchOverviewCache(prefetchCtx)
+		prefetchCtx, prefetchCancel := context.WithTimeout(m.scanRequestContext, 30*time.Second)
+		prefetchDone = make(chan struct{})
+		defer func() { prefetchCancel(); <-prefetchDone }()
+		if !startAnalyzerWork(prefetchCtx, func() { defer close(prefetchDone); prefetchOverviewCache(prefetchCtx) }) {
+			close(prefetchDone)
+		}
 	}
+	return runAnalyzerProgram(m, tea.WithAltScreen())
+}
 
-	p := tea.NewProgram(newModel(path, isOverview), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "analyzer error: %v\n", err)
-		os.Exit(1)
+func runAnalyzerProgram(m model, options ...tea.ProgramOption) error {
+	defer m.lifecycle.stop()
+	options = append(options, tea.WithFilter(analyzerExitFilter))
+	final, err := tea.NewProgram(m, options...).Run()
+	// Also handles renderer/input errors and killed programs, which need not
+	// deliver a quit message. Do this before returning to main's os.Exit.
+	if final, ok := final.(model); ok {
+		final.stopForExit()
 	}
+	return err
 }
 
 func newModel(path string, isOverview bool) model {
+	lifecycle := newAnalyzerLifecycle()
+	scanContext, scanCancel, scanPublication := newScanRequestContext(lifecycle.ctx)
 	var filesScanned, dirsScanned, bytesScanned int64
 	currentPath := &atomic.Value{}
 	currentPath.Store("")
@@ -133,24 +151,30 @@ func newModel(path string, isOverview bool) model {
 	}
 
 	m := model{
-		path:                path,
-		selected:            0,
-		status:              "Preparing scan...",
-		diskFree:            diskFreeBytes,
-		scanning:            !isOverview,
-		filesScanned:        &filesScanned,
-		dirsScanned:         &dirsScanned,
-		bytesScanned:        &bytesScanned,
-		currentPath:         currentPath,
-		showLargeFiles:      false,
-		isOverview:          isOverview,
-		cache:               make(map[string]historyEntry),
-		overviewSizeCache:   make(map[string]int64),
-		overviewScanningSet: make(map[string]bool),
-		multiSelected:       make(map[string]bool),
-		largeMultiSelected:  make(map[string]bool),
-		liveSortMode:        liveScanSortModeFromEnv(),
-		snapshotRunner:      runLocalSnapshotCommand,
+		lifecycle:              lifecycle,
+		path:                   path,
+		selected:               0,
+		status:                 "Preparing scan...",
+		diskFree:               diskFreeBytes,
+		scanning:               !isOverview,
+		filesScanned:           &filesScanned,
+		dirsScanned:            &dirsScanned,
+		bytesScanned:           &bytesScanned,
+		currentPath:            currentPath,
+		showLargeFiles:         false,
+		isOverview:             isOverview,
+		cache:                  make(map[string]historyEntry),
+		overviewSizeCache:      make(map[string]int64),
+		overviewScanningSet:    make(map[string]bool),
+		overviewRequestIDs:     make(map[string]int64),
+		multiSelected:          make(map[string]bool),
+		largeMultiSelected:     make(map[string]bool),
+		liveSortMode:           liveScanSortModeFromEnv(),
+		scanRequestID:          1,
+		scanRequestPublication: scanPublication,
+		scanRequestContext:     scanContext,
+		scanRequestCancel:      scanCancel,
+		snapshotRunner:         runLocalSnapshotCommand,
 	}
 
 	if isOverview {
@@ -214,12 +238,54 @@ func systemOverviewRoots() []dirEntry {
 
 func sumKnownEntrySizes(entries []dirEntry) int64 {
 	var total int64
-	for _, entry := range entries {
-		if entry.Size > 0 {
+	for i, entry := range entries {
+		if entry.Size <= 0 {
+			continue
+		}
+		covered := false
+		for j, parent := range entries {
+			if parent.Size > 0 && j != i && (overviewPathContains(parent.Path, entry.Path) ||
+				(j < i && filepath.Clean(parent.Path) == filepath.Clean(entry.Path))) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
 			total += entry.Size
 		}
 	}
 	return total
+}
+
+// Overview insights overlap their containing rows. Home is the exception:
+// its measurement excludes Library, which is a separate, disjoint row.
+func overviewPathContains(parent, child string) bool {
+	if parent == "" || child == "" {
+		return false
+	}
+	if home := os.Getenv("HOME"); home != "" && filepath.Clean(parent) == filepath.Clean(home) {
+		library := filepath.Join(home, "Library")
+		if filepath.Clean(child) == library || pathIsWithin(library, child) {
+			return false
+		}
+	}
+	if home := os.Getenv("HOME"); home != "" && filepath.Clean(parent) == filepath.Join(home, "Downloads") {
+		// This insight measures old immediate children, not every descendant.
+		return false
+	}
+	rel, err := filepath.Rel(parent, child)
+	if err == nil && rel != "." {
+		if first, _, _ := strings.Cut(rel, string(filepath.Separator)); overviewDuIgnoreNames[first] {
+			return false
+		}
+	}
+	return pathIsWithin(parent, child)
+}
+
+func pathIsWithin(parent, child string) bool {
+	rel, err := filepath.Rel(parent, child)
+	return err == nil && rel != "." && rel != ".." && !filepath.IsAbs(rel) &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func nextPendingOverviewIndex(entries []dirEntry) int {

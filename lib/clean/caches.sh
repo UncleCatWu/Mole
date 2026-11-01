@@ -647,7 +647,7 @@ clean_project_caches() {
         return 0
     fi
 
-    local -a root_matches_files=()
+    local -a root_matches_files=() root_scan_paths=() scan_failure_rows=()
     local -a scan_pids=()
     local -a scan_statuses=()
     local failed_scan_count=0
@@ -730,6 +730,7 @@ clean_project_caches() {
             continue
         fi
         root_matches_files+=("$root_matches_file")
+        root_scan_paths+=("$root")
         [[ $scan_interrupt_status -ge 128 ]] && break
         scan_project_cache_root "$root" "$root_matches_file" < /dev/null &
         scan_pids+=("$!")
@@ -774,6 +775,13 @@ clean_project_caches() {
         local scan_rc="${scan_statuses[$scan_index]:-1}"
         if [[ $scan_rc -ne 0 ]]; then
             failed_scan_count=$((failed_scan_count + 1))
+            if [[ ${#scan_failure_rows[@]} -lt 3 ]]; then
+                local failed_root="${root_scan_paths[$scan_index]}"
+                local failure_reason="scan failed (exit $scan_rc)"
+                [[ $scan_rc -eq 124 ]] && failure_reason="scan timed out"
+                [[ "$failed_root" != "$HOME"/* ]] || failed_root="~${failed_root#"$HOME"}"
+                scan_failure_rows+=("$failed_root ($failure_reason)")
+            fi
             rm -f "$root_matches_file"
             continue
         fi
@@ -796,6 +804,10 @@ clean_project_caches() {
             scan_noun="root scan"
         fi
         echo -e "  ${GRAY}${ICON_WARNING}${NC} Project caches · skipped ${failed_scan_count} slow/incomplete ${scan_noun}"
+        local failure_row
+        for failure_row in "${scan_failure_rows[@]+"${scan_failure_rows[@]}"}"; do
+            printf '  %s%s%s Project caches · kept %s\n' "$GRAY" "$ICON_WARNING" "$NC" "$failure_row"
+        done
         if declare -f note_activity > /dev/null 2>&1; then
             note_activity
         fi

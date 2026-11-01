@@ -27,6 +27,28 @@ Run tests:
 ./scripts/test.sh
 ```
 
+Run a focused Bats selection through the same test-only boundary:
+
+```bash
+./scripts/test_sandbox.sh bats tests/clean_user_core.bats
+```
+
+The runner copies current source files into a private directory and uses
+macOS `sandbox-exec` to deny writes outside that run, external network access,
+and real authorization/system-control executables. Test fixtures can still be
+removed inside that directory. `MOLE_TEST_NO_AUTH=1` and a fixture `HOME` alone
+are not filesystem isolation; direct Bats calls are not a supported substitute.
+Supported Bats file/run fields also trigger the library boundary when explicit
+test flags are forgotten. A subprocess that clears its environment can erase
+that context; the wrapper's inherited kernel sandbox remains the protection.
+Missing sandbox support fails closed. Failed runs print their retained artifact
+directory; successful runs remove only the directory they created. Historical
+`tests/tmp-*` directories in the original checkout are never swept. Reports and
+caches stay inside the run; an external `MOLE_TEST_REPORT_DIR` is refused.
+The final installation stage checks entrypoint syntax only and performs no
+installation. Installation/update behavior is covered by the private mocked
+Bats regressions; syntax success alone is not installation acceptance.
+
 ## Code Style
 
 ### Basic Rules
@@ -133,7 +155,7 @@ Format: `[MODULE_NAME] message` output to stderr.
 - macOS 12 or newer, works on Intel and Apple Silicon
 - Default macOS Bash 3.2+ plus administrator privileges for cleanup tasks
 - Install Command Line Tools with `xcode-select --install` for curl, tar, and related utilities
-- Go 1.25+ is required to build the `mo status` or `mo analyze` TUI binaries locally.
+- Go 1.26+ is required to build the `mo status` or `mo analyze` TUI binaries locally.
 
 ## Go Components
 

@@ -4,11 +4,15 @@
 
 set -euo pipefail
 
+_MOLE_CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/core/test_boundary.sh
+source "$_MOLE_CORE_DIR/test_boundary.sh"
+_mole_test_require_context || return $?
+
 # Prevent multiple sourcing
 if [[ -n "${MOLE_FILE_OPS_LOADED:-}" ]]; then
     return 0
 fi
-readonly MOLE_FILE_OPS_LOADED=1
 
 # Error codes for removal operations
 readonly MOLE_ERR_SIP_PROTECTED=10
@@ -19,23 +23,23 @@ readonly MOLE_ERR_PRIVACY_DENIED=14
 readonly MOLE_ERR_MUTABLE_PARENT=15
 
 # Ensure dependencies are loaded
-_MOLE_CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -z "${MOLE_BASE_LOADED:-}" ]]; then
     # shellcheck source=lib/core/base.sh
-    source "$_MOLE_CORE_DIR/base.sh"
+    source "$_MOLE_CORE_DIR/base.sh" || return $?
 fi
 if [[ -z "${MOLE_LOG_LOADED:-}" ]]; then
     # shellcheck source=lib/core/log.sh
-    source "$_MOLE_CORE_DIR/log.sh"
+    source "$_MOLE_CORE_DIR/log.sh" || return $?
 fi
 if [[ -z "${MOLE_TIMEOUT_LOADED:-}" ]]; then
     # shellcheck source=lib/core/timeout.sh
-    source "$_MOLE_CORE_DIR/timeout.sh"
+    source "$_MOLE_CORE_DIR/timeout.sh" || return $?
 fi
 if [[ -z "${MOLE_TIMEOUTS_LOADED:-}" ]]; then
     # shellcheck source=lib/core/timeouts.sh
-    source "$_MOLE_CORE_DIR/timeouts.sh"
+    source "$_MOLE_CORE_DIR/timeouts.sh" || return $?
 fi
+readonly MOLE_FILE_OPS_LOADED=1
 
 # Keep the removal-timeout summary actionable: record which path ran out of
 # budget so the closing note can name it instead of a bare count.
@@ -252,12 +256,22 @@ _mole_is_user_cache_sqlite_family_path() {
 # Exact browser partial-download files directly under Downloads. These may be
 # actively written even when their browser process name is unavailable, so the
 # final deletion gate must recheck the file handle itself.
+# A partial download is a mutable file some process may still be writing, not a
+# rebuildable cache, so callers gate it on an open-handle probe instead of size
+# or age. Homebrew's cache belongs here for the same reason the browser roots
+# do: `brew fetch` writes `<sha>--<name>.incomplete` and holds it open for the
+# length of the transfer, and a blanket sweep of that directory deleted six
+# in-flight cask downloads out from under a running fetch (#1594).
 _mole_is_incomplete_download_path() {
     local downloads_root="${HOME%/}/Downloads"
+    local brew_downloads="${HOME%/}/Library/Caches/Homebrew/downloads"
     local path="$1"
     case "$path" in
         "$downloads_root"/*.download | "$downloads_root"/*.crdownload | "$downloads_root"/*.part)
             [[ "${path#"$downloads_root"/}" != */* ]]
+            ;;
+        "$brew_downloads"/*.incomplete)
+            [[ "${path#"$brew_downloads"/}" != */* ]]
             ;;
         *) return 1 ;;
     esac
@@ -1134,6 +1148,17 @@ validate_path_for_deletion() {
         return 1
     fi
 
+    # Test snapshots place HOME below /private/tmp. Preserve the existing HOME
+    # protection policy there instead of having the disposable-temp allowlist
+    # mask protected-data/Trash regressions. Ordinary CLI policy is unchanged.
+    if _mole_test_boundary_required && [[ "$policy_path" == "${HOME%/}/"* ]] &&
+        declare -f should_protect_path > /dev/null 2>&1; then
+        if ! _mole_is_user_trash_top_level_item "$policy_path" &&
+            should_protect_path "$policy_path"; then
+            return 1
+        fi
+    fi
+
     # Allow known safe paths under /private
     case "$policy_path" in
         /private/tmp/* | \
@@ -1243,8 +1268,42 @@ _mole_record_clean_cancellation() {
     fi
 }
 
-# Safe wrapper around rm -rf with validation
+# Preserve the exact target acknowledgment from rm's verbose stream. This is
+# an internal completion receipt, not another deletion path. Filtering avoids
+# retaining recursive per-child output while preserving errors for callers.
+_mole_capture_rm_receipt() {
+    MOLE_RM_RECEIPT_TARGET="$1" awk '
+        BEGIN { target = ENVIRON["MOLE_RM_RECEIPT_TARGET"] }
+        $0 == target || $0 == "removed '\''" target "'\''" ||
+            $0 == "removed directory '\''" target "'\''" {
+            acknowledged = 1
+            next
+        }
+        substr($0, 1, 1) == "/" || index($0, "removed ") == 1 { next }
+        {
+            # Drain every line, retaining only a bounded diagnostic prefix.
+            # Permission causes can arrive after thousands of child fragments.
+            if ($0 ~ /Permission denied|Operation not permitted|timed out|Timeout/) {
+                cause = substr($0, 1, 512)
+            }
+            remaining = 4096 - retained
+            if (remaining > 0) {
+                line = substr($0, 1, remaining)
+                print line
+                retained += length(line) + 1
+            }
+        }
+        END {
+            if (cause != "") print cause
+            if (acknowledged) print "__MOLE_RM_TARGET_REMOVED__"
+        }
+    '
+}
+
+# Legacy rc=0 includes missing paths and previews. Actual-byte accounting
+# additionally requires this per-call outcome to equal "removed".
 safe_remove() {
+    _MOLE_SAFE_REMOVE_OUTCOME="refused"
     local path="$1"
     local silent="${2:-false}"
     local precomputed_size_kb="${3:-}"
@@ -1290,6 +1349,7 @@ safe_remove() {
     if [[ $validation_rc -ne 0 ]]; then
         if [[ $validation_rc -eq 124 || $validation_rc -ge 128 ]]; then
             _mole_record_clean_cancellation "$validation_rc"
+            _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
             return "$validation_rc"
         fi
         return 1
@@ -1309,6 +1369,7 @@ safe_remove() {
 
     # Check if path exists
     if [[ ! -e "$path" ]]; then
+        _MOLE_SAFE_REMOVE_OUTCOME="missing"
         return 0
     fi
 
@@ -1328,6 +1389,7 @@ safe_remove() {
             "$path" "$precomputed_size_kb" || dry_record_rc=$?
         if [[ $dry_record_rc -eq 124 || $dry_record_rc -ge 128 ]]; then
             _mole_record_clean_cancellation "$dry_record_rc"
+            _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
             return "$dry_record_rc"
         fi
         [[ $dry_record_rc -eq 0 ]] || return "$dry_record_rc"
@@ -1345,6 +1407,7 @@ safe_remove() {
                 size_kb=$(get_path_size_kb "$path" 2> /dev/null) || size_rc=$?
                 if [[ $size_rc -eq 124 || $size_rc -ge 128 ]]; then
                     _mole_record_clean_cancellation "$size_rc"
+                    _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
                     return "$size_rc"
                 fi
                 [[ $size_rc -eq 0 ]] || size_kb=0
@@ -1358,6 +1421,7 @@ safe_remove() {
                     mod_time=$(stat -f%m "$path" 2> /dev/null) || stat_rc=$?
                     if [[ $stat_rc -eq 124 || $stat_rc -ge 128 ]]; then
                         _mole_record_clean_cancellation "$stat_rc"
+                        _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
                         return "$stat_rc"
                     fi
                     [[ $stat_rc -eq 0 ]] || mod_time=0
@@ -1373,9 +1437,11 @@ safe_remove() {
         else
             debug_log "[DRY RUN] Would remove: $path"
         fi
+        _MOLE_SAFE_REMOVE_OUTCOME="preview"
         return 0
     fi
 
+    _mole_test_guard_mutation_path "$path" || return $?
     debug_log "Removing: $path"
 
     # Calculate size before deletion for logging.
@@ -1402,6 +1468,7 @@ safe_remove() {
             fi
             if [[ $size_probe_rc -ge 128 ]]; then
                 _mole_record_clean_cancellation "$size_probe_rc"
+                _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
                 return "$size_probe_rc"
             fi
             [[ $size_probe_rc -eq 0 && "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
@@ -1433,6 +1500,7 @@ safe_remove() {
     fi
     if [[ $live_cache_guard_rc -eq 124 || $live_cache_guard_rc -ge 128 ]]; then
         _mole_record_clean_cancellation "$live_cache_guard_rc"
+        _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
         return "$live_cache_guard_rc"
     fi
     container_probe_parent="$_MOLE_CONTAINER_CACHE_PROBE_PARENT"
@@ -1451,6 +1519,7 @@ safe_remove() {
         _mole_sqlite_database_in_use "$path" || sqlite_state=$?
         if [[ $sqlite_state -eq 124 || $sqlite_state -ge 128 ]]; then
             _mole_record_clean_cancellation "$sqlite_state"
+            _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
             return "$sqlite_state"
         fi
         if [[ $sqlite_state -ne 1 ]]; then
@@ -1481,6 +1550,7 @@ safe_remove() {
         _mole_paths_have_open_handle "$path" || download_open_state=$?
         if [[ $download_open_state -eq 124 || $download_open_state -ge 128 ]]; then
             _mole_record_clean_cancellation "$download_open_state"
+            _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
             return "$download_open_state"
         fi
         if [[ $download_open_state -ne 1 ]]; then
@@ -1522,6 +1592,7 @@ safe_remove() {
             log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "sink guard denied"
             if [[ $final_sink_guard_rc -eq 124 || $final_sink_guard_rc -ge 128 ]]; then
                 _mole_record_clean_cancellation "$final_sink_guard_rc"
+                _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
                 return "$final_sink_guard_rc"
             fi
             return 1
@@ -1560,13 +1631,19 @@ safe_remove() {
     local rm_exit=0
     local section_deadline_spent=0
     if declare -F rm > /dev/null 2>&1; then
-        error_msg=$(rm -rf "$path" 2>&1) || rm_exit=$? # SAFE: safe_remove validated and rebound this exact target above
+        error_msg=$(
+            set -o pipefail
+            LC_ALL=C rm -rfv "$path" 2>&1 | _mole_capture_rm_receipt "$path" # SAFE: safe_remove validated and rebound this exact target above
+        ) || rm_exit=$?
     else
         local rm_timeout=""
         rm_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" \
             "$deadline_seconds") || rm_exit=$?
         if [[ $rm_exit -eq 0 ]]; then
-            error_msg=$(run_with_timeout "$rm_timeout" rm -rf "$path" < /dev/null 2>&1) || rm_exit=$? # SAFE: safe_remove validated and rebound this exact target above
+            error_msg=$(
+                set -o pipefail
+                LC_ALL=C run_with_timeout "$rm_timeout" rm -rfv "$path" < /dev/null 2>&1 | _mole_capture_rm_receipt "$path" # SAFE: safe_remove validated and rebound this exact target above
+            ) || rm_exit=$?
         else
             # The section's own wall-clock budget ran out, so rm never started.
             section_deadline_spent=1
@@ -1574,6 +1651,7 @@ safe_remove() {
     fi
 
     if [[ $rm_exit -eq 124 ]]; then
+        _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
         debug_log "Removal timed out: $path"
         if [[ $section_deadline_spent -eq 1 ]]; then
             # Not a slow removal: the caller's section deadline expired before
@@ -1593,15 +1671,38 @@ safe_remove() {
 
     # Preserve interrupt semantics so callers can abort long-running deletions.
     if [[ $rm_exit -ge 128 ]]; then
+        _MOLE_SAFE_REMOVE_OUTCOME="cancelled"
         _mole_record_clean_cancellation "$rm_exit"
         return "$rm_exit"
     fi
 
     if [[ $rm_exit -eq 0 ]]; then
-        # Log successful removal
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "REMOVED" "$path" "$size_human"
+        if [[ "$error_msg" == "__MOLE_RM_TARGET_REMOVED__" ||
+            "$error_msg" == *$'\n__MOLE_RM_TARGET_REMOVED__' ]]; then
+            if [[ ! -e "$path" && ! -L "$path" ]]; then
+                _MOLE_SAFE_REMOVE_OUTCOME="removed"
+            else
+                _MOLE_SAFE_REMOVE_OUTCOME="not_removed"
+            fi
+        elif [[ -e "$path" || -L "$path" ]]; then
+            _MOLE_SAFE_REMOVE_OUTCOME="not_removed"
+        else
+            _MOLE_SAFE_REMOVE_OUTCOME="not_observed"
+        fi
+        case "$_MOLE_SAFE_REMOVE_OUTCOME" in
+            removed)
+                log_operation "${MOLE_CURRENT_COMMAND:-clean}" "REMOVED" "$path" "$size_human"
+                ;;
+            not_removed)
+                log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "removal not completed"
+                ;;
+            not_observed)
+                log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "removal not observed"
+                ;;
+        esac
         return 0
     else
+        _MOLE_SAFE_REMOVE_OUTCOME="failed"
         # Check if it's a permission error
         if [[ "$error_msg" == *"Permission denied"* ]] || [[ "$error_msg" == *"Operation not permitted"* ]]; then
             MOLE_PERMISSION_DENIED_COUNT=${MOLE_PERMISSION_DENIED_COUNT:-0}
@@ -1644,6 +1745,8 @@ safe_remove_symlink() {
         log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "whitelist"
         return 1
     fi
+
+    _mole_test_guard_mutation_path "$path" || return $?
 
     if [[ "$use_sudo" == "true" ]] && _mole_privileged_path_has_mutable_ancestor "$path"; then
         if [[ ${EUID:-0} -ne 0 ]]; then
@@ -1802,6 +1905,7 @@ safe_sudo_remove() {
         return "$MOLE_ERR_PROTECTED_PATH"
     fi
 
+    _mole_test_guard_mutation_path "$path" || return $?
     if _mole_privileged_path_has_mutable_ancestor "$path"; then
         if [[ ${EUID:-0} -ne 0 ]]; then
             debug_log "Downgrading sudo remove below mutable parent: $path"
@@ -2059,6 +2163,7 @@ safe_sudo_remove() {
 # disappeared mid-call); never silently coerced to 0KB so post-hoc forensics
 # can tell measured-zero from measurement-failure.
 mole_delete() {
+    local _MOLE_SAFE_REMOVE_OUTCOME=""
     local path="$1"
     local needs_sudo="${2:-false}"
     local expected_identity="${3:-}"
@@ -2243,6 +2348,7 @@ mole_delete() {
     # validation, sudo handling, and existing log_operation calls remain
     # unchanged for callers that have always gone through rm -rf.
     local rc=0
+    local used_safe_remove=false
     if [[ "$needs_sudo" == "true" ]] && _mole_privileged_path_has_mutable_ancestor "$path"; then
         # Recheck at the permanent-delete sink. The parent may have become
         # mutable while size accounting was running. This check covers both
@@ -2257,13 +2363,32 @@ mole_delete() {
             "$expected_parent" "$expected_parent_id" \
             "$expected_target_id" || rc=$?
     else
+        used_safe_remove=true
         safe_remove "$path" "true" "$size_kb" "" \
             "$expected_parent" "$expected_parent_id" \
             "$expected_target_id" || rc=$?
     fi
 
     local status_label="ok"
-    if [[ $rc -eq $MOLE_ERR_MUTABLE_PARENT ]]; then
+    if [[ $rc -eq 0 && "$used_safe_remove" == "true" && "$_MOLE_SAFE_REMOVE_OUTCOME" != "removed" ]]; then
+        # safe_remove keeps legacy rc=0 for previews and missing paths. This
+        # forensic funnel must not turn those into confirmed freed bytes.
+        rc=1
+        case "$_MOLE_SAFE_REMOVE_OUTCOME" in
+            not_removed)
+                status_label="not-removed"
+                size_kb=0
+                ;;
+            missing)
+                status_label="missing"
+                size_kb=0
+                ;;
+            *)
+                status_label="not-observed"
+                size_kb="unknown"
+                ;;
+        esac
+    elif [[ $rc -eq $MOLE_ERR_MUTABLE_PARENT ]]; then
         status_label="mutable-parent"
     elif [[ $rc -eq 124 ]]; then
         status_label="timed-out"
@@ -2400,7 +2525,10 @@ _mole_move_to_trash() {
     local expected_parent_id="${4:-}"
     local expected_target_id="${5:-}"
 
+    _mole_test_guard_mutation_path "$path" || return $?
+
     if [[ -n "${MOLE_TEST_TRASH_DIR:-}" ]]; then
+        _mole_test_guard_mutation_path "$MOLE_TEST_TRASH_DIR" || return $?
         mkdir -p "$MOLE_TEST_TRASH_DIR" 2> /dev/null || return 1
         local dest="$MOLE_TEST_TRASH_DIR/$(basename "$path").$$.$(date +%s 2> /dev/null || echo 0)"
         _mole_trash_target_still_safe "$path" "$expected_parent" \
@@ -2531,6 +2659,8 @@ _mole_move_path_to_user_trash() {
     local expected_parent="${3:-}"
     local expected_parent_id="${4:-}"
     local expected_target_id="${5:-}"
+
+    _mole_test_guard_mutation_path "$path" || return $?
 
     if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
         return 1
@@ -2833,6 +2963,10 @@ _mole_bound_path_matches() {
 _mole_move_to_trash_batch() {
     local -a paths=("$@")
     [[ ${#paths[@]} -eq 0 ]] && return 0
+    local boundary_path
+    for boundary_path in "${paths[@]}"; do
+        _mole_test_guard_mutation_path "$boundary_path" || return $?
+    done
     _MOLE_TRASH_BATCH_MOVED_PATHS=()
 
     local use_bound_snapshots=false
@@ -2863,6 +2997,7 @@ _mole_move_to_trash_batch() {
     done
 
     if [[ -n "${MOLE_TEST_TRASH_DIR:-}" ]]; then
+        _mole_test_guard_mutation_path "$MOLE_TEST_TRASH_DIR" || return $?
         mkdir -p "$MOLE_TEST_TRASH_DIR" 2> /dev/null || return 1
         local ts
         ts=$(date +%s 2> /dev/null || echo 0)
@@ -2982,6 +3117,8 @@ safe_find_delete() {
         log_error "Invalid type filter: $type_filter, must be 'f' or 'd'"
         return 1
     fi
+
+    _mole_test_guard_mutation_path "$base_dir" || return $?
 
     debug_log "Finding in $base_dir: $pattern, age: ${age_days}d, type: $type_filter"
 

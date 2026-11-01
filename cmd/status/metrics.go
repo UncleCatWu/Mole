@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -429,7 +430,17 @@ func (c *Collector) collectFull() (MetricsSnapshot, error) {
 		func() (err error) { collected.diskIO = c.collectDiskIO(now); return nil },
 		func() (err error) { collected.netStats = c.collectNetwork(now); return nil },
 		func() (err error) { collected.proxyStats = collectProxy(); return nil },
-		func() (err error) { collected.batteryStats, _ = collectBatteries(); return nil },
+		func() error {
+			var err error
+			collected.batteryStats, err = collectBatteries()
+			if errors.Is(err, errNoBatteryData) {
+				return nil // A desktop with no battery is an ordinary sample.
+			}
+			if err != nil && c.hasEnrichment {
+				collected.batteryStats = slices.Clone(c.enrichment.batteries)
+			}
+			return err
+		},
 		func() (err error) { collected.thermalStats = collectThermal(); return nil },
 		// Sensors disabled - CPU temp already shown in CPU card
 		// collect(func() (err error) { sensorStats, _ = collectSensors(); return nil })

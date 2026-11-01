@@ -842,12 +842,9 @@ _uninstall_materialize_complete_pkg_apps() {
         "$MOLE_TIMEOUT_DISK_VERIFY_SEC" "$deadline_seconds") || remaining_rc=$?
     [[ $remaining_rc -eq 0 ]] || return "$remaining_rc"
 
-    # Allow the on-disk receipt cache (#1383). A cold walk of every non-Apple
-    # package on an Xcode machine can burn the whole discovery budget; the
-    # cache is keyed by a 1h TTL and only stores nonstandard .app paths, which
-    # is enough for the sibling check. A stale miss is still fail-closed:
-    # timeout/incomplete paths degrade to MOLE_UNINSTALL_SCAN_PARTIAL and
-    # narrow the plan rather than deleting shared leftovers.
+    # Complete sibling evidence must scan live payloads: a reinstall can alter
+    # paths without adding a package id. The UI cache is never absence proof.
+    # A bounded incomplete scan narrows the plan to the selected app only.
     local producer_rc=0
     MOLE_PKG_RECEIPT_LIST_TIMEOUT="$remaining" \
         MOLE_PKG_RECEIPT_SCAN_TIMEOUT="$remaining" \
@@ -1315,6 +1312,7 @@ _batch_scan_app_details() {
         [[ -z "$selected_app" ]] && continue
         IFS='|' read -r _ app_path app_name bundle_id _ _ <<< "$selected_app"
 
+        _batch_scan_stage="application identity check"
         local current_bundle_id=""
         local refresh_rc=0
         current_bundle_id=$(_batch_refresh_selected_app_bundle_id \
@@ -1369,6 +1367,7 @@ _batch_scan_app_details() {
         # Narrow the plan to the selected app bundle only: no bundle-id/name
         # leftovers, login item, process, helper, or Homebrew zap teardown.
         # Execution compares the exact snapshot before its first side effect.
+        _batch_scan_stage="other installation check"
         local live_sibling_rc=0
         local live_sibling_present=false
         uninstall_live_bundle_has_other_install \
@@ -1469,6 +1468,7 @@ _batch_scan_app_details() {
             running_apps+=("$app_name")
         fi
 
+        _batch_scan_stage="Homebrew ownership check"
         local cask_name="" is_brew_cask="false"
         if command -v get_brew_cask_name > /dev/null 2>&1; then
             local detected_cask=""
@@ -1477,6 +1477,10 @@ _batch_scan_app_details() {
             if [[ $cask_detect_rc -eq 124 || $cask_detect_rc -ge 128 ]]; then
                 return "$cask_detect_rc"
             elif [[ $cask_detect_rc -ne 0 && $cask_detect_rc -ne 1 ]]; then
+                # A cask brew cannot parse still lists cleanly under
+                # `brew list --cask`, so the app name is the only handle the
+                # abort message can give the user on which selection failed.
+                _batch_scan_app_name="$app_name"
                 return "$cask_detect_rc"
             fi
             if [[ -n "$detected_cask" ]]; then
@@ -1515,6 +1519,7 @@ _batch_scan_app_details() {
             continue
         fi
 
+        _batch_scan_stage="application size check"
         local app_size_kb="0"
         local app_size_rc=0
         app_size_kb=$(get_path_size_kb "$app_path") || app_size_rc=$?
@@ -1536,6 +1541,7 @@ _batch_scan_app_details() {
             # caches the surviving install uses.
             local sibling_survives=0
             [[ "$sibling_guard" != "none" ]] && sibling_survives=1
+            _batch_scan_stage="leftover scan"
             local discovery_rc=0
             related_files=$(MOLE_UNINSTALL_SIBLING_SURVIVES="$sibling_survives" \
                 find_app_files "$bundle_id" "$discovery_app_name" \
@@ -1557,6 +1563,7 @@ _batch_scan_app_details() {
             # fail-safe direction. Skip follow-on probes when leftover
             # discovery already timed out so we do not burn the floor budget.
             if [[ "$sibling_guard" == "none" && $discovery_rc -ne 124 ]]; then
+                _batch_scan_stage="diagnostic report scan"
                 local diag_rc=0
                 diag_user=$(get_diagnostic_report_paths_for_app "$app_path" \
                     "$discovery_app_name" \
@@ -1582,6 +1589,7 @@ _batch_scan_app_details() {
                 fi
             fi
             if [[ $discovery_rc -ne 124 ]]; then
+                _batch_scan_stage="system leftover scan"
                 local system_rc=0
                 system_files=$(find_app_system_files \
                     "$bundle_id" "$discovery_app_name") || system_rc=$?
@@ -1692,10 +1700,11 @@ _batch_preview_and_confirm() {
     # casks that will actually zap; sibling-guarded casks run a plain
     # uninstall so their shared configs and data stay.
     local has_zap_cask=false
-    local zap_detail zap_is_brew zap_guard
+    local zap_detail zap_is_brew zap_guard zap_name zap_original_id
     for zap_detail in "${app_details[@]}"; do
-        IFS='|' read -r _ _ _ _ _ _ _ _ zap_is_brew _ _ _ _ zap_guard _ <<< "$zap_detail"
-        if [[ "$zap_is_brew" == "true" && "${zap_guard:-none}" == "none" ]]; then
+        IFS='|' read -r zap_name _ _ _ _ _ _ _ zap_is_brew _ _ _ _ zap_guard _ zap_original_id _ <<< "$zap_detail"
+        if [[ "$zap_is_brew" == "true" && "${zap_guard:-none}" == "none" ]] &&
+            ! _mole_uninstall_is_zed_channel "$zap_original_id" "$zap_name"; then
             has_zap_cask=true
             break
         fi
@@ -2016,7 +2025,11 @@ _batch_execute_removals() {
                 # sibling guard is active those paths still belong to the
                 # surviving same-bundle install, so run a plain uninstall.
                 local cask_zap_mode="zap"
-                [[ "${sibling_guard:-none}" != "none" ]] && cask_zap_mode="nozap"
+                if [[ "${sibling_guard:-none}" != "none" ]] ||
+                    _mole_uninstall_is_zed_channel "$original_bundle_id" "$app_name"; then
+                    # Zed cask zaps also remove channel-shared name roots.
+                    cask_zap_mode="nozap"
+                fi
                 # Use brew_uninstall_cask helper (handles env vars, timeout, verification)
                 local brew_uninstall_rc=0
                 brew_uninstall_cask "$cask_name" "$app_path" \
@@ -2577,6 +2590,8 @@ batch_uninstall_applications() {
     local total_estimated_size=0
     local -a app_details=()
 
+    local _batch_scan_stage="application inspection"
+    local _batch_scan_app_name=""
     local _scan_rc=0
     _batch_scan_app_details || _scan_rc=$?
     if [[ $_batch_interrupted -eq 1 ]]; then
@@ -2593,6 +2608,12 @@ batch_uninstall_applications() {
         return "$_scan_rc"
     elif [[ $_scan_rc -ne 0 ]]; then
         _abort_uninstall_batch
+        log_error "Could not finish the uninstall scan ($_batch_scan_stage, exit $_scan_rc); nothing was removed"
+        if [[ "$_batch_scan_stage" == "Homebrew ownership check" ]]; then
+            log_info "'$_batch_scan_app_name' matches a Homebrew cask brew cannot read; run brew info --cask <cask>, fix or untap it, then retry mo uninstall --debug"
+        else
+            log_info "Run mo uninstall --debug to see which scan failed"
+        fi
         return 1
     fi
 
@@ -2668,17 +2689,8 @@ batch_uninstall_applications() {
 
     _batch_render_summary
 
-    # Run brew autoremove silently in background to avoid interrupting UX.
-    if [[ $brew_apps_removed -gt 0 && "${MOLE_DRY_RUN:-0}" != "1" ]]; then
-        # This background job never needs terminal input. Keeping its stdin
-        # attached lets the Perl timeout fallback hand off the controlling tty
-        # and suspend the foreground uninstall prompt with SIGTTIN.
-        (
-            HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
-                run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" brew autoremove > /dev/null 2>&1 || true
-        ) > /dev/null 2>&1 < /dev/null &
-        disown $! 2> /dev/null || true
-    fi
+    # Dependency cleanup belongs to mo clean's preview-first Homebrew flow.
+    # App confirmation does not authorize removing unrelated formulae.
 
     # Clean up Dock entries for uninstalled apps.
     if [[ $success_count -gt 0 && ${#success_dock_targets[@]} -gt 0 ]]; then

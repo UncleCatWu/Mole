@@ -120,6 +120,7 @@ _detect_cask_via_caskroom_search() {
 
     local -a tokens=()
     local room match token
+    local exact_app_link=""
     local scan_file=""
     scan_file=$(create_temp_file) || return 1
     local scan_deadline=$((SECONDS + MOLE_TIMEOUT_PKG_LIST_SEC))
@@ -147,6 +148,9 @@ _detect_cask_via_caskroom_search() {
             [[ -n "$match" ]] || continue
             token=$(_extract_cask_token_from_path "$match" 2> /dev/null) || continue
             [[ -n "$token" ]] && tokens+=("$token")
+            if [[ -n "$app_path" && -L "$match" && -d "$app_path" && "$match" -ef "$app_path" ]]; then
+                exact_app_link="$match"
+            fi
         done < "$scan_file"
     done
     rm -f -- "$scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
@@ -183,7 +187,17 @@ _detect_cask_via_caskroom_search() {
         info_output=$(_mole_brew_probe "$MOLE_TIMEOUT_PKG_LIST_SEC" \
             info --cask "${uniq[0]}" 2> /dev/null) || info_rc=$?
         [[ $info_rc -eq 124 || $info_rc -ge 128 ]] && return "$info_rc"
-        [[ $info_rc -eq 0 ]] || return 2
+        if [[ $info_rc -ne 0 ]]; then
+            # Third-party short-token lookup can fail even with an installed
+            # cask. Require its actual app symlink, not just a matching name,
+            # and recheck after the probe in case the link changed meanwhile.
+            if [[ -n "$exact_app_link" && -L "$exact_app_link" && -d "$app_path" &&
+                "$exact_app_link" -ef "$app_path" ]]; then
+                echo "${uniq[0]}"
+                return 0
+            fi
+            return 2
+        fi
         if [[ -n "$app_path" ]]; then
             if grep -qF "$app_path" <<< "$info_output"; then
                 :

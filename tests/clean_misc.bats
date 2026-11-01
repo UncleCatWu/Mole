@@ -27,18 +27,26 @@ teardown_file() {
 }
 
 @test "clean_cloud_storage calls expected caches" {
+    mkdir -p "$HOME/Library/Caches/com.getdropbox.dropbox" "$HOME/Library/Caches/com.google.GoogleDrive"
+    touch "$HOME/Library/Caches/com.getdropbox.dropbox/owned.bin" "$HOME/Library/Caches/com.google.GoogleDrive/owned.bin"
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
 stop_section_spinner() { :; }
-safe_clean() { echo "$2"; }
+safe_clean() { echo "$2|$1"; }
+pgrep() {
+    case "$*" in
+        "-x Dropbox" | "-x Google Drive") return 1 ;;
+        *) return 2 ;;
+    esac
+}
 clean_cloud_storage
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Dropbox cache"* ]] || return 1
-    [[ "$output" == *"Google Drive cache"* ]]
+    [[ "$output" == *"Dropbox cache|$HOME/Library/Caches/com.getdropbox.dropbox"* ]] || return 1
+    [[ "$output" == *"Google Drive cache|$HOME/Library/Caches/com.google.GoogleDrive"* ]]
 }
 
 @test "clean_virtualization_tools hits cache paths" {

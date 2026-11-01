@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 
 setup_file() {
+    export MOLE_PURGE_YES=1
 	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
 	export PROJECT_ROOT
 
@@ -2114,8 +2115,8 @@ set -euo pipefail
 source "$PROJECT_ROOT/bin/purge.sh"
 clean_project_artifacts() {
     PURGE_RUN_OUTCOME=incomplete
-    printf '0\n' > "$HOME/.cache/mole/purge_stats"
-    printf '0\n' > "$HOME/.cache/mole/purge_count"
+    printf '0\n' > "$_MOLE_PURGE_STATE_DIR/purge_stats"
+    printf '0\n' > "$_MOLE_PURGE_STATE_DIR/purge_count"
 }
 perform_purge </dev/null
 EOF
@@ -2132,8 +2133,8 @@ source "$PROJECT_ROOT/bin/purge.sh"
 clean_project_artifacts() {
     PURGE_RUN_OUTCOME=completed
     PURGE_UNKNOWN_SIZE_COUNT=1
-    printf '0\n' > "$HOME/.cache/mole/purge_stats"
-    printf '1\n' > "$HOME/.cache/mole/purge_count"
+    printf '0\n' > "$_MOLE_PURGE_STATE_DIR/purge_stats"
+    printf '1\n' > "$_MOLE_PURGE_STATE_DIR/purge_count"
 }
 perform_purge </dev/null
 EOF
@@ -2169,7 +2170,6 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
 
 mkdir -p "$HOME/.cache/mole"
-echo "0" > "$HOME/.cache/mole/purge_stats"
 
 mkdir -p "$HOME/www/test-project/node_modules"
 touch "$HOME/www/test-project/package.json"
@@ -2182,7 +2182,7 @@ export MOLE_PURGE_INCLUDE_EMPTY=1
 export MOLE_DRY_RUN=1
 clean_project_artifacts </dev/null
 
-stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+stats_dir="$_MOLE_PURGE_LAST_STATE_DIR"
 echo "COUNT=$(cat "$stats_dir/purge_count" 2> /dev/null || echo missing)"
 echo "SIZE=$(cat "$stats_dir/purge_stats" 2> /dev/null || echo missing)"
 [[ -d "$HOME/www/test-project/node_modules" ]]
@@ -2311,7 +2311,7 @@ EOF
 
 @test "clean_project_artifacts: manually selected uncertain activity never reaches removal" {
 	local script_file
-	script_file=$(mktemp "$HOME/uncertain_selection.XXXXXX.sh")
+	script_file=$(mktemp "$HOME/uncertain_selection.XXXXXX")
 
 	cat > "$script_file" <<'SCRIPT'
 set -euo pipefail
@@ -2358,10 +2358,6 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/project.sh"
 
 mkdir -p "$HOME/.cache/mole"
-echo "0" > "$HOME/.cache/mole/purge_stats"
-# purge_count must be seeded too: without it this reads a previous test's file
-# through the shared HOME, or reports "missing" when run alone.
-echo "0" > "$HOME/.cache/mole/purge_count"
 
 mkdir -p "$HOME/www/test-project/node_modules"
 echo "test data" > "$HOME/www/test-project/node_modules/file.js"
@@ -2379,7 +2375,7 @@ safe_remove() { return 1; }
 export MOLE_DRY_RUN=1
 clean_project_artifacts
 
-stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+stats_dir="$_MOLE_PURGE_LAST_STATE_DIR"
 echo "COUNT=$(cat "$stats_dir/purge_count" 2> /dev/null || echo missing)"
 echo "SIZE=$(cat "$stats_dir/purge_stats" 2> /dev/null || echo missing)"
 [[ -d "$HOME/www/test-project/node_modules" ]]
@@ -2946,7 +2942,7 @@ EOF
 _run_in_pty() {
 	local script_file="$1"
 	# A socket-backed runner stdin makes macOS script(1) fail before the child starts.
-	script -q /dev/null /bin/bash --noprofile --norc "$script_file" < /dev/null 2>/dev/null
+	python3 -B "$PROJECT_ROOT/tests/support/owned_pty.py" run "$script_file"
 }
 
 @test "sort: PURGE_CATEGORY_FULL_PATHS_ARRAY[0] is the largest artifact after size-descending sort" {
@@ -2962,7 +2958,7 @@ _run_in_pty() {
 
 	local capture_file script_file
 	capture_file=$(mktemp "$HOME/sort_capture.XXXXXX")
-	script_file=$(mktemp  "$HOME/sort_script.XXXXXX.sh")
+	script_file=$(mktemp  "$HOME/sort_script.XXXXXX")
 
 	cat > "$script_file" << SCRIPT
 set -euo pipefail
@@ -3011,7 +3007,7 @@ SCRIPT
 
 	local capture_file script_file
 	capture_file=$(mktemp "$HOME/sort_capture.XXXXXX")
-	script_file=$(mktemp  "$HOME/sort_script.XXXXXX.sh")
+	script_file=$(mktemp  "$HOME/sort_script.XXXXXX")
 
 	cat > "$script_file" << SCRIPT
 set -euo pipefail
@@ -3089,7 +3085,7 @@ SCRIPT
 
 	local capture_file script_file
 	capture_file=$(mktemp "$HOME/group_sort_capture.XXXXXX")
-	script_file=$(mktemp "$HOME/group_sort_script.XXXXXX.sh")
+	script_file=$(mktemp "$HOME/group_sort_script.XXXXXX")
 
 	cat > "$script_file" << SCRIPT
 set -euo pipefail
@@ -3134,7 +3130,7 @@ SCRIPT
 
 	local capture_file script_file
 	capture_file=$(mktemp "$HOME/fallback_group_capture.XXXXXX")
-	script_file=$(mktemp "$HOME/fallback_group_script.XXXXXX.sh")
+	script_file=$(mktemp "$HOME/fallback_group_script.XXXXXX")
 
 	cat > "$script_file" << SCRIPT
 set -euo pipefail
@@ -3191,7 +3187,7 @@ SCRIPT
 
 	local capture_file script_file
 	capture_file=$(mktemp "$HOME/sort_cloud_capture.XXXXXX")
-	script_file=$(mktemp "$HOME/sort_cloud_script.XXXXXX.sh")
+	script_file=$(mktemp "$HOME/sort_cloud_script.XXXXXX")
 
 	cat > "$script_file" << SCRIPT
 set -euo pipefail
@@ -3242,4 +3238,178 @@ SCRIPT
 	[[ "$path1" == *"[cloud]"* ]] || return 1
 	[[ "$menu1" == *"cloud-project"* ]] || return 1
 	[[ "$path1" == *"cloud-project"* ]] || return 1
+}
+
+@test "purge state is per invocation and cannot cancel or overwrite a peer run" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+# The only destructive action below removes this fixture's progress marker;
+# target deletion is never invoked by this state/progress regression.
+local_run() {
+    local _MOLE_PURGE_STATE_DIR=""
+    mole_purge_init_run_state
+    local state="$_MOLE_PURGE_STATE_DIR"
+    printf '%s\n' "$state" > "$HOME/$1.state"
+    if [[ "$1" == first ]]; then
+        printf '13\n' > "$state/purge_stats"
+        printf '2\n' > "$state/purge_count"
+        local attempts=0
+        while [[ ! -f "$HOME/second.ready" ]]; do
+            attempts=$((attempts + 1)); [[ $attempts -lt 250 ]] || return 3
+            sleep 0.02
+        done
+        # Simulate first run's ordinary scan completion/cancel boundary.
+        rm -f "$state/purge_scanning" # SAFE: exact fixture-owned progress file
+        : > "$HOME/first.finished"
+    else
+        : > "$HOME/second.ready"
+        local attempts=0
+        while [[ ! -f "$HOME/first.finished" ]]; do
+            attempts=$((attempts + 1)); [[ $attempts -lt 250 ]] || return 4
+            sleep 0.02
+        done
+        [[ -f "$state/purge_scanning" ]] || return 1
+        [[ $(cat "$state/purge_stats") == 0 && $(cat "$state/purge_count") == 0 ]] || return 2
+        printf 'PEER_PROGRESS_AND_TOTALS_PRESERVED\n'
+    fi
+}
+local_run first & a=$!
+local_run second & b=$!
+wait "$a"; wait "$b"
+[[ $(cat "$HOME/first.state") != "$(cat "$HOME/second.state")" ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"PEER_PROGRESS_AND_TOTALS_PRESERVED"* ]]
+}
+
+@test "purge protects deployment keys and tracked source but keeps ordinary artifacts eligible" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/protected-artifacts.XXXXXX")
+mkdir -p "$root/anchor[1]/target/deploy" "$root/rust/target/debug" "$root/repo/build"
+printf fixture > "$root/anchor[1]/target/deploy/demo-keypair.json"
+printf fixture > "$root/repo/build/default.nix"
+git init -q "$root/repo"
+git -C "$root/repo" add build/default.nix
+is_protected_purge_artifact "$root/anchor[1]/target" || exit 11
+is_protected_purge_artifact "$root/repo/build" || exit 12
+if is_protected_purge_artifact "$root/rust/target"; then exit 13; fi
+rm "$root/anchor[1]/target/deploy/demo-keypair.json"
+if is_protected_purge_artifact "$root/anchor[1]/target"; then exit 14; fi
+mkdir "$root/rust/target/nested"
+git init -q "$root/rust/target/nested"
+is_protected_purge_artifact "$root/rust/target" || exit 15
+EOF
+    [ "$status" -eq 0 ]
+}
+
+@test "purge protects artifacts when Git inspection fails" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/broken-git.XXXXXX")
+mkdir -p "$root/.git" "$root/target"
+is_protected_purge_artifact "$root/target" || exit 1
+EOF
+    [ "$status" -eq 0 ]
+}
+
+@test "purge refuses unattended real deletion without explicit consent" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+unset MOLE_PURGE_YES MOLE_DRY_RUN
+clean_project_artifacts
+EOF
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Purge requires confirmation"* ]] || return 1
+}
+
+@test "purge inspection never executes repository fsmonitor hooks" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/fsmonitor.XXXXXX")
+mkdir -p "$root/target"
+git init -q "$root"
+printf fixture > "$root/target/source.txt"
+git -C "$root" add target/source.txt
+printf '#!/bin/sh\ntouch "%s"\n' "$root/invoked" > "$root/hook"
+chmod +x "$root/hook"
+git -C "$root" config core.fsmonitor "$root/hook"
+is_protected_purge_artifact "$root/target" || exit 1
+[[ ! -e "$root/invoked" ]] || exit 2
+EOF
+    [ "$status" -eq 0 ]
+}
+
+@test "purge protects tracked source through a symlinked project ancestor" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/git-alias.XXXXXX")
+mkdir -p "$root/repo/subproject/child/build" "$root/aliases"
+printf authored > "$root/repo/subproject/child/build/source.txt"
+git init -q "$root/repo"
+git -C "$root/repo" add subproject/child/build/source.txt
+ln -s "$root/repo/subproject" "$root/aliases/project"
+is_protected_purge_artifact "$root/aliases/project/child/build" || exit 1
+EOF
+    [ "$status" -eq 0 ]
+}
+
+@test "purge keeps and reports a candidate whose content probe could not finish" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF_INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+root=$(mktemp -d "$HOME/unverified.XXXXXX")
+mkdir -p "$root/proj/node_modules/pkg"
+printf x > "$root/proj/node_modules/pkg/index.js"
+# A timed-out or failed walk is status 2: neither authored nor clean.
+purge_artifact_has_authored_content() { return 2; }
+is_protected_purge_artifact "$root/proj/node_modules" || exit 11
+[[ "$PURGE_PROTECTION_UNVERIFIED" == "true" ]] || exit 12
+# Discovery must not drop it silently.
+kept=$(printf '%s\n' "$root/proj/node_modules" | filter_protected_artifacts)
+[[ "$kept" == "$root/proj/node_modules" ]] || exit 13
+# Evidence still protects, and clears the unverified flag.
+purge_artifact_has_authored_content() { return 0; }
+is_protected_purge_artifact "$root/proj/node_modules" || exit 14
+[[ "$PURGE_PROTECTION_UNVERIFIED" == "false" ]] || exit 15
+kept=$(printf '%s\n' "$root/proj/node_modules" | filter_protected_artifacts)
+[[ -z "$kept" ]] || exit 16
+EOF_INNER
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "purge review names a candidate it could not inspect and marks the run incomplete" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF_INNER'
+set -euo pipefail
+# Match the physical paths returned by discovery when HOME contains a symlink.
+HOME=$(cd "$HOME" && pwd -P)
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mkdir -p "$HOME/www/test-project/node_modules/pkg"
+printf x > "$HOME/www/test-project/node_modules/pkg/index.js"
+printf '{}' > "$HOME/www/test-project/package.json"
+touch -t 202001010101 "$HOME/www/test-project/node_modules/pkg/index.js" \
+    "$HOME/www/test-project/node_modules" "$HOME/www/test-project/package.json" "$HOME/www/test-project"
+PURGE_SEARCH_PATHS=("$HOME/www")
+purge_artifact_has_authored_content() { return 2; }
+export MOLE_DRY_RUN=1
+clean_project_artifacts
+echo "OUTCOME=$PURGE_RUN_OUTCOME"
+[[ -d "$HOME/www/test-project/node_modules" ]]
+EOF_INNER
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"Could not inspect ~/www/test-project/node_modules; kept"* ]] || return 1
+    [[ "$output" == *"OUTCOME=incomplete"* ]] || return 1
 }

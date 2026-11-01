@@ -142,7 +142,7 @@ before the code can land.
 For current uses, grep `# SAFE:`. Anchored by symbol rather than line number,
 because line refs rot: `_remove_verified_container_stub` in `lib/clean/apps.sh`,
 `cleanup_temp_files` and the Mole-temp-root sweeps in `lib/core/base.sh`, and
-the orphan-tmp cleanup in `scripts/test.sh`.
+the exact per-invocation root cleanup in `scripts/test_sandbox.sh`.
 
 `_remove_verified_container_stub` is the one bypass worth understanding before
 you "fix" it: it *must* use raw `rm`, because `should_protect_path` blankets
@@ -209,7 +209,7 @@ rejected before it reaches Finder.
 
 ## Layer 5: Test mode + dry run + property tests
 
-Three orthogonal mechanisms make the safety claims testable and
+These mechanisms make the safety claims testable and
 prevent live-machine test runs from doing real damage:
 
 - `MOLE_DRY_RUN=1`: every safe-remove logs what it would do and
@@ -219,6 +219,16 @@ prevent live-machine test runs from doing real damage:
   `launchctl`, or any path that would prompt the user. Required for
   bats and the integration tests. Enforced by `scripts/test.sh` PATH
   stubs that fail loudly when called.
+- `scripts/test_sandbox.sh`: copies current source into a private run root and
+  applies a macOS kernel sandbox. Writes outside that root, external network
+  access, external signals, and real authorization/system-control executables
+  are denied. Shared file-operation sinks additionally require a matching
+  internal fixture capability and reject symlinked ancestors. Non-sudo removal
+  of normal fixtures remains real and testable. Test flags or a fixture HOME
+  alone do not provide this boundary. Direct Bats entrypoints must use the
+  wrapper; unavailable OS isolation refuses rather than running unconfined.
+  Prior `tests/tmp-*` directories are never swept. Only the root created by the
+  current successful invocation is removed; failed roots remain as evidence.
 - `tests/path_validation_fuzz.bats` and `cmd/analyze/delete_fuzz_test.go`
   harden the validators. The bats test asserts that every line in
   `tests/fuzz_corpus/dangerous_paths.txt` (79 adversarial paths today)

@@ -12,6 +12,11 @@ clean_tool_cache() {
     local cache_path="$2"
     shift 2
 
+    local pending_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
+    if [[ $pending_cancel -eq 124 || $pending_cancel -ge 128 ]]; then
+        return "$pending_cancel"
+    fi
+
     if [[ -n "$cache_path" ]] && is_path_whitelisted "$cache_path"; then
         if [[ "$DRY_RUN" == "true" ]]; then
             echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $description · would skip (whitelist)"
@@ -24,19 +29,22 @@ clean_tool_cache() {
     fi
 
     if [[ "$DRY_RUN" != "true" ]]; then
-        local command_succeeded=false
+        local command_status=0
         if [[ -t 1 ]]; then
             start_section_spinner "Cleaning $description..."
         fi
-        if "$@" > /dev/null 2>&1; then
-            command_succeeded=true
-        fi
+        "$@" > /dev/null 2>&1 || command_status=$?
         if [[ -t 1 ]]; then
             stop_section_spinner
         fi
-        if [[ "$command_succeeded" == "true" ]]; then
+        if [[ $command_status -eq 0 ]]; then
             echo -e "  ${GREEN}${ICON_SUCCESS}${NC} $description"
             note_activity
+        else
+            _mole_record_clean_cancellation "$command_status"
+            echo -e "  ${GRAY}${ICON_WARNING}${NC} $description · failed (status $command_status)"
+            note_activity
+            return "$command_status"
         fi
     else
         echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $description · would clean"
@@ -773,7 +781,7 @@ clean_dev_python() {
         if [[ -z "$pip_cache_path" || "$pip_cache_path" != /* ]]; then
             pip_cache_path="$HOME/Library/Caches/pip"
         fi
-        clean_tool_cache "pip cache" "$pip_cache_path" bash -c 'pip3 cache purge > /dev/null 2>&1 || true'
+        clean_tool_cache "pip cache" "$pip_cache_path" run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" pip3 cache purge
         note_activity
     fi
     safe_clean ~/.pyenv/cache/* "pyenv cache"
@@ -1051,7 +1059,7 @@ clean_dev_mise() {
 
     if command -v mise > /dev/null 2>&1; then
         if [[ "${DRY_RUN:-false}" != "true" ]]; then
-            clean_tool_cache "mise cache" "$mise_cache_path" bash -c 'mise cache clear > /dev/null 2>&1 || true'
+            clean_tool_cache "mise cache" "$mise_cache_path" run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" mise cache clear
             note_activity
         elif is_path_whitelisted "$mise_cache_path"; then
             echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} mise cache · would skip (whitelist)"
@@ -2315,27 +2323,6 @@ clean_xcode_device_support() {
     fi
 }
 
-_sim_runtime_mount_points() {
-    if [[ -n "${MOLE_XCODE_SIM_RUNTIME_MOUNT_POINTS:-}" ]]; then
-        printf '%s\n' "$MOLE_XCODE_SIM_RUNTIME_MOUNT_POINTS"
-        return 0
-    fi
-    mount 2> /dev/null | command awk '{print $3}' || true
-}
-
-_sim_runtime_is_path_in_use() {
-    local target_path="$1"
-    shift || true
-    local mount_path
-    for mount_path in "$@"; do
-        [[ -z "$mount_path" ]] && continue
-        if [[ "$mount_path" == "$target_path" || "$mount_path" == "$target_path"/* ]]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
 _sim_runtime_size_kb() {
     local target_path="$1"
     local size_kb=0
@@ -2347,266 +2334,6 @@ _sim_runtime_size_kb() {
 
     [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
     echo "$size_kb"
-}
-
-clean_xcode_simulator_runtime_volumes() {
-    local volumes_root="${MOLE_XCODE_SIM_RUNTIME_VOLUMES_ROOT:-/Library/Developer/CoreSimulator/Volumes}"
-    local cryptex_root="${MOLE_XCODE_SIM_RUNTIME_CRYPTEX_ROOT:-/Library/Developer/CoreSimulator/Cryptex}"
-
-    local -a candidates=()
-    local candidate
-    for candidate in "$volumes_root" "$cryptex_root"; do
-        [[ -d "$candidate" ]] || continue
-        while IFS= read -r -d '' entry; do
-            candidates+=("$entry")
-        done < <(command find "$candidate" -mindepth 1 -maxdepth 1 -type d -print0 2> /dev/null)
-    done
-
-    if [[ ${#candidates[@]} -eq 0 ]]; then
-        return 0
-    fi
-
-    local -a mount_points=()
-    while IFS= read -r line; do
-        [[ -n "$line" ]] && mount_points+=("$line")
-    done < <(_sim_runtime_mount_points)
-
-    # A real macOS system always mounts at least "/", so an empty list means
-    # `mount` failed. Without this guard every candidate falls to the UNUSED
-    # branch below and gets sudo-deleted, possibly while still mounted. Treat
-    # "cannot enumerate mounts" as "cannot prove unused" and skip cleanup.
-    if [[ ${#mount_points[@]} -eq 0 ]]; then
-        return 0
-    fi
-
-    local -a entry_statuses=()
-    local -a sorted_candidates=()
-    local sorted
-    while IFS= read -r sorted; do
-        [[ -n "$sorted" ]] && sorted_candidates+=("$sorted")
-    done < <(printf '%s\n' "${candidates[@]}" | LC_ALL=C sort)
-
-    # Only show scanning message in debug mode; spinner provides visual feedback otherwise
-    if [[ "${MO_DEBUG:-0}" == "1" ]]; then
-        echo -e "  ${GRAY}${ICON_LIST}${NC} Xcode runtime volumes · scanning ${#sorted_candidates[@]} entries"
-    fi
-    local runtime_scan_spinner=false
-    if [[ -t 1 ]]; then
-        start_section_spinner "Scanning Xcode runtime volumes..."
-        runtime_scan_spinner=true
-    fi
-
-    local in_use_count=0
-    for candidate in "${sorted_candidates[@]}"; do
-        local status="UNUSED"
-        if [[ ${#mount_points[@]} -gt 0 ]] && _sim_runtime_is_path_in_use "$candidate" "${mount_points[@]}"; then
-            status="IN_USE"
-            in_use_count=$((in_use_count + 1))
-        fi
-        entry_statuses+=("$status")
-    done
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        local -a size_values=()
-        local unused_kb=0
-        local cleanable_unused_count=0
-        local preview_in_use_count=0
-        local dry_stop_reason=""
-        local i=0
-        for candidate in "${sorted_candidates[@]}"; do
-            local status="${entry_statuses[$i]:-UNUSED}"
-            if [[ "$status" == "IN_USE" ]]; then
-                # Mounted runtimes cannot be removed by this run. Walking a
-                # multi-GB mounted image only to report a non-reclaimable size
-                # dominated dry-run latency, so keep the state and skip du.
-                size_values+=("-1")
-                preview_in_use_count=$((preview_in_use_count + 1))
-            else
-                local size_kb
-                size_kb=$(_sim_runtime_size_kb "$candidate")
-                local -a current_mount_points=()
-                while IFS= read -r line; do
-                    [[ -n "$line" ]] && current_mount_points+=("$line")
-                done < <(_sim_runtime_mount_points)
-                if [[ ${#current_mount_points[@]} -eq 0 ]]; then
-                    dry_stop_reason="mount state unknown"
-                    break
-                fi
-                if _sim_runtime_is_path_in_use "$candidate" "${current_mount_points[@]}"; then
-                    dry_stop_reason="runtime became mounted"
-                    break
-                fi
-                if ! should_protect_path "$candidate" && ! is_path_whitelisted "$candidate"; then
-                    if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                        record_dry_run_cleanup_target "$candidate" "$size_kb" 1 true || {
-                            size_values+=("$size_kb")
-                            i=$((i + 1))
-                            continue
-                        }
-                    fi
-                    unused_kb=$((unused_kb + size_kb))
-                    cleanable_unused_count=$((cleanable_unused_count + 1))
-                fi
-                size_values+=("$size_kb")
-            fi
-            i=$((i + 1))
-        done
-        if [[ "$runtime_scan_spinner" == "true" ]]; then
-            stop_section_spinner
-            runtime_scan_spinner=false
-        fi
-
-        echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Xcode runtime volumes · ${cleanable_unused_count} unused, ${preview_in_use_count} in use"
-        local dryrun_unused_human
-        dryrun_unused_human=$(bytes_to_human "$((unused_kb * 1024))")
-        local in_use_size_note=""
-        if [[ $preview_in_use_count -gt 0 ]]; then
-            in_use_size_note=" (in-use not scanned)"
-        fi
-        echo -e "  ${GRAY}${ICON_LIST}${NC} Runtime volume size: unused ${dryrun_unused_human}${in_use_size_note}"
-
-        local dryrun_max_items="${MOLE_SIM_RUNTIME_DRYRUN_MAX_ITEMS:-20}"
-        [[ "$dryrun_max_items" =~ ^[0-9]+$ ]] || dryrun_max_items=20
-        if [[ "$dryrun_max_items" -le 0 ]]; then
-            dryrun_max_items=20
-        fi
-
-        local shown=0
-        local line_size_kb line_status line_path
-        while IFS=$'\t' read -r line_size_kb line_status line_path; do
-            [[ -z "${line_path:-}" ]] && continue
-            local line_human
-            if [[ "$line_size_kb" == "-1" ]]; then
-                line_human="not scanned"
-            else
-                line_human=$(bytes_to_human "$((line_size_kb * 1024))")
-            fi
-            echo -e "    ${GRAY}${line_status}${NC} ${line_human} · ${line_path}"
-            shown=$((shown + 1))
-            if [[ "$shown" -ge "$dryrun_max_items" ]]; then
-                break
-            fi
-        done < <(
-            local j=0
-            while [[ $j -lt ${#sorted_candidates[@]} ]]; do
-                printf '%s\t%s\t%s\n' "${size_values[$j]:-0}" "${entry_statuses[$j]:-UNUSED}" "${sorted_candidates[$j]}"
-                j=$((j + 1))
-            done | LC_ALL=C sort -nr -k1,1
-        )
-
-        local total_entries="${#size_values[@]}"
-        if [[ "$total_entries" -gt "$shown" ]]; then
-            local remaining=$((total_entries - shown))
-            echo -e "    ${GRAY}${ICON_LIST}${NC} ... and ${remaining} more runtime volume entries"
-        fi
-        note_activity
-        if [[ -n "$dry_stop_reason" ]]; then
-            echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode runtime volumes · stopped (${dry_stop_reason})"
-            note_activity
-        fi
-        return 0
-    fi
-
-    # Auto-clean all UNUSED runtime volumes (no user selection)
-    local -a selected_paths=()
-    local skipped_protected=0
-    local i=0
-    for ((i = 0; i < ${#sorted_candidates[@]}; i++)); do
-        local status="${entry_statuses[$i]:-UNUSED}"
-        [[ "$status" == "IN_USE" ]] && continue
-
-        local candidate_path="${sorted_candidates[$i]}"
-        if should_protect_path "$candidate_path" || is_path_whitelisted "$candidate_path"; then
-            skipped_protected=$((skipped_protected + 1))
-            continue
-        fi
-        selected_paths+=("$candidate_path")
-    done
-
-    if [[ "$runtime_scan_spinner" == "true" ]]; then
-        stop_section_spinner
-        runtime_scan_spinner=false
-    fi
-
-    if [[ ${#selected_paths[@]} -eq 0 ]]; then
-        debug_log "Xcode runtime volumes have no unused cleanable entries"
-        return 0
-    fi
-
-    if ! has_sudo_session; then
-        if ! ensure_sudo_session "Cleaning Xcode runtime volumes requires admin access"; then
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Xcode runtime volumes · skipped (sudo denied)"
-            note_activity
-            return 0
-        fi
-    fi
-
-    # Perform cleanup and report final result in one line
-    local removed_count=0
-    local removed_size_kb=0
-    local failed_count=0
-    local stop_reason=""
-    local selected_path
-    for selected_path in "${selected_paths[@]}"; do
-        local selected_size_kb=0
-        selected_size_kb=$(_sim_runtime_size_kb "$selected_path")
-
-        # Mount state can change while sizing or waiting for sudo. Refresh it
-        # for each candidate and stop when the path is mounted or the probe is
-        # unavailable; an old UNUSED snapshot never authorizes deletion.
-        local -a current_mount_points=()
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && current_mount_points+=("$line")
-        done < <(_sim_runtime_mount_points)
-        if [[ ${#current_mount_points[@]} -eq 0 ]]; then
-            stop_reason="mount state unknown"
-            break
-        fi
-        if _sim_runtime_is_path_in_use "$selected_path" "${current_mount_points[@]}"; then
-            stop_reason="runtime became mounted"
-            break
-        fi
-
-        if safe_sudo_remove "$selected_path" "$selected_size_kb"; then
-            removed_count=$((removed_count + 1))
-            removed_size_kb=$((removed_size_kb + selected_size_kb))
-        else
-            failed_count=$((failed_count + 1))
-        fi
-    done
-
-    # Unified output: report result, not intermediate steps
-    if [[ $removed_count -gt 0 ]]; then
-        local removed_human
-        removed_human=$(bytes_to_human "$((removed_size_kb * 1024))")
-        local line_color
-        line_color=$(cleanup_result_color_kb "$removed_size_kb")
-        if [[ $skipped_protected -gt 0 ]]; then
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Xcode runtime volumes · removed ${removed_count} (${line_color}${removed_human}${NC}), skipped ${skipped_protected} protected"
-        else
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Xcode runtime volumes · removed ${removed_count} (${line_color}${removed_human}${NC})"
-        fi
-        if [[ $failed_count -gt 0 ]]; then
-            echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode runtime volumes · could not remove ${failed_count} entries"
-        fi
-        note_activity
-    else
-        if [[ $failed_count -gt 0 ]]; then
-            echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode runtime volumes · could not remove ${failed_count} entries"
-            if [[ $skipped_protected -gt 0 ]]; then
-                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Xcode runtime volumes · skipped ${skipped_protected} protected"
-            fi
-        elif [[ $skipped_protected -gt 0 ]]; then
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Xcode runtime volumes · skipped ${skipped_protected} protected, none removed"
-        fi
-        if [[ $failed_count -gt 0 || $skipped_protected -gt 0 ]]; then
-            note_activity
-        fi
-    fi
-    if [[ -n "$stop_reason" ]]; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode runtime volumes · stopped (${stop_reason})"
-        note_activity
-    fi
 }
 
 _MOLE_SIMCTL_DEVELOPER_DIR=""
@@ -2748,10 +2475,11 @@ _debug_simctl_probe_stderr() {
 }
 
 # Installed simulator runtimes that no device uses. Distinct from
-# clean_xcode_simulator_runtime_volumes (stale mount points) and from
 # unavailable-simulator cleanup (devices orphaned by a removed runtime):
 # this is the inverse, a runtime left behind after its last device went
-# away. Nothing in macOS or Xcode reports it, so an 8GB download can sit
+# away. The runtime volume and cryptex roots under /Library/Developer/
+# CoreSimulator are Apple-owned and never touched or listed; mount absence
+# proves nothing about ownership or obsolescence. Nothing in macOS or Xcode reports it, so an 8GB download can sit
 # unreferenced indefinitely.
 #
 # Review-only by design. A runtime is a toolchain payload that only Apple
@@ -2840,6 +2568,10 @@ _simctl_orphan_runtime_rows() {
         }'
 }
 
+# Review-only: prints a hint naming the owner command, never deletes. A
+# simctl timeout here (cold CoreSimulatorService) only costs this run its
+# hint, so it is a debug-logged skip rather than a run-wide cancellation.
+# Signals (>=128) still propagate so Ctrl-C stays sticky.
 check_orphaned_simulator_runtimes() {
     command -v xcrun > /dev/null 2>&1 || return 0
     [[ "${_MOLE_SIMCTL_RESOLUTION_STATUS:-}" == "ready" ]] || return 0
@@ -2847,16 +2579,16 @@ check_orphaned_simulator_runtimes() {
     local runtime_json="" device_json="" probe_status=0
     runtime_json=$(_run_simctl "$MOLE_TIMEOUT_PKG_LIST_SEC" runtime list -j 2> /dev/null) || probe_status=$?
     if [[ $probe_status -ne 0 ]]; then
-        [[ $probe_status -eq 124 || $probe_status -ge 128 ]] && return "$probe_status"
-        debug_log "Orphaned runtime probe failed (exit=$probe_status)"
+        [[ $probe_status -ge 128 ]] && return "$probe_status"
+        debug_log "Orphaned runtime review skipped: runtime probe failed (exit=$probe_status)"
         return 0
     fi
 
     probe_status=0
     device_json=$(_run_simctl "$MOLE_TIMEOUT_PKG_LIST_SEC" list devices -j 2> /dev/null) || probe_status=$?
     if [[ $probe_status -ne 0 ]]; then
-        [[ $probe_status -eq 124 || $probe_status -ge 128 ]] && return "$probe_status"
-        debug_log "Orphaned runtime device probe failed (exit=$probe_status)"
+        [[ $probe_status -ge 128 ]] && return "$probe_status"
+        debug_log "Orphaned runtime review skipped: device probe failed (exit=$probe_status)"
         return 0
     fi
     # Without a recognizable device payload there is no evidence of absence,
@@ -2879,7 +2611,6 @@ clean_dev_mobile() {
     check_android_ndk
     clean_xcode_documentation_cache || return $?
     clean_xcode_system_coresimulator_caches || return $?
-    clean_xcode_simulator_runtime_volumes || return $?
     clean_xcode_xctest_devices || return $?
 
     if command -v xcrun > /dev/null 2>&1; then
@@ -3082,11 +2813,17 @@ clean_dev_mobile() {
                     fi
                 fi # Close if ((unavailable_before == 0))
             fi     # End of simctl_available check
+            # The review reads the same service the listing above just failed
+            # to reach; two more bounded waits would not warm it any faster.
+            if [[ "$simctl_available" == "true" ]]; then
+                check_orphaned_simulator_runtimes || return $?
+            else
+                debug_log "Orphaned runtime review skipped: unavailable-simulator probe failed"
+            fi
         else
             echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode unavailable simulators · simctl could not be resolved"
             note_activity
         fi
-        check_orphaned_simulator_runtimes || return $?
     fi
     # Old iOS/watchOS/tvOS DeviceSupport versions (debug symbols for connected devices).
     # Each iOS version creates a 1-3 GB folder of debug symbols. Only the versions
@@ -3961,16 +3698,20 @@ clean_claude_desktop_bundled_versions() {
 
 # Headless browser trees leaked by dead Playwright/agent automation sessions.
 # When an MCP server or agent harness dies without cleanup, its browser
-# daemons reparent to launchd (ppid 1) and the Chrome tree keeps running
-# headless, holding RSS; the ephemeral temp profiles keep disk.
+# reparents to launchd (ppid 1) and the Chrome tree keeps running headless,
+# holding RSS; the ephemeral temp profiles keep disk.
 #
-# Only processes tied to playwright_chromiumdev_profile-* automation profiles
-# are ever touched, never a user's real browser, and the evidence of a leak is
-# ppid 1: the harness that owned this browser is gone. That is a fact about
-# the session rather than a guess from age, so it protects a live automation
-# run of any length (its parent is still alive) while catching a leak minutes
-# after it happens instead of a day later. The one-hour floor only keeps the
-# scan away from a browser that is mid-handoff between two parents.
+# Only browser processes tied to playwright_chromiumdev_profile-* automation
+# profiles are ever touched, never a user's real browser, and the evidence of
+# a leak is ppid 1: the node process that launched this browser is gone. That
+# is a fact about the session rather than a guess from age, so it protects a
+# live automation run of any length (its parent is still alive) while catching
+# a leak minutes after it happens. The one-hour floor only keeps the scan away
+# from a browser that is mid-handoff between two parents.
+#
+# The playwright-cli session daemon (cliDaemon.js) is deliberately not a
+# target: cli-client spawns it detached and unrefs it, so ppid 1 is its normal
+# state for the whole life of an active session, not evidence of a leak.
 #
 # Chrome helper processes keep the main browser as their parent, so this
 # matches roots only and the tree follows them down.
@@ -3987,8 +3728,7 @@ _automation_browser_process_records() {
             command = $9
             for (i = 10; i <= NF; i++) command = command " " $i
         }
-        command ~ /playwright-core\/lib\/entry\/cliDaemon\.js/ ||
-            command ~ /playwright_chromiumdev_profile/ {
+        command ~ /playwright_chromiumdev_profile/ {
             print $1 "|" $4 " " $5 " " $6 " " $7 " " $8
         }'
 }
@@ -4010,6 +3750,29 @@ _automation_browser_process_matches_record() {
     [[ "$current_record" == "$pid|$expected_start" ]]
 }
 
+# Final owner and identity probe for one discovered automation profile.
+# Return the shared process tri-state; unknown never authorizes cleanup.
+_automation_profile_cleanup_state() {
+    local probe_rc=0
+    run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        pgrep -qf -- "$_MOLE_AUTOMATION_PROFILE" > /dev/null 2>&1 || probe_rc=$?
+    if [[ $probe_rc -eq 124 || $probe_rc -ge 128 ]]; then
+        _mole_record_clean_cancellation "$probe_rc"
+        return 2
+    fi
+    [[ $probe_rc -eq 1 ]] || return "$probe_rc"
+    [[ ! -L "$_MOLE_AUTOMATION_PROFILE" ]] || return 2
+    _mole_path_matches_identity "$_MOLE_AUTOMATION_PROFILE" \
+        "$_MOLE_AUTOMATION_PARENT" "$_MOLE_AUTOMATION_PARENT_ID" \
+        "$_MOLE_AUTOMATION_TARGET_ID" || return 2
+    # Pass discovery's exact object binding into safe_remove, including parent.
+    _MOLE_SAFE_CLEAN_BOUND_PATH="$_MOLE_AUTOMATION_PROFILE"
+    _MOLE_SAFE_CLEAN_EXPECTED_PARENT="$_MOLE_AUTOMATION_PARENT"
+    _MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID="$_MOLE_AUTOMATION_PARENT_ID"
+    _MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID="$_MOLE_AUTOMATION_TARGET_ID"
+    return 1
+}
+
 clean_dev_automation_browsers() {
     local -a leaked_processes=()
     local process_rows=""
@@ -4026,19 +3789,34 @@ clean_dev_automation_browsers() {
     fi
 
     # Ephemeral automation profiles: stale after 2h, and never one that a
-    # live process still references.
-    local -a stale_profiles=()
+    # live process still references. Only a clean "no match" (exit 1) proves
+    # that; any other pgrep status is an unknown state and keeps the profile.
+    local -a stale_profiles=() profile_parents=() profile_parent_ids=() profile_target_ids=()
     local tmpdir
     tmpdir=$(getconf DARWIN_USER_TEMP_DIR 2> /dev/null) || tmpdir=""
     if [[ -n "$tmpdir" ]]; then
         local d now age_hours
         now=$(date +%s)
         for d in "$tmpdir"playwright_chromiumdev_profile-*; do
-            [[ -d "$d" ]] || continue
+            [[ -d "$d" && ! -L "$d" ]] || continue
             age_hours=$(((now - $(stat -f %m "$d" 2> /dev/null || echo "$now")) / 3600))
             [[ "$age_hours" -ge 2 ]] || continue
-            pgrep -qf "$d" 2> /dev/null && continue
+            local profile_probe_rc=0
+            run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+                pgrep -qf -- "$d" > /dev/null 2>&1 || profile_probe_rc=$?
+            if [[ $profile_probe_rc -eq 124 || $profile_probe_rc -ge 128 ]]; then
+                _mole_record_clean_cancellation "$profile_probe_rc"
+                return "$profile_probe_rc"
+            fi
+            [[ $profile_probe_rc -eq 1 ]] || continue
+            _mole_snapshot_path_identity "$d" || continue
+            local physical_tmpdir
+            physical_tmpdir=$(cd -P "$tmpdir" 2> /dev/null && pwd -P) || continue
+            [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "$physical_tmpdir" ]] || continue
             stale_profiles+=("$d")
+            profile_parents+=("$_MOLE_PATH_SNAPSHOT_PARENT")
+            profile_parent_ids+=("$_MOLE_PATH_SNAPSHOT_PARENT_ID")
+            profile_target_ids+=("$_MOLE_PATH_SNAPSHOT_TARGET_ID")
         done
     fi
 
@@ -4088,7 +3866,23 @@ clean_dev_automation_browsers() {
     fi
 
     if [[ ${#stale_profiles[@]} -gt 0 ]]; then
-        safe_clean "${stale_profiles[@]}" "Leaked browser profiles" || return $?
+        local profile_index
+        for ((profile_index = 0; profile_index < ${#stale_profiles[@]}; profile_index++)); do
+            local _MOLE_AUTOMATION_PROFILE="${stale_profiles[$profile_index]}"
+            local _MOLE_AUTOMATION_PARENT="${profile_parents[$profile_index]}"
+            local _MOLE_AUTOMATION_PARENT_ID="${profile_parent_ids[$profile_index]}"
+            local _MOLE_AUTOMATION_TARGET_ID="${profile_target_ids[$profile_index]}"
+            local profile_clean_rc=0
+            _dev_safe_clean_process_guarded _automation_profile_cleanup_state \
+                "automation browser" "Leaked browser profiles" \
+                "$_MOLE_AUTOMATION_PROFILE" "Leaked browser profiles" || profile_clean_rc=$?
+            local pending_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
+            if [[ $pending_cancel -eq 124 || $pending_cancel -ge 128 ]]; then return "$pending_cancel"; fi
+            if [[ $profile_clean_rc -eq 124 || $profile_clean_rc -ge 128 ]]; then
+                _mole_record_clean_cancellation "$profile_clean_rc"
+                return "$profile_clean_rc"
+            fi
+        done
     fi
     return 0
 }
@@ -4162,7 +3956,7 @@ clean_dev_other_langs() {
 clean_dev_cicd() {
     safe_clean ~/.cache/terraform/* "Terraform cache"
     safe_clean ~/.grafana/cache/* "Grafana cache"
-    safe_clean ~/.prometheus/data/wal/* "Prometheus WAL cache"
+    # Prometheus WAL is recovery data, not a disposable cache.
     safe_clean ~/.jenkins/workspace/*/target/* "Jenkins workspace cache"
     safe_clean ~/.cache/gitlab-runner/* "GitLab Runner cache"
     safe_clean ~/.github/cache/* "GitHub Actions cache"
@@ -5418,6 +5212,30 @@ clean_chrome_devtools_mcp_caches() {
 }
 
 # Misc dev tool caches.
+clean_claude_desktop_caches() {
+    local root="$HOME/Library/Application Support/Claude"
+    mole_cleanup_targets_exist \
+        "$root/Cache"/* "$root/Code Cache"/* "$root/GPUCache"/* \
+        "$root/DawnGraphiteCache"/* "$root/DawnWebGPUCache"/* "$root/sentry"/* || return 0
+    if ! mole_clean_process_guard claude_desktop_running "Claude Desktop started"; then
+        _dev_report_process_guard_stop "Claude cache" "Claude Desktop" "$_MOLE_CLEAN_GUARD_REASON"
+        return 1
+    fi
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD=_dev_process_delete_guard_allows
+    _dev_safe_clean_process_guarded claude_desktop_running "Claude Desktop" "Claude cache" \
+        "$root/Cache"/* "Claude cache" || return 1
+    _dev_safe_clean_process_guarded claude_desktop_running "Claude Desktop" "Claude code cache" \
+        "$root/Code Cache"/* "Claude code cache" || return 1
+    _dev_safe_clean_process_guarded claude_desktop_running "Claude Desktop" "Claude GPU cache" \
+        "$root/GPUCache"/* "Claude GPU cache" || return 1
+    _dev_safe_clean_process_guarded claude_desktop_running "Claude Desktop" "Claude Dawn cache" \
+        "$root/DawnGraphiteCache"/* "Claude Dawn cache" || return 1
+    _dev_safe_clean_process_guarded claude_desktop_running "Claude Desktop" "Claude WebGPU cache" \
+        "$root/DawnWebGPUCache"/* "Claude WebGPU cache" || return 1
+    _dev_safe_clean_process_guarded claude_desktop_running "Claude Desktop" "Claude sentry cache" \
+        "$root/sentry"/* "Claude sentry cache"
+}
+
 clean_dev_misc() {
     safe_clean ~/Library/Caches/com.unity3d.*/* "Unity cache"
     safe_clean ~/Library/Caches/com.mongodb.compass/* "MongoDB Compass cache"
@@ -5443,15 +5261,8 @@ clean_dev_misc() {
         safe_clean ~/Library/Application\ Support/Filo/production/DawnGraphiteCache/* "Filo Dawn cache"
         safe_clean ~/Library/Application\ Support/Filo/production/DawnWebGPUCache/* "Filo WebGPU cache"
     fi
-    # Claude (Electron)
-    if [[ -d ~/Library/Application\ Support/Claude ]]; then
-        safe_clean ~/Library/Application\ Support/Claude/Cache/* "Claude cache"
-        safe_clean ~/Library/Application\ Support/Claude/Code\ Cache/* "Claude code cache"
-        safe_clean ~/Library/Application\ Support/Claude/GPUCache/* "Claude GPU cache"
-        safe_clean ~/Library/Application\ Support/Claude/DawnGraphiteCache/* "Claude Dawn cache"
-        safe_clean ~/Library/Application\ Support/Claude/DawnWebGPUCache/* "Claude WebGPU cache"
-        safe_clean ~/Library/Application\ Support/Claude/sentry/* "Claude sentry cache"
-    fi
+    # Claude (Electron): native hosts keep the same cache owner alive.
+    clean_claude_desktop_caches || true
     # Qoder (VS Code fork, Electron)
     if [[ -d ~/Library/Application\ Support/Qoder ]]; then
         safe_clean ~/Library/Application\ Support/Qoder/Cache/* "Qoder cache"
@@ -5499,7 +5310,7 @@ clean_dev_misc() {
 }
 # Shell and VCS leftovers.
 clean_dev_shell() {
-    safe_clean ~/.gitconfig.lock "Git config lock"
+    # Git config locks coordinate active writers and must remain owner-managed.
     safe_clean ~/.gitconfig.bak* "Git config backup"
     safe_clean ~/.oh-my-zsh/cache/* "Oh My Zsh cache"
     safe_clean ~/.config/fish/fish_history.bak* "Fish shell backup"
@@ -5602,19 +5413,10 @@ clean_developer_tools() {
     # for ~94s before its first output on the next run.
     _run_developer_cleanup_step \
         safe_clean ~/Library/Caches/Homebrew/downloads/* "Homebrew cache" || return $?
-    local brew_lock_dirs=(
-        "/opt/homebrew/var/homebrew/locks"
-        "/usr/local/var/homebrew/locks"
-    )
-    for lock_dir in "${brew_lock_dirs[@]}"; do
-        if [[ -d "$lock_dir" && -w "$lock_dir" ]]; then
-            _run_developer_cleanup_step \
-                safe_clean "$lock_dir"/* "Homebrew lock files" || return $?
-        elif [[ -d "$lock_dir" ]]; then
-            if find "$lock_dir" -mindepth 1 -maxdepth 1 -print -quit 2> /dev/null | grep -q .; then
-                debug_log "Skipping read-only Homebrew locks in $lock_dir"
-            fi
-        fi
-    done
+    # Homebrew's lock directory is deliberately not swept. Every file in it is
+    # zero bytes, so the whole directory reclaims nothing measurable, while
+    # deleting a lock a running `brew fetch` still holds makes that fetch fail
+    # with `No such file or directory @ dir_s_rmdir` (#1594). `brew cleanup`
+    # below already prunes what is genuinely stale, under Homebrew's own locking.
     _run_developer_cleanup_step clean_homebrew || return $?
 }

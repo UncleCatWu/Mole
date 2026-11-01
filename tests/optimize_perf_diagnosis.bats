@@ -7,36 +7,6 @@ setup_file() {
     export PROJECT_ROOT
 }
 
-# ---------- time parsing ----------
-
-@test "time_to_seconds handles mm:ss, hh:mm:ss and dd-hh:mm:ss" {
-    run /bin/bash -c "
-        source '$PROJECT_ROOT/lib/core/common.sh'
-        source '$PROJECT_ROOT/lib/optimize/diagnostics.sh'
-        opt_diag_time_to_seconds '01:30'
-        opt_diag_time_to_seconds '02:00:00'
-        opt_diag_time_to_seconds '16-08:00:00'
-    "
-    [ "$status" -eq 0 ]
-    [ "${lines[0]}" -eq 90 ]
-    [ "${lines[1]}" -eq 7200 ]
-    [ "${lines[2]}" -eq 1411200 ]
-}
-
-@test "time_to_seconds returns 0 on garbage so it cannot fake a runaway" {
-    run /bin/bash -c "
-        source '$PROJECT_ROOT/lib/core/common.sh'
-        source '$PROJECT_ROOT/lib/optimize/diagnostics.sh'
-        opt_diag_time_to_seconds 'not-a-time'
-        opt_diag_time_to_seconds ''
-        opt_diag_time_to_seconds '1:2:3:4'
-    "
-    [ "$status" -eq 0 ]
-    [ "${lines[0]}" -eq 0 ]
-    [ "${lines[1]}" -eq 0 ]
-    [ "${lines[2]}" -eq 0 ]
-}
-
 # ---------- memory pressure ----------
 
 @test "memory pressure stays silent when swap is healthy" {

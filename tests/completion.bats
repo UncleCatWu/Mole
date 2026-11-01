@@ -92,7 +92,7 @@ setup() {
 	[[ "$output" == *"--dry-run -n --external --whitelist --debug --help -h"* ]] || return 1
 	[[ "$output" == *"--json --help -h"* ]] || return 1
 	[[ "$output" == *"--json --limit --help -h"* ]] || return 1
-	[[ "$output" == *"--paths --dry-run -n --include-empty --debug --help -h"* ]] || return 1
+	[[ "$output" == *"--paths --dry-run -n --yes --include-empty --debug --help -h"* ]] || return 1
 	[[ "$output" != *"--select"* ]] || return 1
 	[[ "$output" != *"--categories"* ]] || return 1
 	[[ "$output" != *"--exclude-paths"* ]]
@@ -128,6 +128,7 @@ setup() {
 	[[ "$output" == *"--json"* ]] || return 1
 	[[ "$output" == *"--limit"* ]] || return 1
 	[[ "$output" == *"--include-empty"* ]] || return 1
+	[[ "$output" == *"--yes[Confirm unattended cleanup of eligible artifacts]"* ]] || return 1
 	[[ "$output" != *"--select"* ]] || return 1
 	[[ "$output" != *"--categories"* ]] || return 1
 	[[ "$output" != *"--exclude-paths"* ]]
@@ -180,14 +181,16 @@ setup() {
 	[ "$status" -eq 0 ]
 }
 
-@test "completion auto-install detects already installed" {
+@test "completion auto-install preserves a manually authored unmarked entry" {
 	mkdir -p "$HOME"
 	# shellcheck disable=SC2016
 	echo 'eval "$(mole completion zsh)"' >"$HOME/.zshrc"
 
 	run env SHELL=/bin/zsh "$PROJECT_ROOT/bin/completion.sh"
 	[ "$status" -eq 0 ]
-	[[ "$output" == *"updated"* ]]
+	[[ "$output" == *"added"* ]] || return 1
+	# shellcheck disable=SC2016  # Assert literal shell initialization text.
+	[[ $(head -n1 "$HOME/.zshrc") == 'eval "$(mole completion zsh)"' ]]
 }
 
 @test "completion --dry-run previews changes without writing config" {
@@ -211,4 +214,10 @@ setup() {
 
 	run "$PROJECT_ROOT/bin/completion.sh" fish
 	[ "$status" -eq 0 ]
+}
+
+@test "completion fish includes explicit unattended purge consent" {
+    run "$PROJECT_ROOT/bin/completion.sh" fish
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'__fish_seen_subcommand_from purge" -l yes -d "Confirm unattended cleanup of eligible artifacts"'* ]]
 }

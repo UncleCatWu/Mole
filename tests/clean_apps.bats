@@ -743,6 +743,194 @@ EOF
     [[ "$output" == *"orphan"* ]]
 }
 
+@test "is_bundle_orphaned keeps the app when mdfind times out (#1584)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ORPHAN_AGE_THRESHOLD=30 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+should_protect_data() { return 1; }
+get_file_mtime() { echo 0; }
+: > "$HOME/installed.txt"
+mkdir -p "$HOME/old"
+run_with_timeout() { printf 'MDFIND\n' >&2; return 124; }
+rc=0
+is_bundle_orphaned "com.example.Old" "$HOME/old" "$HOME/installed.txt" || rc=$?
+printf 'RC=%s\n' "$rc"
+if [[ $rc -eq 0 ]]; then
+    echo ORPHAN
+else
+    echo KEEP
+fi
+run_with_timeout() { shift; "$@"; }
+mdfind() { echo ""; return 0; }
+rc=0
+is_bundle_orphaned "com.example.Old" "$HOME/old" "$HOME/installed.txt" || rc=$?
+printf 'RETRY_RC=%s\n' "$rc"
+if [[ $rc -eq 0 ]]; then
+    echo RETRY_ORPHAN
+fi
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RC=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"KEEP"* ]] || return 1
+    [[ "$output" != *$'\nORPHAN'* ]] || return 1
+    [[ "$output" == *"RETRY_ORPHAN"* ]] || return 1
+}
+
+@test "is_bundle_orphaned still cancels on interrupt (#1584)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ORPHAN_AGE_THRESHOLD=30 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+should_protect_data() { return 1; }
+get_file_mtime() { echo 0; }
+: > "$HOME/installed.txt"
+mkdir -p "$HOME/old"
+run_with_timeout() { return 130; }
+rc=0
+is_bundle_orphaned "com.example.Old" "$HOME/old" "$HOME/installed.txt" || rc=$?
+printf 'RC=%s\n' "$rc"
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RC=130"* ]]
+}
+
+@test "clean_orphaned_app_data size timeout skips that leftover and continues (#1584)" {
+    local test_home="$HOME/orphan-size-timeout"
+    rm -rf "$test_home"
+    mkdir -p "$test_home"
+
+    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+scan_installed_apps() { : > "$1"; }
+is_claude_vm_bundle_orphaned() { return 1; }
+is_bundle_orphaned() { return 0; }
+is_path_whitelisted() { return 1; }
+note_activity() { :; }
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+debug_log() { :; }
+orphan_cleanup_candidate_snapshot() {
+    _ORPHAN_CANDIDATE_IDENTITY="id:$1"
+    _ORPHAN_CANDIDATE_PARENT="$(dirname "$1")"
+    _ORPHAN_CANDIDATE_PARENT_ID="p"
+    _ORPHAN_CANDIDATE_TARGET_ID="t"
+    return 0
+}
+# Pin eligibility: the real guard walks /Applications via
+# bundle_has_installed_app, and a 5s deadline fail-closes as "installed"
+# on a loaded CI Mac, so neither leftover would reach the sink.
+orphan_cleanup_candidate_still_eligible() { return 0; }
+bundle_has_installed_app() { return 1; }
+get_path_size_kb() {
+    if [[ "$1" == *com.example.slow* ]]; then
+        echo "SLOW_SIZED" >&2
+        return 124
+    fi
+    echo 12
+}
+safe_clean() {
+    printf 'CLEANED:%s\n' "$(basename "$1")"
+    rm -rf "$1"
+    return 0
+}
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    "$guard" "$1" || return $?
+    safe_clean "$@"
+}
+mkdir -p "$HOME/Library/Caches/com.example.slow" "$HOME/Library/Caches/com.example.fast"
+touch -t 200001010000 "$HOME/Library/Caches/com.example.slow" "$HOME/Library/Caches/com.example.fast"
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+clean_orphaned_app_data
+printf 'STATUS=0\n'
+if [[ -d "$HOME/Library/Caches/com.example.slow" ]]; then
+    echo KEPT_SLOW
+fi
+if [[ ! -d "$HOME/Library/Caches/com.example.fast" ]]; then
+    echo REMOVED_FAST
+fi
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SLOW_SIZED"* ]] || return 1
+    [[ "$output" == *"CLEANED:com.example.fast"* ]] || return 1
+    [[ "$output" == *"KEPT_SLOW"* ]] || return 1
+    [[ "$output" == *"REMOVED_FAST"* ]] || return 1
+    [[ "$output" != *"CLEANED:com.example.slow"* ]] || return 1
+}
+
+@test "clean_orphaned_app_data leftover sink timeout still cancels (#1584)" {
+    local test_home="$HOME/orphan-sink-timeout"
+    rm -rf "$test_home"
+    mkdir -p "$test_home"
+
+    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+scan_installed_apps() { : > "$1"; }
+is_claude_vm_bundle_orphaned() { return 1; }
+is_bundle_orphaned() { return 0; }
+is_path_whitelisted() { return 1; }
+note_activity() { :; }
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+debug_log() { :; }
+orphan_cleanup_candidate_snapshot() {
+    _ORPHAN_CANDIDATE_IDENTITY="id:$1"
+    _ORPHAN_CANDIDATE_PARENT="$(dirname "$1")"
+    _ORPHAN_CANDIDATE_PARENT_ID="p"
+    _ORPHAN_CANDIDATE_TARGET_ID="t"
+    return 0
+}
+orphan_cleanup_candidate_still_eligible() { return 0; }
+bundle_has_installed_app() { return 1; }
+get_path_size_kb() { echo 12; }
+safe_clean() {
+    printf 'CLEANED:%s\n' "$(basename "$1")"
+    return 0
+}
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    "$guard" "$1" || return $?
+    if [[ "$1" == *com.example.first* ]]; then
+        echo SINK_TIMEOUT
+        return 124
+    fi
+    safe_clean "$@"
+}
+mkdir -p "$HOME/Library/Caches/com.example.first" "$HOME/Library/Caches/com.example.second"
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+set +e
+clean_orphaned_app_data
+rc=$?
+set -e
+printf 'RC=%s\n' "$rc"
+if [[ -d "$HOME/Library/Caches/com.example.second" ]]; then
+    echo KEPT_SECOND
+fi
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SINK_TIMEOUT"* ]] || return 1
+    [[ "$output" == *"RC=124"* ]] || return 1
+    [[ "$output" == *"KEPT_SECOND"* ]] || return 1
+    [[ "$output" != *"CLEANED:com.example.second"* ]] || return 1
+}
+
 @test "clean_orphaned_app_data skips when no permission" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -2478,11 +2666,18 @@ sudo() {
   command "$@"
 }
 
+safe_sudo_remove() {
+  [[ "$1" == "$tmp_plist" && "$2" == "4" ]] || return 99
+  echo "protected-sink:$1"
+  return "$MOLE_ERR_PROTECTED_PATH"
+}
 clean_orphaned_system_services
+[[ -f "$tmp_plist" ]] || exit 1
 EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"Found 1 orphaned"* ]] || return 1
+    [[ "$output" == *"protected-sink:"* ]] || return 1
     [[ "$output" == *"Orphaned services · skipped 1 protected"* ]] || return 1
     [[ "$output" != *"rm-called"* ]] || return 1
     [[ "$output" != *"Failed to remove orphaned service"* ]] || return 1
@@ -2621,6 +2816,26 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"found dry"* ]] || return 1
     [[ "$output" == *"com.example.exported.orphan.plist  # "* ]] || return 1
+}
+
+@test "_container_stub_app_exists assumes installed when mdfind times out (#1584)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+run_with_timeout() { return 124; }
+rc=0
+_container_stub_app_exists "com.example.missing" "/Applications/Missing.app" || rc=$?
+printf 'RC=%s\n' "$rc"
+run_with_timeout() { return 130; }
+rc=0
+_container_stub_app_exists "com.example.missing" "/Applications/Missing.app" || rc=$?
+printf 'INT_RC=%s\n' "$rc"
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RC=0"* ]] || return 1
+    [[ "$output" == *"INT_RC=130"* ]]
 }
 
 @test "clean_orphaned_container_stubs removes stub container when app is uninstalled" {

@@ -8,15 +8,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-cd "$PROJECT_ROOT"
-
-# Sweep orphaned per-test HOME dirs left behind by killed bats runs.
-# Normal teardown removes them; this only catches the ones that escaped.
-# 60-minute threshold avoids racing with a long-running test in progress.
-if [[ -d "$PROJECT_ROOT/tests" ]]; then
-    find "$PROJECT_ROOT/tests" -maxdepth 1 -type d -name 'tmp-*' -mmin +60 \
-        -exec rm -rf {} + 2> /dev/null || true # SAFE: confined to tests/tmp-*
+# The outer invocation only starts the test sandbox. All test setup, lint,
+# fixtures, module loading, and cleanup then happen in its private snapshot.
+if [[ -z "${MOLE_TEST_SANDBOX_ACTIVE:-}" ||
+    "${MOLE_TEST_SANDBOX_ACTIVE:-}" != "${MOLE_TEST_BOUNDARY_TOKEN:-}" ||
+    "$SCRIPT_DIR" != "${MOLE_TEST_RUN_ROOT:-}/"* ]]; then
+    exec /bin/bash "$SCRIPT_DIR/test_sandbox.sh" /bin/bash scripts/test.sh "$@"
 fi
+cd "$PROJECT_ROOT"
+# shellcheck source=lib/core/test_boundary.sh
+source "$PROJECT_ROOT/lib/core/test_boundary.sh"
+_mole_test_guard_mutation_path "$SCRIPT_DIR/runner-identity" || exit $?
 
 # Never allow the scripted test run to trigger real sudo or Touch ID prompts.
 export MOLE_TEST_NO_AUTH=1
@@ -111,13 +113,13 @@ report_unit_result() {
         printf "${GREEN}${ICON_SUCCESS} Unit tests passed${NC}\n"
     else
         printf "${RED}${ICON_ERROR} Unit tests failed${NC}\n"
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
     fi
 }
 
 enforce_timeout_dependency_in_ci
 
-GO_TEST_CACHE="${MOLE_GO_TEST_CACHE:-/tmp/mole-go-build-cache}"
+GO_TEST_CACHE="$MOLE_TEST_RUN_ROOT/go-cache"
 export MOLE_GO_TEST_CACHE="$GO_TEST_CACHE"
 
 test_selection_needs_go_helpers() {
@@ -135,17 +137,12 @@ test_selection_needs_go_helpers() {
 prepare_go_test_helpers() {
     command -v go > /dev/null 2>&1 || return 0
 
-    TEST_GO_HELPER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mole-go-helpers.XXXXXX")"
+    TEST_GO_HELPER_DIR="$(mktemp -d "${TMPDIR%/}/mole-go-helpers.XXXXXX")"
     mkdir -p "$GO_TEST_CACHE"
 
-    if GOCACHE="$GO_TEST_CACHE" go build -o "$TEST_GO_HELPER_DIR/analyze-go" ./cmd/analyze > /dev/null 2>&1 &&
-        GOCACHE="$GO_TEST_CACHE" go build -o "$TEST_GO_HELPER_DIR/status-go" ./cmd/status > /dev/null 2>&1; then
-        export MOLE_TEST_ANALYZE_BIN="$TEST_GO_HELPER_DIR/analyze-go"
-        export MOLE_TEST_STATUS_BIN="$TEST_GO_HELPER_DIR/status-go"
-    else
-        rm -rf "$TEST_GO_HELPER_DIR" # SAFE: exact mktemp-created Go helper directory
-        TEST_GO_HELPER_DIR=""
-    fi
+    # shellcheck source=tests/support/build_go_cli_helpers.sh
+    source "$PROJECT_ROOT/tests/support/build_go_cli_helpers.sh"
+    mole_build_go_cli_helpers "$TEST_GO_HELPER_DIR" || return $?
 }
 
 echo "1. Linting test scripts..."
@@ -159,7 +156,7 @@ if command -v shellcheck > /dev/null 2>&1; then
             printf "${GREEN}${ICON_SUCCESS} Test script lint passed${NC}\n"
         else
             printf "${RED}${ICON_ERROR} Test script lint failed${NC}\n"
-            ((FAILED++))
+            FAILED=$((FAILED + 1))
         fi
     else
         printf "${YELLOW}${ICON_WARNING} No test scripts found, skipping${NC}\n"
@@ -257,7 +254,8 @@ if command -v bats > /dev/null 2>&1 && [ -d "tests" ]; then
     # slowest files are printed after the run.
     if [[ -n "${MOLE_TEST_REPORT_DIR:-}" ]] && $bats_has_formatter; then
         mkdir -p "$MOLE_TEST_REPORT_DIR"
-        bats_opts+=("--report-formatter" "junit" "--output" "$MOLE_TEST_REPORT_DIR")
+        # shellcheck source=tests/support/bats_report.sh
+        source "$PROJECT_ROOT/tests/support/bats_report.sh"
     fi
 
     # Some test files include wall-clock timing assertions that are skewed by
@@ -295,7 +293,9 @@ if command -v bats > /dev/null 2>&1 && [ -d "tests" ]; then
 
     # Main run (parallel when bats_opts has --jobs, skipped if no files remain).
     if [[ $# -gt 0 ]]; then
-        if $bats_has_formatter; then
+        if [[ -n "${MOLE_TEST_REPORT_DIR:-}" ]] && $bats_has_formatter; then
+            mole_run_reported_bats ${bats_opts[@]+"${bats_opts[@]}"} "$@" || _unit_rc=$?
+        elif $bats_has_formatter; then
             formatter="${BATS_FORMATTER:-pretty}"
             if [[ "$formatter" == "tap" ]]; then
                 if $use_color; then
@@ -325,7 +325,12 @@ if command -v bats > /dev/null 2>&1 && [ -d "tests" ]; then
     # Post-run: timing-sensitive tests run after parallel workers have finished
     # so CPU contention does not skew wall-clock assertions.
     for _pf in ${_sequential_files[@]+"${_sequential_files[@]}"}; do
-        if [[ "${MOLE_TEST_TIMING:-0}" == "1" ]]; then
+        if [[ $_unit_rc -eq 124 || $_unit_rc -ge 128 ]]; then break; fi
+        if [[ -n "${MOLE_TEST_REPORT_DIR:-}" ]] && $bats_has_formatter; then
+            _sequential_rc=0
+            mole_run_reported_bats "$_pf" || _sequential_rc=$?
+            if [[ $_sequential_rc -ne 0 ]]; then _unit_rc=$_sequential_rc; fi
+        elif [[ "${MOLE_TEST_TIMING:-0}" == "1" ]]; then
             bats --timing "$_pf" || _unit_rc=1
         else
             bats "$_pf" || _unit_rc=1
@@ -333,8 +338,14 @@ if command -v bats > /dev/null 2>&1 && [ -d "tests" ]; then
     done
     unset _sequential_files _pf
 
+    if [[ -n "${MOLE_TEST_REPORT_DIR:-}" ]] && $bats_has_formatter; then
+        _report_rc=0
+        mole_finish_bats_report || _report_rc=$?
+        if [[ $_unit_rc -eq 0 && $_report_rc -ne 0 ]]; then _unit_rc=$_report_rc; fi
+    fi
     report_slowest_test_files
     report_unit_result "$_unit_rc"
+    if [[ $_unit_rc -eq 124 || $_unit_rc -ge 128 ]]; then exit "$_unit_rc"; fi
 else
     printf "${YELLOW}${ICON_WARNING} bats not installed or no tests found, skipping${NC}\n"
 fi
@@ -349,7 +360,7 @@ if command -v go > /dev/null 2>&1; then
         printf "${GREEN}${ICON_SUCCESS} Go tests passed${NC}\n"
     else
         printf "${RED}${ICON_ERROR} Go tests failed${NC}\n"
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
     fi
 else
     printf "${YELLOW}${ICON_WARNING} Go not installed, skipping Go tests${NC}\n"
@@ -361,7 +372,7 @@ if bash -c 'source lib/core/common.sh && echo "OK"' > /dev/null 2>&1; then
     printf "${GREEN}${ICON_SUCCESS} Module loading passed${NC}\n"
 else
     printf "${RED}${ICON_ERROR} Module loading failed${NC}\n"
-    ((FAILED++))
+    FAILED=$((FAILED + 1))
 fi
 echo ""
 
@@ -371,55 +382,18 @@ if bash -n mole && bash -n bin/clean.sh && bash -n bin/optimize.sh; then
     printf "${GREEN}${ICON_SUCCESS} Integration tests passed${NC}\n"
 else
     printf "${RED}${ICON_ERROR} Integration tests failed${NC}\n"
-    ((FAILED++))
+    FAILED=$((FAILED + 1))
 fi
 echo ""
 
-echo "6. Testing installation..."
-# Installation script is macOS-specific; skip this test on non-macOS platforms
-if [[ "$(uname -s)" != "Darwin" ]]; then
-    printf "${YELLOW}${ICON_WARNING} Installation test skipped (non-macOS)${NC}\n"
+echo "6. Checking installation entry syntax (read-only)..."
+# Installation behavior is exercised by the private mocked Bats regressions.
+# This final stage never dispatches a real installer or downloads a release.
+if bash -n install.sh && bash -n lib/manage/update.sh; then
+    printf "${GREEN}${ICON_SUCCESS} Installation entry syntax passed (no installation performed)${NC}\n"
 else
-    # Skip if Homebrew mole is installed (install.sh will refuse to overwrite)
-    install_test_home=""
-    install_test_prefix=""
-    if command -v brew > /dev/null 2>&1 && brew list mole &> /dev/null; then
-        printf "${GREEN}${ICON_SUCCESS} Installation test skipped, Homebrew${NC}\n"
-    else
-        install_test_home="$(mktemp -d "$PROJECT_ROOT/tests/tmp-install-home.XXXXXX" 2> /dev/null || true)"
-        if [[ -z "$install_test_home" ]]; then
-            install_test_home="$PROJECT_ROOT/tests/tmp-install-home"
-            mkdir -p "$install_test_home"
-        fi
-    fi
-    if [[ -z "$install_test_home" ]]; then
-        :
-    else
-        install_test_prefix="$install_test_home/mole-bin"
-    fi
-    if [[ -z "$install_test_home" ]]; then
-        :
-    elif HOME="$install_test_home" \
-        XDG_CONFIG_HOME="$install_test_home/.config" \
-        XDG_CACHE_HOME="$install_test_home/.cache" \
-        MO_NO_OPLOG=1 \
-        ./install.sh --prefix "$install_test_prefix" > /dev/null 2>&1; then
-        if [[ -f "$install_test_prefix/mole" ]]; then
-            printf "${GREEN}${ICON_SUCCESS} Installation test passed${NC}\n"
-        else
-            printf "${RED}${ICON_ERROR} Installation test failed${NC}\n"
-            ((FAILED++))
-        fi
-    else
-        printf "${RED}${ICON_ERROR} Installation test failed${NC}\n"
-        ((FAILED++))
-    fi
-    if [[ -n "$install_test_prefix" ]]; then
-        MO_NO_OPLOG=1 safe_remove "$install_test_prefix" true || true
-    fi
-    if [[ -n "$install_test_home" ]]; then
-        MO_NO_OPLOG=1 safe_remove "$install_test_home" true || true
-    fi
+    printf "${RED}${ICON_ERROR} Installation entry syntax failed${NC}\n"
+    FAILED=$((FAILED + 1))
 fi
 echo ""
 

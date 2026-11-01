@@ -59,6 +59,15 @@ setup() {
 	[ "$status" -ne 0 ] || return 1
 }
 
+@test "check workflow pins goimports to the project Go toolchain" {
+	run grep -F 'golang.org/x/tools/cmd/goimports@v0.49.0' \
+		"$PROJECT_ROOT/.github/workflows/check.yml"
+	[ "$status" -eq 0 ]
+	run grep -F 'golang.org/x/tools/cmd/goimports@latest' \
+		"$PROJECT_ROOT/.github/workflows/check.yml"
+	[ "$status" -ne 0 ]
+}
+
 @test "diagnostic guidance check rejects equivalent pipe-to-shell spellings across lines" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -129,6 +138,13 @@ find "$target" -depth -delete
 echo "starting"; rm -rf "$target"
 printf 'starting' && find "$target" -delete
 rm "$target" -Rf
+rm --recursive --force "$target"
+find "$target" -delete; echo done
+printf '%s\0' "$target" | xargs -0 rm -rf
+echo "$(rm -rf "$target")"
+command r\m -rf "$target"
+# A comment ending in a backslash does not continue onto the next shell line. \
+rm -rf "$target"
 EOF
 
     run python3 "$audit" "$safe_fixture"
@@ -143,6 +159,12 @@ EOF
     [[ "$output" == *"$unsafe_fixture:4:"* ]] || return 1
     [[ "$output" == *"$unsafe_fixture:5:"* ]] || return 1
     [[ "$output" == *"$unsafe_fixture:6:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:7:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:8:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:9:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:10:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:11:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:13:"* ]] || return 1
     [[ "$output" == *"# SAFE:"* ]] || return 1
 }
 

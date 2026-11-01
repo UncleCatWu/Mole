@@ -220,6 +220,46 @@ EOF
 	[[ "$output" == *"/usr/bin/plutil"* ]] || return 1
 }
 
+@test "login item resolver rejects a disappeared shared-inventory app" {
+	run env HOME="$TEST_HOME/login-stale-inventory" PROJECT_ROOT="$PROJECT_ROOT" \
+		MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+mkdir -p "$HOME"
+printf '%s\0%s\0%s\0%s\0%s\0' \
+    "$HOME/Ghost.app" ready '' '' '' > "$HOME/apps.inventory"
+run_with_timeout() { return 0; }
+
+set +e
+_login_item_app_exists Ghost '' "$((SECONDS + 10))" "$HOME/apps.inventory"
+resolver_rc=$?
+set -e
+printf 'RC=%s\n' "$resolver_rc"
+[[ $resolver_rc -eq 2 ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"RC=2"* ]] || return 1
+}
+
+@test "login item resolver keeps case-insensitive filesystem matching" {
+	run env HOME="$TEST_HOME/login-case-inventory" PROJECT_ROOT="$PROJECT_ROOT" \
+		MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+mkdir -p "$HOME/example.app"
+printf '%s\0%s\0%s\0%s\0%s\0' \
+    "$HOME/example.app" ready '' '' '' > "$HOME/apps.inventory"
+run_with_timeout() { return 0; }
+
+_login_item_app_exists Example '' "$((SECONDS + 10))" "$HOME/apps.inventory"
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+}
+
 @test "login item audit does not publish partial broken-item conclusions" {
 	run env HOME="$TEST_HOME/login-partial" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -517,4 +557,32 @@ fi
 EOF
 
 	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+}
+
+@test "shared file list permission denial is an explicit retained skip" {
+    run env HOME="$TEST_HOME/shared-denied" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+sfl_dir="$HOME/Library/Application Support/com.apple.sharedfilelist"
+mkdir -p "$sfl_dir" "$HOME/bin"
+touch "$sfl_dir/partial.sfl3"
+cat > "$HOME/bin/find" <<'STUB'
+#!/bin/bash
+printf 'SCAN_REACHED\n' > "$HOME/find-reached"
+printf '%s\0' "$1/partial.sfl3"
+printf 'find: %s: Operation not permitted\n' "$1" >&2
+exit 1
+STUB
+chmod +x "$HOME/bin/find"
+PATH="$HOME/bin:$PATH"
+safe_remove() { printf 'UNEXPECTED_REMOVE\n'; return 0; }
+execute_optimization shared_file_list_repair
+[[ "$(optimize_outcome_count skipped)" == "1" ]] || exit 1
+[[ -f "$sfl_dir/partial.sfl3" && -f "$HOME/find-reached" ]] || exit 1
+EOF
+    [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"Shared file lists skipped (access denied; files kept)"* ]] || return 1
+    [[ "$output" != *"all healthy"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
 }

@@ -19,21 +19,15 @@ Before drafting, confirm:
 5. **Issue reporters and PR contributors in this cycle**. Use the merged PRs and fixed issues in the release range. Keep it short, for example `Issue reporters and PR contributors this cycle: @a · @b.` Exclude `tw93` and bots.
 6. **Verify release exists**. `gh release view V<version> --repo tw93/Mole --json id,name` should return non-empty. If it doesn't, the workflow hasn't finished, wait, don't `gh release create`.
 
-## Pre-flight (cross-check against AGENTS.md)
+## Pre-flight (published-tag evidence)
 
-These should already be true if the tag was pushed correctly. Confirm before publishing notes:
+Use the target tag's exact commit and the completed checks and public-asset evidence from [release-flow](../release-flow/SKILL.md). Reuse that evidence when it still matches the immutable tag; rerun only a missing or failed gate. A build of a newer working tree does not verify the release being described. The full build, test, asset, and script-update gates stay owned by `release-flow` rather than a second checklist here.
 
-- `grep '^VERSION=' mole` matches `<version>`.
-- `SECURITY_AUDIT.md` opening line reflects the new version and date.
-- `./scripts/check.sh --format` clean.
-- `TERM=xterm-256color MOLE_TEST_NO_AUTH=1 MOLE_TEST_JOBS=2 BATS_FORMATTER=tap ./scripts/test.sh` exits 0.
-- `go test ./...` and `make build` pass.
-
-If any fail, stop. The notes can wait; a bad release tag cannot.
+If evidence is missing, complete the applicable release-flow gate before publishing notes. Keep draft work read-only; an existing release object alone is not proof its assets or upgrade path passed.
 
 ## Format
 
-Strictly follow the current compact release shape. Read the latest stable release as the live format reference before drafting: `gh release view --repo tw93/Mole --json tagName,body`.
+Strictly follow the current compact release shape. Read the previous published stable release before the target tag as the live format reference. Exclude the candidate release: the workflow may already have made it the latest release with an empty body. Resolve the previous tag first, then read it with `gh release view <previous-tag> --repo tw93/Mole --json tagName,body`.
 
 Structure:
 

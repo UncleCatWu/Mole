@@ -4,32 +4,36 @@
 
 set -euo pipefail
 
+_MOLE_CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Refuse an unconfined test before base prepares temporary files or log.sh
+# creates a log under HOME. Authentication suppression is not write isolation.
+# shellcheck source=lib/core/test_boundary.sh
+source "$_MOLE_CORE_DIR/test_boundary.sh"
+_mole_test_require_context || return $?
+
 # Prevent multiple sourcing
 if [[ -n "${MOLE_COMMON_LOADED:-}" ]]; then
     return 0
 fi
-readonly MOLE_COMMON_LOADED=1
-
-_MOLE_CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 # Load core modules
-source "$_MOLE_CORE_DIR/base.sh"
-prepare_mole_tmpdir > /dev/null
-source "$_MOLE_CORE_DIR/log.sh"
+source "$_MOLE_CORE_DIR/base.sh" || return $?
+prepare_mole_tmpdir > /dev/null || return $?
+source "$_MOLE_CORE_DIR/log.sh" || return $?
 
-source "$_MOLE_CORE_DIR/timeout.sh"
-source "$_MOLE_CORE_DIR/timeouts.sh"
-source "$_MOLE_CORE_DIR/file_ops.sh"
-source "$_MOLE_CORE_DIR/help.sh"
-source "$_MOLE_CORE_DIR/ui.sh"
-source "$_MOLE_CORE_DIR/app_protection.sh"
-source "$_MOLE_CORE_DIR/bundle_resolver.sh"
-source "$_MOLE_CORE_DIR/pkg_receipts.sh"
+source "$_MOLE_CORE_DIR/timeout.sh" || return $?
+source "$_MOLE_CORE_DIR/timeouts.sh" || return $?
+source "$_MOLE_CORE_DIR/file_ops.sh" || return $?
+source "$_MOLE_CORE_DIR/help.sh" || return $?
+source "$_MOLE_CORE_DIR/ui.sh" || return $?
+source "$_MOLE_CORE_DIR/app_protection.sh" || return $?
+source "$_MOLE_CORE_DIR/bundle_resolver.sh" || return $?
+source "$_MOLE_CORE_DIR/pkg_receipts.sh" || return $?
 
 # Load sudo management if available
 if [[ -f "$_MOLE_CORE_DIR/sudo.sh" ]]; then
-    source "$_MOLE_CORE_DIR/sudo.sh"
+    source "$_MOLE_CORE_DIR/sudo.sh" || return $?
 fi
+readonly MOLE_COMMON_LOADED=1
 
 # Normalize a path for comparisons while preserving root.
 mole_normalize_path() {

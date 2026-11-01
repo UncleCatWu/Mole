@@ -12,6 +12,7 @@ Past shapes:
 - `${bundle_id}*.plist` let `com.foo` match `com.foobar.plist` (`5498edd1`).
 - Substring teardown removed a surviving `Foo-beta.app` sibling while uninstalling `Foo.app` (`ec1cd647`).
 - TeamID-prefix fallbacks in PR #874 and #875 were merged and then reverted (`229bd0f9`, `bc7f4c0a`).
+- A failed `brew info --cask` plus a basename or copied-bundle match is not ownership. The `#1558` Caskroom fallback needs the unique installed cask's app symlink pointing at the exact selected app, rechecked after the lookup. Timeout and signal still abort. `#1579` kept that bar for binary-only casks: name the refused app and send the user to `brew info --cask` instead of accepting `brew list --cask` as proof.
 
 Probe the class:
 
@@ -31,6 +32,7 @@ Past shapes:
 - `command -v` plus LaunchAgents missed a GUI Proton Mail Bridge owner and called `~/.bridge` orphaned (`28ee58c9`).
 - Any UP `utun*` interface was treated as VPN, including iCloud Private Relay (`37a446c9`).
 - `brew list mole` answered an ownership question but reset the user's sudo timestamp. Replacing it with a Cellar check removed the side effect, then initially missed custom prefixes until the prefix was also derived from the installed brew path (`cb4a3d66`, `73f89841`).
+- A `playwright-cli` daemon is normally `ppid 1` for the life of an active session. Leaked automation browsers are a `playwright_chromiumdev_profile` root whose `pgrep -f` returns exactly 1. Any other status is unknown and keeps the profile (`9e67a3ff`, `#1518`).
 
 ```bash
 command grep -rn 'mdfind' lib/ bin/ | command grep -v run_with_timeout
@@ -93,3 +95,23 @@ Before deriving deletion from owner metadata, answer:
 - Is interruption equivalent to a cache miss, or can it leave installed/session/authored state incomplete?
 
 If completeness or synchronization is not guaranteed, use only exact owner-authored removal markers, call an owner-supported cleanup command, offer a documented whole-cache reset when its recovery contract permits it, or leave the target alone. Adding more inferred keep sources does not turn an incomplete universe into authority.
+
+## 18. A sandbox well-known path is not app-private leftover
+
+macOS creates every App Sandbox container with well-known names under `Data/`. Those names do not mean the bytes are the app's rebuildable cache.
+
+- `Data/Downloads`, `Data/Desktop`, `Data/Pictures`, `Data/Music`, and `Data/Movies` are usually symbolic links to the real user folders. Apple's sandbox docs say the container includes those links, and access to the resolved location needs the matching entitlement plus TCC.
+- `Data/Documents` is a real directory inside the container. It holds user documents the app wrote without going through `~/Documents`.
+- On a current Mac, every container `Data/Downloads` and `Data/Desktop` resolved to the home-folder symlink; every `Data/Documents` was a real in-container directory.
+
+`#1578` asked Mole to clean `~/Library/Containers/com.kingsoft.wpsoffice.mac/Data/Downloads/*` while leaving that Downloads directory itself. WPS ships `com.apple.security.files.downloads.read-write`, so writes through that path land in the user's `~/Downloads`. Kingsoft's own download location is the user-set `文档/WPS/下载`, not this alias. Clearing the glob would empty the real Downloads folder.
+
+The same illusion shows up as "container leftover" proposals for Desktop and Pictures. The lexical path sits under `Library/Containers`, so it looks disposable. Physically it is user documents.
+
+Before adding a container cleanup target:
+
+1. Resolve the path with `readlink` or `pwd -P`. If it lands in `~/Downloads`, `~/Desktop`, or another user document root, stop.
+2. Classify the remaining interior: `Data/Library/Caches` and `Data/tmp` are the existing rebuildable carve-outs; `Data/Documents` and `Data/Library/Application Support` are user or mixed state until a measured non-target list says otherwise.
+3. Apply the Product Decision Filter. No measured rebuildable bytes, or no explicit excluded siblings, means the target stays out of default `clean`.
+
+`should_protect_path` already blankets `~/Library/Containers` interiors as user data. Do not punch a hole for a well-known name that Apple aliased to the home folder. A regression for this class asserts the resolved destination, not only that the lexical container path exists.

@@ -205,14 +205,23 @@ EOF
     [ "$status" -eq 0 ]
 }
 
-@test "prepare_mole_tmpdir falls back to /tmp when TMPDIR and invoking home are unavailable" {
-    result=$(env HOME="$HOME" TMPDIR="/var/empty" /bin/bash -c "
+@test "prepare_mole_tmpdir uses the /tmp fallback provider when preferred roots are unavailable" {
+    local fallback="$HOME/fallback-temp"
+    local trace="$HOME/fallback-probes"
+    mkdir -p "$fallback"
+    result=$(env HOME="$HOME" TMPDIR="$HOME/unavailable-temp" /bin/bash -c "
         source '$PROJECT_ROOT/lib/core/base.sh'
-        get_invoking_home() { echo '/var/empty'; }
+        get_invoking_home() { echo '$HOME/unavailable-home'; }
+        probe_temp_root() {
+            printf '%s\n' \"\$1\" >> '$trace'
+            [[ \"\$1\" == /tmp ]] || return 1
+            printf '%s\n' '$fallback'
+        }
         prepare_mole_tmpdir
     ")
 
-    [ "$result" = "/tmp" ]
+    [ "$result" = "$fallback" ]
+    grep -Fxq /tmp "$trace"
 }
 
 @test "common.sh exports resolved TMPDIR for runtime callers" {
@@ -225,10 +234,17 @@ EOF
 }
 
 @test "get_user_home returns home for valid user" {
-    current_user="${USER:-$(whoami)}"
-    result=$(/bin/bash -c "source '$PROJECT_ROOT/lib/core/base.sh'; get_user_home '$current_user'")
+    result=$(/bin/bash -c "
+        source '$PROJECT_ROOT/lib/core/base.sh'
+        dscl() {
+            [[ \"\$*\" == '. -read /Users/fixture-user NFSHomeDirectory' ]] || return 1
+            printf 'NFSHomeDirectory: %s\n' '$HOME'
+        }
+        get_user_home fixture-user
+    ")
     [ -n "$result" ]
     [ -d "$result" ]
+    [ "$result" = "$HOME" ]
 }
 
 @test "get_user_home returns empty for invalid user" {

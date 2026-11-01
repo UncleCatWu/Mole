@@ -5,7 +5,47 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# User state and installed tools must never run with inherited root privileges.
+# Individual maintenance operations request administrator access themselves.
+if [[ "$EUID" -eq 0 ]]; then
+    printf '%s\n' 'Run Mole without sudo; it requests administrator access when needed.' >&2
+    exit 1
+fi
+
+# Resolve where lib/ lives. bash 3.2 BASH_SOURCE[0] names the invoked path,
+# not the physical target.
+# Prefer the invoked directory when it already holds lib/ (Homebrew prefix
+# layout: bin/mo -> Cellar/.../mole, with lib next to bin/). Otherwise walk
+# the symlink for unpinned custom layouts such as
+# /usr/local/bin/mole -> /opt/mole/mole. Official install.sh and Homebrew
+# still pin SCRIPT_DIR with sed.
+_mole_invoked="${BASH_SOURCE[0]}"
+_mole_invoked_dir="$(cd "$(dirname "$_mole_invoked")" && pwd)"
+if [[ -f "$_mole_invoked_dir/lib/core/common.sh" ]]; then
+    SCRIPT_PATH="$_mole_invoked_dir/$(basename "$_mole_invoked")"
+elif command -v readlink > /dev/null 2>&1 && readlink -f / > /dev/null 2>&1; then
+    # GNU readlink -f (Linux coreutils): one-shot full canonicalization.
+    SCRIPT_PATH="$(readlink -f "$_mole_invoked")"
+else
+    # Portable fallback for BSD readlink (macOS), which lacks -f. Walk each
+    # symlink level, resolving relative targets against their parent dir.
+    SOURCE="$_mole_invoked"
+    _mole_link_hops=0
+    while [ -L "$SOURCE" ]; do
+        _mole_link_hops=$((_mole_link_hops + 1))
+        if [ "$_mole_link_hops" -gt 32 ]; then
+            printf '%s\n' 'mole: too many symlink hops resolving the entrypoint' >&2
+            exit 1
+        fi
+        DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+        SOURCE="$(readlink "$SOURCE")"
+        [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+    done
+    unset _mole_link_hops
+    SCRIPT_PATH="$(cd -P "$(dirname "$SOURCE")" && pwd)/$(basename "$SOURCE")"
+fi
+unset _mole_invoked _mole_invoked_dir
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
 # The path of THIS entrypoint, captured before anything is sourced. The update
 # flow reinstalls over the exact `mole` that was invoked, so it must resolve the
@@ -54,7 +94,7 @@ source "$SCRIPT_DIR/lib/core/commands.sh"
 trap cleanup_temp_files EXIT INT TERM
 
 # Version and update helpers
-VERSION="1.53.0"
+VERSION="1.55.0"
 MOLE_TAGLINE="Deep clean and optimize your Mac."
 
 is_touchid_configured() {

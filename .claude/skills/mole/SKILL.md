@@ -68,8 +68,9 @@ you find the exact `<UNINSTALL NAME>` argument without touching the selector TUI
 
 **The dry-run path list.** `mo clean --dry-run` prints a summary to the
 terminal and writes every candidate path to `~/.config/mole/clean-list.txt`.
-Read that file, not the terminal output, when you need to reason about or show
-the user exactly what a real run would remove. This list is clean-only: `mo
+Read that file to review the paths found by that dry-run. It is a preview
+snapshot, not an executable deletion plan: a later `mo clean` rescans and
+revalidates current candidates, so the two target sets can differ. This list is clean-only: `mo
 purge --dry-run` and `mo installer --dry-run` print their candidates to the
 terminal and write no file.
 
@@ -90,7 +91,10 @@ the user asked for; do not leave an unbounded monitor running in the background.
   a network to restore (`node_modules/`, `Pods/`, `venv/`, `vendor/`). A purge
   is therefore not always recoverable offline, so say which kind the candidates
   are before running it. `mo purge --paths` configures which directories are
-  scanned; `--include-empty` shows zero-size candidates.
+  scanned; `--include-empty` shows zero-size candidates. A non-interactive real
+  run requires explicit `--yes`; dry-run does not. Use `--yes` only after the
+  user has authorized removal. Artifacts with authored content stay protected,
+  and an inconclusive content probe keeps the candidate and reports an incomplete run.
 - `mo optimize` refreshes caches and system services. It is the one destructive
   command whose effects are not "files disappear", so say what it will do
   before running it.
@@ -103,7 +107,7 @@ the user asked for; do not leave an unbounded monitor running in the background.
 
 **`mo clean` deletions are permanent by default.** Cache cleanup removes files
 rather than moving them to the Trash, so there is usually nothing to restore.
-That is exactly why rule 1 exists: the dry-run is the undo. `mo uninstall` is
+That is why preview matters; a dry-run provides no backup or undo. `mo uninstall` is
 the exception: it routes the app and its leftovers through the Trash, so an
 uninstalled app is recoverable until the Trash is emptied.
 

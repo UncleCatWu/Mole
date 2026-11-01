@@ -223,6 +223,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 # Mock dependencies
 request_sudo_access() { return 0; }
@@ -250,6 +252,8 @@ brew() {
 export -f brew
 
 # Mock get_brew_cask_name to return a name
+# This case owns a mocked Homebrew installation.
+is_homebrew_available() { return 0; }
 get_brew_cask_name() { echo "brew-app-cask"; return 0; }
 export -f get_brew_cask_name
 
@@ -278,6 +282,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 request_sudo_access() { return 0; }
 start_inline_spinner() { :; }
@@ -304,6 +310,8 @@ brew() {
 }
 export -f brew
 
+# This case owns a mocked Homebrew installation.
+is_homebrew_available() { return 0; }
 get_brew_cask_name() { echo "brewshared-beta"; return 0; }
 export -f get_brew_cask_name
 
@@ -350,6 +358,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 start_inline_spinner() { :; }
 stop_inline_spinner() { :; }
@@ -374,6 +384,8 @@ brew() {
 }
 export -f brew
 
+# This case owns a mocked Homebrew installation.
+is_homebrew_available() { return 0; }
 get_brew_cask_name() { echo "brew-preauth-cask"; return 0; }
 export -f get_brew_cask_name
 
@@ -392,61 +404,35 @@ EOF
     [ "$status" -eq 0 ]
 }
 
-@test "batch_uninstall_applications runs silent brew autoremove without UX noise" {
-    local app_bundle="$HOME/Applications/BrewTimeout.app"
-    mkdir -p "$app_bundle"
-
+@test "batch_uninstall_applications does not remove unreviewed brew dependencies" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
-
-request_sudo_access() { return 0; }
-start_inline_spinner() { :; }
-stop_inline_spinner() { :; }
-get_file_owner() { whoami; }
-get_path_size_kb() { echo "100"; }
-bytes_to_human() { echo "$1"; }
-drain_pending_input() { :; }
-print_summary_block() { :; }
-force_kill_app() { return 0; }
-remove_apps_from_dock() { :; }
-refresh_launch_services_after_uninstall() { echo "LS_REFRESH"; }
-ensure_sudo_session() { return 0; }
-
-get_brew_cask_name() { echo "brew-timeout-cask"; return 0; }
-brew_uninstall_cask() { return 0; }
-brew() {
-    echo "BREW_CALL:$*" >> "$HOME/timeout_calls.log"
-    return 0
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
+_batch_scan_app_details() { app_details=("reviewed-cask"); }
+_batch_preview_and_confirm() { return 0; }
+_batch_execute_removals() {
+    brew_apps_removed=1
+    success_count=1
+    success_items=("$HOME/Applications/Reviewed.app")
 }
-
-run_with_timeout() {
-    local duration="$1"
-    shift
-    echo "TIMEOUT_CALL:$duration:$*" >> "$HOME/timeout_calls.log"
-    "$@"
-}
-
-selected_apps=("0|$HOME/Applications/BrewTimeout.app|BrewTimeout|com.example.brewtimeout|0|Never")
-files_cleaned=0
-total_items=0
-total_size_cleaned=0
-
-printf '\n' | batch_uninstall_applications
-
+_uninstall_match_loaded_background_items() { return 0; }
+_batch_render_summary() { printf 'REVIEWED_CASK_REMOVED\n'; }
+stop_sudo_session() { :; }
+brew() { printf 'BREW_CALL:%s\n' "$*" >> "$HOME/brew-dependency.trace"; }
+run_with_timeout() { shift; "$@"; }
+selected_apps=("reviewed-cask")
+files_cleaned=0 total_items=0 total_size_cleaned=0
+batch_uninstall_applications </dev/null
+# A pre-fix autoremove was disowned; allow its otherwise-eligible worker to run.
 sleep 0.2
-
-if [[ -f "$HOME/timeout_calls.log" ]]; then
-    cat "$HOME/timeout_calls.log"
-else
-    echo "NO_TIMEOUT_CALL"
-fi
+if [[ -f "$HOME/brew-dependency.trace" ]]; then cat "$HOME/brew-dependency.trace"; fi
 EOF
-
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"TIMEOUT_CALL:30:brew autoremove"* ]] || return 1
-    [[ "$output" != *"Checking brew dependencies"* ]]
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"REVIEWED_CASK_REMOVED"* ]] || return 1
+    [[ "$output" != *"BREW_CALL:autoremove"* ]]
 }
 
 @test "batch_uninstall_applications keeps brew-managed app intact when brew uninstall fails" {
@@ -457,6 +443,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 start_inline_spinner() { :; }
 stop_inline_spinner() { :; }
@@ -516,6 +504,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 start_inline_spinner() { :; }
 stop_inline_spinner() { :; }
@@ -576,6 +566,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 start_inline_spinner() { :; }
 stop_inline_spinner() { :; }
@@ -629,6 +621,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 brew() {
     echo "BREW_CALL:$*" >> "$HOME/dry_run.log"
@@ -721,4 +715,83 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == "test-cask-app" ]]
+}
+
+# Only discovery and Homebrew are mocked; app identity uses real fixture
+# directories and symlinks so a same-name copy cannot satisfy the fallback.
+run_caskroom_info_failure_case() {
+    local scenario="$1"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" SCENARIO="$scenario" \
+        FIXTURE="$BATS_TEST_TMPDIR" /bin/bash --noprofile --norc <<'SCRIPT'
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/brew.sh"
+mkdir -p "$FIXTURE/selected/Rebased.app" "$FIXTURE/other/Rebased.app" "$FIXTURE/cask"
+app_path="$FIXTURE/selected/Rebased.app"
+match="$FIXTURE/cask/Rebased.app"
+ln -s "$app_path" "$match"
+case "$SCENARIO" in
+    unrelated) rm "$match"; ln -s "$FIXTURE/other/Rebased.app" "$match" ;;
+    copied) rm "$match"; mkdir "$match" ;;
+esac
+find() { printf '%s\n' "$FIXTURE/cask/Rebased.app"; }
+# Production token parsing has independent coverage; fixture paths must not
+# create or change the machine's actual Caskroom.
+_extract_cask_token_from_path() { printf '%s\n' rebased; }
+run_with_timeout() { shift; "$@"; }
+_mole_brew_probe() {
+    shift
+    case "$*" in
+        'list --cask') printf '%s\n' rebased ;;
+        'info --cask rebased')
+            case "$SCENARIO" in
+                timeout) return 124 ;;
+                cancelled) return 143 ;;
+                retargeted) rm "$FIXTURE/cask/Rebased.app"; ln -s "$FIXTURE/other/Rebased.app" "$FIXTURE/cask/Rebased.app" ;;
+            esac
+            return 1
+            ;;
+        *) return 99 ;;
+    esac
+}
+result=""
+rc=0
+result=$(_detect_cask_via_caskroom_search Rebased.app "$app_path") || rc=$?
+printf 'rc=%s token=%s\n' "$rc" "$result"
+SCRIPT
+}
+
+@test "third-party cask info failure accepts the exact installed app (#1558)" {
+    run_caskroom_info_failure_case exact
+    [ "$status" -eq 0 ]
+    [ "$output" = 'rc=0 token=rebased' ]
+}
+
+@test "third-party cask info failure refuses a same-name app at another path (#1558)" {
+    run_caskroom_info_failure_case unrelated
+    [ "$status" -eq 0 ]
+    [ "$output" = 'rc=2 token=' ]
+}
+
+@test "third-party cask info failure refuses a same-name copied bundle (#1558)" {
+    run_caskroom_info_failure_case copied
+    [ "$status" -eq 0 ]
+    [ "$output" = 'rc=2 token=' ]
+}
+
+@test "third-party cask info failure rechecks a retargeted symlink (#1558)" {
+    run_caskroom_info_failure_case retargeted
+    [ "$status" -eq 0 ]
+    [ "$output" = 'rc=2 token=' ]
+}
+
+@test "third-party cask info timeout is not bypassed by exact ownership (#1558)" {
+    run_caskroom_info_failure_case timeout
+    [ "$status" -eq 0 ]
+    [ "$output" = 'rc=124 token=' ]
+}
+
+@test "third-party cask info cancellation is not bypassed by exact ownership (#1558)" {
+    run_caskroom_info_failure_case cancelled
+    [ "$status" -eq 0 ]
+    [ "$output" = 'rc=143 token=' ]
 }

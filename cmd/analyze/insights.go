@@ -96,18 +96,39 @@ func createInsightEntries() []dirEntry {
 // measureInsightSize measures the size of a path.
 // Old Downloads is treated specially: only files older than 90 days are counted.
 func measureInsightSize(path string) (int64, error) {
+	return measureInsightSizeWithContext(context.Background(), path)
+}
+
+func measureInsightSizeWithContext(ctx context.Context, path string) (int64, error) {
 	home := os.Getenv("HOME")
 
 	if home != "" && path == filepath.Join(home, "Downloads") {
-		return measureOldDownloads(path, 90)
+		size, err := measureOldDownloadsWithContext(ctx, path, 90)
+		if stopped := ctx.Err(); stopped != nil {
+			return 0, stopped
+		}
+		if err == nil {
+			_ = storeOverviewSizeWithContext(ctx, path, size)
+			if stopped := ctx.Err(); stopped != nil {
+				return 0, stopped
+			}
+		}
+		return size, err
 	}
 
-	return measureOverviewSize(path)
+	return measureOverviewSizeWithContext(ctx, path)
 }
 
 // measureOldDownloads calculates total size of files in a directory
 // that haven't been modified in the given number of days.
 func measureOldDownloads(dir string, daysOld int) (int64, error) {
+	return measureOldDownloadsWithContext(context.Background(), dir, daysOld)
+}
+
+func measureOldDownloadsWithContext(ctx context.Context, dir string, daysOld int) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	cutoff := time.Now().AddDate(0, 0, -daysOld)
 	var total int64
 
@@ -117,6 +138,9 @@ func measureOldDownloads(dir string, daysOld int) (int64, error) {
 	}
 
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		// Skip hidden files.
 		if strings.HasPrefix(entry.Name(), ".") {
 			continue
@@ -130,8 +154,10 @@ func measureOldDownloads(dir string, daysOld int) (int64, error) {
 		if info.ModTime().Before(cutoff) {
 			if entry.IsDir() {
 				// Use du for directories.
-				if size, err := getDirSizeFast(filepath.Join(dir, entry.Name())); err == nil {
+				if size, err := getDirSizeFastWithContext(ctx, filepath.Join(dir, entry.Name())); err == nil {
 					total += size
+				} else if ctx.Err() != nil {
+					return 0, ctx.Err()
 				}
 			} else {
 				total += info.Size()
@@ -144,7 +170,11 @@ func measureOldDownloads(dir string, daysOld int) (int64, error) {
 
 // getDirSizeFast measures directory size using du.
 func getDirSizeFast(path string) (int64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	return getDirSizeFastWithContext(context.Background(), path)
+}
+
+func getDirSizeFastWithContext(parent context.Context, path string) (int64, error) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "du", "-sk", path)

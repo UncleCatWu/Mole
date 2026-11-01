@@ -5,6 +5,17 @@
 
 set -euo pipefail
 
+# The installed entrypoint refuses to run as root, so a root install would
+# write every file and then fail its own verification probe with the wrong
+# cause. Refuse up front with the same message, before anything is written.
+refuse_root_invocation() {
+    local uid="${1:-0}"
+    [[ "$uid" -eq 0 ]] || return 0
+    printf '%s\n' 'Run Mole without sudo; it requests administrator access when needed.' >&2
+    return 1
+}
+refuse_root_invocation "${EUID:-0}" || exit 1
+
 # Honor https://no-color.org: any non-empty NO_COLOR disables ANSI escapes.
 if [[ -n "${NO_COLOR:-}" ]]; then
     GREEN=''
@@ -149,9 +160,11 @@ INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="$HOME/.config/mole"
 SOURCE_DIR=""
 SOURCE_COMMIT_HASH=""
+RESOLVED_SOURCE_REF=""
 INSTALL_LOCK_PATH=""
 INSTALL_LOCK_CONTROL=""
 INSTALL_LOCK_HOLDER_PID=""
+INSTALL_LOCK_TOKEN=""
 INSTALL_LOCK_USE_SUDO=false
 # Why the last acquire_install_lock attempt failed. A bare "the lock is busy"
 # message sent one reporter reverse-engineering the ancestor check by hand
@@ -359,7 +372,7 @@ install_lock_reauthenticate() {
 install_lock_current_shell_pid() {
     local variable_name="$1"
     local pid_file current_pid=""
-    pid_file=$(/usr/bin/mktemp /tmp/mole-install-pid.XXXXXX) || return 1
+    pid_file=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/mole-install-pid.XXXXXX") || return 1
     if ! /bin/sh -c 'printf "%s\n" "$PPID" > "$1"' sh "$pid_file"; then
         safe_rm "$pid_file"
         return 1
@@ -409,6 +422,7 @@ install_lock_read_owner() {
 install_lock_remove_control() {
     local control_path="$1"
     local use_sudo="$2"
+    local expected_token="${3:-}"
     local control_prefix="$INSTALL_DIR/.mole-update.lock/control."
     local control_suffix
     [[ -n "$control_path" ]] || return 0
@@ -417,7 +431,12 @@ install_lock_remove_control() {
     [[ -n "$control_suffix" && "$control_suffix" != */* ]] || return 1
     install_lock_command "$use_sudo" /bin/test -f "$control_path" 2> /dev/null || return 1
     ! install_lock_command "$use_sudo" /bin/test -L "$control_path" 2> /dev/null || return 1
-    install_lock_command "$use_sudo" /bin/rm -f "$control_path" 2> /dev/null # SAFE: exact mktemp-created install lock control file.
+    if [[ -n "$expected_token" ]]; then
+        local current_token=""
+        current_token=$(install_lock_read_owner "$control_path" "$use_sudo") || return 1
+        [[ "$current_token" == "$expected_token" ]] || return 1
+    fi
+    install_lock_command "$use_sudo" /bin/rm -f "$control_path" 2> /dev/null # SAFE: exact token-bound install lock control file.
 }
 
 acquire_install_lock() {
@@ -463,9 +482,9 @@ acquire_install_lock() {
     # killed -9, so prefer it. It only ships with newer macOS, and requiring it
     # made both install and update exit before writing a single file on every
     # older release (#1348). Where it is absent, an atomic mkdir inside the lock
-    # directory provides the same mutual exclusion; what it does not provide is
-    # release-on-death, so that path reclaims a mutex whose recorded owner is
-    # provably gone. Only a system with neither is refused.
+    # directory provides mutual exclusion without release-on-death. An occupied
+    # directory is never reclaimed from a stale token; after SIGKILL it requires
+    # manual ownership checks. Only a system with neither primitive is refused.
     local mutex_dir=""
     if [[ ! -x /usr/bin/lockf ]]; then
         if [[ ! -x /bin/mkdir ]]; then
@@ -479,52 +498,62 @@ acquire_install_lock() {
     [[ -n "$owner_start" ]] || return 1
     control_path=$(install_lock_command "$use_sudo" /usr/bin/mktemp "$INSTALL_DIR/.mole-update.lock/control.XXXXXX") || return 1
     token="$owner_pid|$owner_start|${control_path##*.}"
+    # shellcheck disable=SC2016 # The child shell expands its positional arguments.
+    if ! install_lock_command "$use_sudo" /bin/sh -c 'printf "%s\n" "$1" > "$2"' sh "$token" "$control_path"; then
+        INSTALL_LOCK_FAILURE="control"
+        return 1
+    fi
 
     # shellcheck disable=SC2016 # The lock-holder shell expands these values.
     local holder_script='
-        token="$1"
-        owner_pid="$2"
-        owner_start="$3"
-        lock_path="$4"
-        control_path="$5"
-        mutex_dir="$6"
-        current_start=""
-        if [ ! -f "$control_path" ]; then
-            exit 1
-        fi
-        if [ -n "$mutex_dir" ] && ! /bin/mkdir "$mutex_dir" 2>/dev/null; then
-            # Occupied. Reclaim only against proof the recorded owner is gone:
-            # a live pid whose start time still matches is a real concurrent
-            # writer, and a reused pid is why the start time is compared too.
-            previous=$(/bin/cat "$lock_path" 2>/dev/null || true)
-            previous_pid=${previous%%|*}
-            previous_rest=${previous#*|}
-            previous_start=${previous_rest%%|*}
-            owner_gone=1
-            if [ -n "$previous_pid" ] && kill -0 "$previous_pid" 2>/dev/null; then
-                current_start=$(LC_ALL=C /bin/ps -p "$previous_pid" -o lstart= 2>/dev/null |
-                    /usr/bin/sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//" | /usr/bin/head -1)
-                if [ "$current_start" = "$previous_start" ]; then
-                    owner_gone=0
+        token="$1"; owner_pid="$2"; owner_start="$3"; lock_path="$4"; control_path="$5"; mutex_dir="$6"
+        mutex_identity=""; marker_identity=""; current_start=""
+        [ -f "$control_path" ] && [ ! -L "$control_path" ] || exit 1
+        [ "$(/bin/cat "$control_path" 2>/dev/null)" = "$token" ] || exit 1
+        if [ -n "$mutex_dir" ]; then
+            if ! /bin/mkdir "$mutex_dir" 2>/dev/null; then
+                # Never reclaim an occupied directory: its token can belong to
+                # an older generation while a new owner is still publishing.
+                previous=$(/bin/cat "$mutex_dir/owner" 2>/dev/null || true)
+                previous_pid=${previous%%|*}
+                previous_rest=${previous#*|}
+                previous_start=${previous_rest%%|*}
+                if [ -n "$previous_pid" ] && kill -0 "$previous_pid" 2>/dev/null; then
+                    current_start=$(LC_ALL=C /bin/ps -p "$previous_pid" -o lstart= 2>/dev/null |
+                        /usr/bin/sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//" | /usr/bin/head -1)
+                    [ -n "$current_start" ] && [ "$current_start" = "$previous_start" ] && exit 73
                 fi
+                exit 74
             fi
-            [ "$owner_gone" = 1 ] || exit 1
-            /bin/rmdir "$mutex_dir" 2>/dev/null || exit 1
-            /bin/mkdir "$mutex_dir" 2>/dev/null || exit 1
+            mutex_identity=$(/usr/bin/stat -f%d:%i "$mutex_dir" 2>/dev/null) || exit 75
+            if ! (umask 077; set -C; printf "%s\n" "$token" > "$mutex_dir/owner"); then
+                exit 75
+            fi
+            marker_identity=$(/usr/bin/stat -f%d:%i "$mutex_dir/owner" 2>/dev/null) || exit 75
         fi
-        if ! printf "%s\n" "$token" > "$lock_path"; then
-            [ -n "$mutex_dir" ] && /bin/rmdir "$mutex_dir" 2>/dev/null
-            exit 1
-        fi
-        while [ -f "$control_path" ]; do
+        printf "%s\n" "$token" > "$lock_path" || exit 75
+        while [ -f "$control_path" ] && [ ! -L "$control_path" ] &&
+            [ "$(/bin/cat "$control_path" 2>/dev/null)" = "$token" ]; do
             kill -0 "$owner_pid" 2>/dev/null || break
             current_start=$(LC_ALL=C /bin/ps -p "$owner_pid" -o lstart= 2>/dev/null |
                 /usr/bin/sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//" | /usr/bin/head -1)
-            [ "$current_start" = "$owner_start" ] || break
+            # Unknown process metadata retains the lease. Only a positive pid
+            # reuse proof or loss of this generation control ends it.
+            [ -z "$current_start" ] || [ "$current_start" = "$owner_start" ] || break
             /bin/sleep 0.1
         done
-        /bin/rm -f "$control_path" # SAFE: exact mktemp-created install lock control file.
-        [ -n "$mutex_dir" ] && /bin/rmdir "$mutex_dir" 2>/dev/null
+        if [ -f "$control_path" ] && [ ! -L "$control_path" ] &&
+            [ "$(/bin/cat "$control_path" 2>/dev/null)" = "$token" ]; then
+            /bin/rm -f "$control_path" # SAFE: exact token-bound control file created for this attempt
+        fi
+        if [ -n "$mutex_dir" ] && [ ! -L "$mutex_dir" ] && [ ! -L "$mutex_dir/owner" ] &&
+            [ "$(/usr/bin/stat -f%d:%i "$mutex_dir" 2>/dev/null)" = "$mutex_identity" ] &&
+            [ "$(/usr/bin/stat -f%d:%i "$mutex_dir/owner" 2>/dev/null)" = "$marker_identity" ] &&
+            [ "$(/bin/cat "$mutex_dir/owner" 2>/dev/null)" = "$token" ] &&
+            [ "$(/bin/cat "$lock_path" 2>/dev/null)" = "$token" ]; then
+            /bin/rm -f "$mutex_dir/owner" || exit 75 # SAFE: identity-checked owner marker for this mkdir generation
+            /bin/rmdir "$mutex_dir" 2>/dev/null || exit 75
+        fi
         exit 0
     '
     if [[ -n "$mutex_dir" ]]; then
@@ -538,8 +567,16 @@ acquire_install_lock() {
 
     while [[ "$attempt" -lt 100 ]]; do
         if ! kill -0 "$holder_pid" 2> /dev/null; then
-            wait "$holder_pid" 2> /dev/null || true
-            install_lock_remove_control "$control_path" "$use_sudo" || true
+            local holder_status=0
+            wait "$holder_pid" 2> /dev/null || holder_status=$?
+            if [[ -n "$mutex_dir" ]]; then
+                case "$holder_status" in
+                    73) INSTALL_LOCK_FAILURE="active_mutex" ;;
+                    74) INSTALL_LOCK_FAILURE="unverified_mutex" ;;
+                    75) INSTALL_LOCK_FAILURE="mutex_state" ;;
+                esac
+            fi
+            install_lock_remove_control "$control_path" "$use_sudo" "$token" || true
             return 1
         fi
         owner_value=$(install_lock_read_owner "$lock_path" "$use_sudo" || true)
@@ -547,6 +584,7 @@ acquire_install_lock() {
             INSTALL_LOCK_PATH="$lock_path"
             INSTALL_LOCK_CONTROL="$control_path"
             INSTALL_LOCK_HOLDER_PID="$holder_pid"
+            INSTALL_LOCK_TOKEN="$token"
             INSTALL_LOCK_USE_SUDO="$use_sudo"
             INSTALL_LOCK_FAILURE=""
             return 0
@@ -555,7 +593,7 @@ acquire_install_lock() {
         attempt=$((attempt + 1))
     done
 
-    install_lock_remove_control "$control_path" "$use_sudo" || true
+    install_lock_remove_control "$control_path" "$use_sudo" "$token" || true
     wait "$holder_pid" 2> /dev/null || true
     return 1
 }
@@ -609,6 +647,18 @@ report_install_lock_failure() {
             log_error "$INSTALL_DIR/.mole-update.lock/kernel.lock is not a regular file"
             log_error "Remove it, then retry: sudo rm -f $INSTALL_DIR/.mole-update.lock/kernel.lock"
             ;;
+        active_mutex)
+            log_error "An install or update owner is still running for $INSTALL_DIR/.mole-update.lock/holder"
+            log_error "Wait for that operation to finish, then retry"
+            ;;
+        unverified_mutex | mutex_state)
+            log_error "$INSTALL_DIR/.mole-update.lock/holder could not be bound to a completed owner generation"
+            log_error "Inspect its owner file and running install/update processes; only after confirming none can write, move this holder aside and retry"
+            ;;
+        control)
+            log_error "Could not write install lock control state under $INSTALL_DIR/.mole-update.lock"
+            log_error "Inspect directory permissions and free space, then retry"
+            ;;
         no_mutex)
             log_error "Neither /usr/bin/lockf nor /bin/mkdir is usable, so concurrent installs cannot be kept apart"
             log_error "Check that /bin and /usr/bin are intact, then retry: ls -l /bin/mkdir /usr/bin/lockf"
@@ -621,11 +671,12 @@ report_install_lock_failure() {
 
 release_install_lock() {
     [[ -n "$INSTALL_LOCK_CONTROL" ]] &&
-        install_lock_remove_control "$INSTALL_LOCK_CONTROL" "$INSTALL_LOCK_USE_SUDO" || true
+        install_lock_remove_control "$INSTALL_LOCK_CONTROL" "$INSTALL_LOCK_USE_SUDO" "$INSTALL_LOCK_TOKEN" || true
     [[ -n "$INSTALL_LOCK_HOLDER_PID" ]] && wait "$INSTALL_LOCK_HOLDER_PID" 2> /dev/null || true
     INSTALL_LOCK_PATH=""
     INSTALL_LOCK_CONTROL=""
     INSTALL_LOCK_HOLDER_PID=""
+    INSTALL_LOCK_TOKEN=""
     INSTALL_LOCK_USE_SUDO=false
 }
 
@@ -671,6 +722,18 @@ source_archive_url() {
 }
 
 resolve_source_dir() {
+    case "${MOLE_VERSION:-}" in
+        main | latest)
+            RESOLVED_SOURCE_REF=main
+            export MOLE_EDGE_INSTALL=true
+            ;;
+        dev)
+            RESOLVED_SOURCE_REF=dev
+            export MOLE_EDGE_INSTALL=true
+            ;;
+        "") ;;
+        *) RESOLVED_SOURCE_REF="$MOLE_VERSION" ;;
+    esac
     if [[ -n "$SOURCE_DIR" && -d "$SOURCE_DIR" && -f "$SOURCE_DIR/mole" ]]; then
         return 0
     fi
@@ -699,6 +762,7 @@ resolve_source_dir() {
     INSTALL_SOURCE_TMP="$tmp"
 
     local branch="${MOLE_VERSION:-}"
+    [[ "$branch" != latest ]] || branch=main
     if [[ -z "$branch" ]]; then
         branch="$(get_latest_release_tag || true)"
     fi
@@ -714,6 +778,10 @@ resolve_source_dir() {
     fi
     if [[ "$branch" != "main" && "$branch" != "dev" ]]; then
         branch="$(normalize_release_tag "$branch")"
+    fi
+    RESOLVED_SOURCE_REF="$branch"
+    if [[ "$branch" == main || "$branch" == dev ]]; then
+        export MOLE_EDGE_INSTALL=true
     fi
     local source_commit=""
     if [[ "$branch" == "main" ]]; then
@@ -986,6 +1054,21 @@ get_installed_version() {
 }
 
 resolve_install_channel() {
+    case "${RESOLVED_SOURCE_REF:-}" in
+        main | latest)
+            printf 'nightly\n'
+            return 0
+            ;;
+        dev)
+            printf 'dev\n'
+            return 0
+            ;;
+        "") ;;
+        *)
+            printf 'stable\n'
+            return 0
+            ;;
+    esac
     case "${MOLE_VERSION:-}" in
         main | latest)
             printf 'nightly\n'
@@ -1204,16 +1287,43 @@ check_requirements() {
     fi
 }
 
+install_config_has_unsafe_ancestor() {
+    local use_sudo="${1:-false}"
+    local INSTALL_DIR="$CONFIG_DIR"
+    while [[ ! -e "$INSTALL_DIR" && ! -L "$INSTALL_DIR" ]]; do
+        local parent="${INSTALL_DIR%/*}"
+        [[ "$parent" != "$INSTALL_DIR" ]] || return 0
+        INSTALL_DIR="${parent:-/}"
+    done
+    install_lock_has_unsafe_ancestor "$use_sudo"
+}
+
 create_directories() {
+    # Canonical paths are used by every subsequent claim, lock and I/O sink.
+    if [[ -d "$INSTALL_DIR" ]]; then
+        INSTALL_DIR=$(cd "$INSTALL_DIR" && /bin/pwd -P) || return 1
+    fi
+    if [[ -d "$CONFIG_DIR" ]]; then
+        CONFIG_DIR=$(cd "$CONFIG_DIR" && /bin/pwd -P) || return 1
+    fi
+    if [[ ${EUID:-0} -eq 0 ]] && install_config_has_unsafe_ancestor true; then
+        log_error "Configuration path cannot be trusted for root writes: $CONFIG_DIR"
+        log_error "Use a root-owned, non-writable --config root, or run the installer as the invoking user"
+        return 1
+    fi
     if [[ ! -d "$INSTALL_DIR" ]]; then
-        maybe_sudo mkdir -p "$INSTALL_DIR"
+        if ! maybe_sudo mkdir -p "$INSTALL_DIR"; then
+            log_error "Failed to create installation directory: $INSTALL_DIR"
+            return 1
+        fi
     fi
 
     if ! mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/bin" "$CONFIG_DIR/lib"; then
         log_error "Failed to create config directory: $CONFIG_DIR"
-        exit 1
+        return 1
     fi
-
+    INSTALL_DIR=$(cd "$INSTALL_DIR" && /bin/pwd -P) || return 1
+    CONFIG_DIR=$(cd "$CONFIG_DIR" && /bin/pwd -P) || return 1
 }
 
 # Binary install helpers
@@ -1277,6 +1387,17 @@ download_binary() {
         arch_suffix="arm64"
     fi
 
+    local source_ref="${RESOLVED_SOURCE_REF:-${MOLE_VERSION:-}}"
+    if [[ "${MOLE_EDGE_INSTALL:-}" == true || "$source_ref" == main || "$source_ref" == latest || "$source_ref" == dev ]]; then
+        if build_binary_from_source "$binary_name" "$staged_path" &&
+            install_staged_binary "$staged_path" "$target_path"; then
+            return 0
+        fi
+        rm -f "$staged_path" # SAFE: exact helper staging file created above
+        log_error "Could not build ${binary_name} from the resolved source; refusing a different release generation"
+        return 1
+    fi
+
     if [[ -f "$SOURCE_DIR/bin/${binary_name}-go" ]]; then
         if ! cp "$SOURCE_DIR/bin/${binary_name}-go" "$staged_path" ||
             ! install_staged_binary "$staged_path" "$target_path"; then
@@ -1293,14 +1414,6 @@ download_binary() {
         fi
         log_success "Installed local ${binary_name} binary"
         return 0
-    fi
-
-    if [[ "${MOLE_EDGE_INSTALL:-}" == "true" ]]; then
-        if build_binary_from_source "$binary_name" "$staged_path" &&
-            install_staged_binary "$staged_path" "$target_path"; then
-            return 0
-        fi
-        rm -f "$staged_path"
     fi
 
     local version
@@ -1386,152 +1499,165 @@ download_binary() {
 
 # File installation (bin/lib/scripts + go helpers).
 install_files() {
+    resolve_source_dir || return 1
+    local source_dir_abs install_dir_abs config_dir_abs
+    source_dir_abs=$(cd "$SOURCE_DIR" && pwd) || return 1
+    install_dir_abs=$(cd "$INSTALL_DIR" && pwd) || return 1
+    config_dir_abs=$(cd "$CONFIG_DIR" && pwd) || return 1
+    [[ -f "$SOURCE_DIR/mole" ]] || {
+        log_error "mole executable not found in $SOURCE_DIR"
+        return 1
+    }
 
-    resolve_source_dir
-
-    local source_dir_abs
-    local install_dir_abs
-    local config_dir_abs
-    source_dir_abs="$(cd "$SOURCE_DIR" && pwd)"
-    install_dir_abs="$(cd "$INSTALL_DIR" && pwd)"
-    config_dir_abs="$(cd "$CONFIG_DIR" && pwd)"
-
-    if [[ -f "$SOURCE_DIR/mole" ]]; then
-        if [[ "$source_dir_abs" != "$install_dir_abs" ]]; then
-            if needs_sudo; then
-                log_admin "Admin access required for /usr/local/bin"
-                if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
-                    log_error "Admin access required, blocked in test mode"
-                    return 1
-                fi
-                # Explicit failure checks throughout this function: callers run
-                # `install_files || {...}`, and bash disables errexit inside a
-                # function invoked that way, so a failed sudo would otherwise be
-                # swallowed and the install would report success while leaving
-                # the old entry script in place (the 1.45.0 -> 1.47.0 fake
-                # "Updated to latest version" incident).
-                if ! ensure_sudo_ready; then
-                    log_error "Admin access to $INSTALL_DIR is required but not available"
-                    log_error "Cache credentials first, then retry: sudo -v && mo update"
-                    return 1
-                fi
-            fi
-
-            # Atomic update: copy to temporary name first, then move
-            if ! maybe_sudo cp "$SOURCE_DIR/mole" "$INSTALL_DIR/mole.new" ||
-                ! maybe_sudo chmod +x "$INSTALL_DIR/mole.new" ||
-                ! maybe_sudo mv -f "$INSTALL_DIR/mole.new" "$INSTALL_DIR/mole"; then
-                log_error "Failed to install mole to $INSTALL_DIR (admin access missing or denied)"
-                log_error "Cache credentials first, then retry: sudo -v && mo update"
-                return 1
-            fi
-
+    if [[ "$source_dir_abs" != "$install_dir_abs" ]] && needs_sudo; then
+        log_admin "Admin access required for $INSTALL_DIR"
+        if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
+            log_error "Admin access required, blocked in test mode"
+            return 1
         fi
-    else
-        log_error "mole executable not found in ${SOURCE_DIR:-unknown}"
-        exit 1
-    fi
-
-    if [[ -f "$SOURCE_DIR/mo" && "$source_dir_abs" != "$install_dir_abs" ]]; then
-        if ! maybe_sudo cp "$SOURCE_DIR/mo" "$INSTALL_DIR/mo.new" ||
-            ! maybe_sudo chmod +x "$INSTALL_DIR/mo.new" ||
-            ! maybe_sudo mv -f "$INSTALL_DIR/mo.new" "$INSTALL_DIR/mo"; then
-            log_error "Failed to install mo alias to $INSTALL_DIR (admin access missing or denied)"
+        if ! ensure_sudo_ready; then
+            log_error "Admin access to $INSTALL_DIR is required but not available"
+            log_error "Cache credentials first, then retry: sudo -v && mo update"
             return 1
         fi
     fi
 
+    # A failed module/helper publication leaves an explicit repair marker.
+    # Publish the entry script last, and never overwrite user configuration.
+    local helper_install_marker="$CONFIG_DIR/.helper_install_incomplete"
+    if [[ -L "$helper_install_marker" || (-e "$helper_install_marker" && ! -f "$helper_install_marker") ]]; then
+        log_error "Installation repair marker is not a regular file: $helper_install_marker"
+        return 1
+    fi
+    if [[ ! -e "$helper_install_marker" ]] &&
+        ! (
+            umask 077
+            set -C
+            : > "$helper_install_marker"
+        ); then
+        log_error "Could not create installation repair marker: $helper_install_marker"
+        return 1
+    fi
+    if ! mkdir -p "$CONFIG_DIR/bin" "$CONFIG_DIR/lib"; then
+        log_error "Could not prepare module directories under $CONFIG_DIR"
+        return 1
+    fi
+
+    local file
     if [[ -d "$SOURCE_DIR/bin" ]]; then
-        local source_bin_abs="$(cd "$SOURCE_DIR/bin" && pwd)"
-        local config_bin_abs="$(cd "$CONFIG_DIR/bin" && pwd)"
+        local source_bin_abs config_bin_abs
+        source_bin_abs=$(cd "$SOURCE_DIR/bin" && pwd) || return 1
+        config_bin_abs=$(cd "$CONFIG_DIR/bin" && pwd) || return 1
         if [[ "$source_bin_abs" != "$config_bin_abs" ]]; then
             local -a bin_files=("$SOURCE_DIR/bin"/*)
             if [[ ${#bin_files[@]} -gt 0 ]]; then
-                cp -r "${bin_files[@]}" "$CONFIG_DIR/bin/"
+                if ! cp -r "${bin_files[@]}" "$CONFIG_DIR/bin/"; then
+                    log_error "Could not install command modules; repair marker remains at $helper_install_marker"
+                    return 1
+                fi
                 for file in "$CONFIG_DIR/bin/"*; do
-                    [[ -e "$file" ]] && chmod +x "$file"
+                    [[ -e "$file" ]] || continue
+                    if ! chmod +x "$file"; then
+                        log_error "Could not make command module executable: $file"
+                        return 1
+                    fi
                 done
             fi
         fi
     fi
-
     if [[ -d "$SOURCE_DIR/lib" ]]; then
-        local source_lib_abs="$(cd "$SOURCE_DIR/lib" && pwd)"
-        local config_lib_abs="$(cd "$CONFIG_DIR/lib" && pwd)"
+        local source_lib_abs config_lib_abs
+        source_lib_abs=$(cd "$SOURCE_DIR/lib" && pwd) || return 1
+        config_lib_abs=$(cd "$CONFIG_DIR/lib" && pwd) || return 1
         if [[ "$source_lib_abs" != "$config_lib_abs" ]]; then
             local -a lib_files=("$SOURCE_DIR/lib"/*)
-            if [[ ${#lib_files[@]} -gt 0 ]]; then
-                cp -r "${lib_files[@]}" "$CONFIG_DIR/lib/"
+            if [[ ${#lib_files[@]} -gt 0 ]] && ! cp -r "${lib_files[@]}" "$CONFIG_DIR/lib/"; then
+                log_error "Could not install libraries; repair marker remains at $helper_install_marker"
+                return 1
             fi
         fi
     fi
-
     if [[ "$config_dir_abs" != "$source_dir_abs" ]]; then
         for file in README.md LICENSE install.sh; do
-            if [[ -f "$SOURCE_DIR/$file" ]]; then
-                cp -f "$SOURCE_DIR/$file" "$CONFIG_DIR/"
+            if [[ -f "$SOURCE_DIR/$file" ]] && ! cp -f "$SOURCE_DIR/$file" "$CONFIG_DIR/"; then
+                log_error "Could not install $file under $CONFIG_DIR"
+                return 1
             fi
         done
     fi
-
-    if [[ -f "$CONFIG_DIR/install.sh" ]]; then
-        chmod +x "$CONFIG_DIR/install.sh"
+    if [[ -f "$CONFIG_DIR/install.sh" ]] && ! chmod +x "$CONFIG_DIR/install.sh"; then
+        log_error "Could not make $CONFIG_DIR/install.sh executable"
+        return 1
     fi
+    download_binary analyze || return 1
+    download_binary status || return 1
 
     if [[ "$source_dir_abs" != "$install_dir_abs" ]]; then
-        # Use absolute /usr/bin/sed (always BSD on macOS) so PATH-shadowed
-        # GNU sed from Homebrew gnu-sed does not break the -i '' syntax.
-        if ! maybe_sudo /usr/bin/sed -i '' "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"$CONFIG_DIR\"|" "$INSTALL_DIR/mole"; then
-            log_error "Failed to point $INSTALL_DIR/mole at $CONFIG_DIR"
+        local quoted_config config_replacement
+        printf -v quoted_config '%q' "$CONFIG_DIR"
+        config_replacement="${quoted_config//\\/\\\\}"
+        config_replacement="${config_replacement//&/\\&}"
+        config_replacement="${config_replacement//|/\\|}"
+        if [[ $(grep -c '^SCRIPT_DIR=' "$SOURCE_DIR/mole") != 1 ]]; then
+            log_error "Source entry must contain one authored SCRIPT_DIR assignment"
+            return 1
+        fi
+        if ! maybe_sudo cp "$SOURCE_DIR/mole" "$INSTALL_DIR/mole.new" ||
+            ! maybe_sudo chmod +x "$INSTALL_DIR/mole.new" ||
+            ! maybe_sudo /usr/bin/sed -i '' "s|^SCRIPT_DIR=.*|SCRIPT_DIR=$config_replacement|" "$INSTALL_DIR/mole.new" ||
+            ! maybe_sudo /bin/bash --noprofile --norc -n "$INSTALL_DIR/mole.new" ||
+            ! maybe_sudo mv -f "$INSTALL_DIR/mole.new" "$INSTALL_DIR/mole"; then
+            log_error "Failed to install mole to $INSTALL_DIR (admin access missing or denied)"
+            log_error "Cache credentials first, then retry: sudo -v && mo update"
+            return 1
+        fi
+        if [[ -f "$SOURCE_DIR/mo" ]] &&
+            { ! maybe_sudo cp "$SOURCE_DIR/mo" "$INSTALL_DIR/mo.new" ||
+                ! maybe_sudo chmod +x "$INSTALL_DIR/mo.new" ||
+                ! maybe_sudo mv -f "$INSTALL_DIR/mo.new" "$INSTALL_DIR/mo"; }; then
+            log_error "Failed to install mo alias to $INSTALL_DIR"
             return 1
         fi
     fi
-
-    # One line for the whole file install. Reporting the entry script, the mo
-    # alias, the modules and the libraries separately described the layout
-    # rather than the outcome, and every one of them is a hard failure that
-    # returns above if it goes wrong.
-    log_success "Installed to $INSTALL_DIR"
-
-    local helper_install_marker="$CONFIG_DIR/.helper_install_incomplete"
-    : > "$helper_install_marker"
-    if ! download_binary "analyze"; then
-        exit 1
+    if ! rm -f "$helper_install_marker" || [[ -e "$helper_install_marker" || -L "$helper_install_marker" ]]; then # SAFE: exact installer-owned repair marker
+        log_error "Could not clear installation repair marker: $helper_install_marker"
+        return 1
     fi
-    if ! download_binary "status"; then
-        exit 1
-    fi
-    rm -f "$helper_install_marker"
+    log_success "Installed to $INSTALL_DIR" || true
+    return 0
 }
 
 # Verification and PATH hint
 verify_installation() {
-
-    if [[ -x "$INSTALL_DIR/mole" ]] && [[ -f "$CONFIG_DIR/lib/core/common.sh" ]]; then
-        # A runnable old entry script also passes --help, so cross-check the
-        # installed version against the source that was just installed. A
-        # mismatch means the entry script was not actually replaced (for
-        # example a swallowed sudo failure) and the install is a mixed-version
-        # state that must not be reported as success.
-        local expected_version installed_version
-        expected_version="$(get_source_version 2> /dev/null || true)"
-        installed_version="$(get_installed_version 2> /dev/null || true)"
-        if [[ -n "$expected_version" && -n "$installed_version" && "$expected_version" != "$installed_version" ]]; then
-            log_error "Installed mole reports $installed_version but $expected_version was expected"
-            log_error "The entry script at $INSTALL_DIR/mole was not replaced; retry with: sudo -v && mo update"
-            exit 1
-        fi
-
-        if run_install_probe_with_timeout 5 "$INSTALL_DIR/mole" --help > /dev/null 2>&1; then
-            return 0
-        else
-            log_error "Installed Mole did not answer the bounded help probe"
-            return 1
-        fi
-    else
-        log_error "Installation verification failed"
-        exit 1
+    if [[ ! -x "$INSTALL_DIR/mole" || ! -f "$CONFIG_DIR/lib/core/common.sh" ||
+        -e "$CONFIG_DIR/.helper_install_incomplete" || -L "$CONFIG_DIR/.helper_install_incomplete" ]]; then
+        log_error "Installation verification failed; missing files or an incomplete repair marker remain"
+        return 1
     fi
+    local expected_version installed_version version_output probe_status=0
+    expected_version=$(get_source_version 2> /dev/null) || return 1
+    [[ -n "$expected_version" ]] || {
+        log_error "Source version is unavailable for installation verification"
+        return 1
+    }
+    # Static VERSION text is useful for repairing an old bootstrap, but cannot
+    # prove a new generation actually runs. Require its bounded live response.
+    version_output=$(run_install_probe_with_timeout 5 "$INSTALL_DIR/mole" --version 2> /dev/null) || probe_status=$?
+    installed_version=$(printf '%s\n' "$version_output" | awk '/Mole version/ {print $NF; exit}')
+    if [[ $probe_status -ne 0 || -z "$installed_version" ]]; then
+        log_error "Installed Mole did not answer the bounded version probe"
+        return 1
+    fi
+    if [[ "$expected_version" != "$installed_version" ]]; then
+        log_error "Installed mole reports $installed_version but $expected_version was expected"
+        log_error "The entry script at $INSTALL_DIR/mole was not replaced; retry with: sudo -v && mo update"
+        return 1
+    fi
+    if ! run_install_probe_with_timeout 5 "$INSTALL_DIR/mole" --help > /dev/null 2>&1; then
+        log_error "Installed Mole did not answer the bounded help probe"
+        return 1
+    fi
+    return 0
 }
 
 setup_path() {
@@ -1627,6 +1753,36 @@ homebrew_owns_mole() {
 }
 
 # Main install/update flows
+# Managed modules, helpers and channel metadata have one physical install owner.
+# A prefix mutex cannot protect a config root shared by two different prefixes.
+claim_install_config_prefix() {
+    local binding_file physical_prefix prefix_identity expected_binding current_binding=""
+    physical_prefix=$(cd "$INSTALL_DIR" && /bin/pwd -P) || return 1
+    CONFIG_DIR=$(cd "$CONFIG_DIR" && /bin/pwd -P) || return 1
+    INSTALL_DIR="$physical_prefix"
+    binding_file="$CONFIG_DIR/.install_prefix"
+    prefix_identity=$(/usr/bin/stat -f%d:%i "$physical_prefix") || return 1
+    expected_binding="$prefix_identity|$physical_prefix"
+    if [[ ! -e "$binding_file" && ! -L "$binding_file" ]]; then
+        # Noclobber publishes the claim atomically. Another prefix that sees
+        # the not-yet-written file refuses; it never treats emptiness as free.
+        (
+            umask 077
+            set -C
+            printf '%s\n' "$expected_binding" > "$binding_file"
+        ) 2> /dev/null || true
+    fi
+    if [[ -f "$binding_file" && ! -L "$binding_file" ]]; then
+        IFS= read -r current_binding < "$binding_file" || current_binding=""
+    fi
+    if [[ "$current_binding" != "$expected_binding" ]]; then
+        log_error "Configuration ownership does not match this physical installation: $binding_file"
+        log_error "Use a separate --config directory for this --prefix; inspect an incomplete claim before manually moving it aside"
+        return 1
+    fi
+    return 0
+}
+
 perform_install() {
     check_requirements
     resolve_source_dir
@@ -1638,8 +1794,9 @@ perform_install() {
         report_install_lock_failure
         exit 1
     }
-    install_files
-    verify_installation
+    claim_install_config_prefix || return 1
+    install_files || return 1
+    verify_installation || return 1
     setup_path
 
     local installed_version
@@ -1674,6 +1831,10 @@ perform_update() {
     check_requirements
 
     if homebrew_owns_mole; then
+        if [[ "$EUID" -eq 0 ]]; then
+            log_error "Run the Homebrew update without sudo."
+            return 1
+        fi
         resolve_source_dir 2> /dev/null || true
         local current_version
         current_version=$(get_installed_version || echo "unknown")
@@ -1709,11 +1870,6 @@ perform_update() {
         exit 1
     fi
 
-    if [[ "$installed_version" == "$target_version" ]]; then
-        echo -e "${GREEN}${ICON_SUCCESS}${NC} Already on latest version, $installed_version"
-        exit 0
-    fi
-
     local old_verbose=$VERBOSE
     VERBOSE=0
     create_directories || {
@@ -1726,6 +1882,15 @@ perform_update() {
         report_install_lock_failure
         exit 1
     }
+    if ! claim_install_config_prefix; then
+        VERBOSE=$old_verbose
+        return 1
+    fi
+    if [[ "$installed_version" == "$target_version" ]] && verify_installation; then
+        VERBOSE=$old_verbose
+        echo -e "${GREEN}${ICON_SUCCESS}${NC} Already on latest version, $installed_version"
+        return 0
+    fi
     install_files || {
         VERBOSE=$old_verbose
         log_error "Failed to install files"

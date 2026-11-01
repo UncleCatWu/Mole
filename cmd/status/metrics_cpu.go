@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -17,6 +19,46 @@ const (
 	cpuSampleInterval = 100 * time.Millisecond
 )
 
+var cpuTimesFunc = cpu.Times
+var cpuClock = time.Now
+var cpuUtilSampler = &cpuUsageSampler{}
+var cpuCountsFunc = cpu.Counts
+var cpuLoadFunc = load.Avg
+
+type cpuUsageSampler struct {
+	mu       sync.Mutex
+	previous []cpu.TimesStat
+	at       time.Time
+}
+
+// Both cadences use the same elapsed-time floor. Fast samples retain the
+// previous native counters instead of sleeping or using raw busy/idle ratios.
+func (s *cpuUsageSampler) sample(interval time.Duration) ([]float64, float64, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before, at := s.previous, s.at
+	if interval > 0 {
+		var err error
+		before, err = cpuTimesFunc(true)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		at = cpuClock()
+		time.Sleep(interval)
+	}
+	after, err := cpuTimesFunc(true)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	now := cpuClock()
+	s.previous, s.at = slices.Clone(after), now
+	if len(before) == 0 || at.IsZero() {
+		return make([]float64, len(after)), 0, true, nil
+	}
+	percents, total, err := perCoreUsageFromTimes(before, after, now.Sub(at).Seconds())
+	return percents, total, false, err
+}
+
 func collectCPU() (CPUStatus, error) {
 	return collectCPUWithOptions(true)
 }
@@ -26,12 +68,12 @@ func collectCPUFast() (CPUStatus, error) {
 }
 
 func collectCPUWithOptions(includeSlowFallbacks bool) (CPUStatus, error) {
-	counts, countsErr := cpu.Counts(false)
+	counts, countsErr := cpuCountsFunc(false)
 	if countsErr != nil || counts == 0 {
 		counts = runtime.NumCPU()
 	}
 
-	logical, logicalErr := cpu.Counts(true)
+	logical, logicalErr := cpuCountsFunc(true)
 	if logicalErr != nil || logical == 0 {
 		logical = runtime.NumCPU()
 	}
@@ -39,27 +81,19 @@ func collectCPUWithOptions(includeSlowFallbacks bool) (CPUStatus, error) {
 		logical = 1
 	}
 
-	var percents []float64
-	var err error
-	var totalPercent float64
-	sampled := false
+	interval := time.Duration(0)
 	if includeSlowFallbacks {
 		// Explicit two-snapshot sampling on the full refresh path. On Apple
 		// Silicon, host_processor_info stops accumulating idle ticks for a
 		// parked core, so busy/(busy+idle) over the raw deltas reports a
-		// mostly-sleeping E-core as 90-100% (#1237). sampleCPUPercents floors
+		// mostly-sleeping E-core as 90-100% (#1237). cpuUsageSampler floors
 		// each core's denominator at the wall-clock window, which counts the
 		// missing parked time as idle; on Intel the ticks already cover the
 		// window and the result is unchanged.
-		warmUpCPU()
-		percents, totalPercent, err = sampleCPUPercents(cpuSampleInterval)
-		sampled = err == nil && len(percents) > 0
+		interval = cpuSampleInterval
 	}
-	if !sampled {
-		percents, err = cpu.Percent(0, true)
-	}
-	perCoreEstimated := false
-	if !sampled && (err != nil || len(percents) == 0) {
+	percents, totalPercent, perCoreEstimated, err := cpuUtilSampler.sample(interval)
+	if err != nil || len(percents) == 0 {
 		if !includeSlowFallbacks {
 			// Fast path: skip the expensive secondary sampling and just
 			// estimate zeroed per-core usage. The next full refresh corrects it.
@@ -77,14 +111,9 @@ func collectCPUWithOptions(includeSlowFallbacks bool) (CPUStatus, error) {
 			percents = fallbackPerCore
 			perCoreEstimated = true
 		}
-	} else if !sampled {
-		for _, v := range percents {
-			totalPercent += v
-		}
-		totalPercent /= float64(len(percents))
 	}
 
-	loadStats, loadErr := load.Avg()
+	loadStats, loadErr := cpuLoadFunc()
 	var loadAvg load.AvgStat
 	if loadStats != nil {
 		loadAvg = *loadStats
@@ -289,26 +318,6 @@ func fallbackCPUUtilization(logical int) (float64, []float64, error) {
 		perCore[i] = avg
 	}
 	return avg, perCore, nil
-}
-
-func warmUpCPU() {
-	cpu.Percent(0, true) //nolint:errcheck
-}
-
-// sampleCPUPercents measures per-core and total CPU usage over one wall-clock
-// window using two cpu.Times snapshots.
-func sampleCPUPercents(interval time.Duration) ([]float64, float64, error) {
-	before, err := cpu.Times(true)
-	if err != nil {
-		return nil, 0, err
-	}
-	start := time.Now()
-	time.Sleep(interval)
-	after, err := cpu.Times(true)
-	if err != nil {
-		return nil, 0, err
-	}
-	return perCoreUsageFromTimes(before, after, time.Since(start).Seconds())
 }
 
 // perCoreUsageFromTimes converts two per-core cpu.Times snapshots into per-core

@@ -25,7 +25,6 @@ type liveScanTargetKind int
 const (
 	liveScanTargetDirectory liveScanTargetKind = iota + 1
 	liveScanTargetFoldedDirectory
-	liveScanTargetHomeLibrary
 )
 
 type liveScanTarget struct {
@@ -92,13 +91,24 @@ func startLiveScanCmd(path string, filesScanned, dirsScanned, bytesScanned *int6
 	return startLiveScanCmdWithPolicy(path, filesScanned, dirsScanned, bytesScanned, currentPath, scanCacheReuse)
 }
 
-func startLiveScanCmdWithPolicy(path string, filesScanned, dirsScanned, bytesScanned *int64, currentPath *atomic.Value, cachePolicy scanCachePolicy) tea.Cmd {
+func startLiveScanCmdWithPolicy(path string, filesScanned, dirsScanned, bytesScanned *int64, currentPath *atomic.Value, cachePolicy scanCachePolicy, contexts ...context.Context) tea.Cmd {
 	return func() tea.Msg {
 		id := nextLiveScanID.Add(1)
-		ctx, cancelContext := context.WithCancel(context.Background())
+		parent := context.Background()
+		if len(contexts) > 0 && contexts[0] != nil {
+			parent = contexts[0]
+		}
+		ctx, cancelContext := context.WithCancel(parent)
+		if err := ctx.Err(); err != nil {
+			cancelContext()
+			return liveScanStartMsg{id: id, path: path, err: err}
+		}
 
 		limiter := newScanLimiter(0)
 		entries, targets, totalSize, totalFiles, largeFiles, err := readLiveScanInitialEntries(path, limiter)
+		if err == nil {
+			err = ctx.Err()
+		}
 		if err != nil {
 			cancelContext()
 			return liveScanStartMsg{id: id, path: path, err: err}
@@ -113,7 +123,12 @@ func startLiveScanCmdWithPolicy(path string, filesScanned, dirsScanned, bytesSca
 
 		publication := newScanPublication(ctx, cancelContext)
 		stream := newLiveScanEventStream(publication, len(targets))
-		go runLiveScan(ctx, id, path, entries, targets, totalSize, totalFiles, largeFiles, limiter, filesScanned, dirsScanned, bytesScanned, currentPath, stream, cachePolicy)
+		if !startAnalyzerWork(ctx, func() {
+			runLiveScan(ctx, id, path, entries, targets, totalSize, totalFiles, largeFiles, limiter, filesScanned, dirsScanned, bytesScanned, currentPath, stream, cachePolicy)
+		}) {
+			stream.close()
+			return liveScanStartMsg{id: id, path: path, err: context.Canceled}
+		}
 
 		scanningPaths := make([]string, 0, len(targets))
 		for _, target := range targets {
@@ -144,8 +159,6 @@ func readLiveScanInitialEntries(root string, limiter *scanLimiter) ([]dirEntry, 
 	}
 
 	isRootDir := root == "/"
-	home := os.Getenv("HOME")
-	isHomeDir := home != "" && root == home
 
 	entries := make([]dirEntry, 0, len(children))
 	targets := make([]liveScanTarget, 0, len(children))
@@ -187,9 +200,7 @@ func readLiveScanInitialEntries(root string, limiter *scanLimiter) ([]dirEntry, 
 			}
 
 			targetKind := liveScanTargetDirectory
-			if isHomeDir && child.Name() == "Library" {
-				targetKind = liveScanTargetHomeLibrary
-			} else if shouldFoldDirWithPath(child.Name(), fullPath) {
+			if shouldFoldDirWithPath(child.Name(), fullPath) {
 				targetKind = liveScanTargetFoldedDirectory
 			}
 
@@ -423,12 +434,6 @@ func scanLiveTarget(ctx context.Context, target liveScanTarget, largeFileChan ch
 	}
 
 	switch target.kind {
-	case liveScanTargetHomeLibrary:
-		if cachePolicy == scanCacheReuse {
-			if cached, err := loadStoredOverviewSize(target.path); err == nil && cached > 0 {
-				return scanResult{TotalSize: cached}, nil
-			}
-		}
 	case liveScanTargetFoldedDirectory:
 		size, err := getDirectorySizeFromDu(ctx, target.path)
 		if ctx.Err() != nil {

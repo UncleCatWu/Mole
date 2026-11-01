@@ -17,6 +17,8 @@ if [[ -n "${MOLE_MANAGE_UPDATE_LOADED:-}" ]]; then
 fi
 readonly MOLE_MANAGE_UPDATE_LOADED=1
 
+source "$(dirname "${BASH_SOURCE[0]}")/local_generation.sh"
+
 curl_download_with_retry() {
     local url="$1"
     local output_file="$2"
@@ -59,7 +61,7 @@ _update_lock_process_start() {
 _update_lock_current_shell_pid() {
     local variable_name="$1"
     local pid_file current_pid=""
-    pid_file=$(/usr/bin/mktemp /tmp/mole-update-pid.XXXXXX) || return 1
+    pid_file=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/mole-update-pid.XXXXXX") || return 1
     if ! /bin/sh -c 'printf "%s\n" "$PPID" > "$1"' sh "$pid_file"; then
         /bin/rm -f "$pid_file" 2> /dev/null || true # SAFE: exact mktemp-created PID probe file.
         return 1
@@ -224,12 +226,18 @@ _update_lock_remove_control() {
     local control_path="$1"
     local use_sudo="$2"
     local lock_path="$3"
+    local expected_token="${4:-}"
     local control_prefix control_suffix
     [[ -n "$control_path" ]] || return 0
     control_prefix="$(dirname "$lock_path")/control."
     [[ "$control_path" == "$control_prefix"* ]] || return 1
     control_suffix="${control_path#"$control_prefix"}"
     [[ -n "$control_suffix" && "$control_suffix" != */* ]] || return 1
+    if [[ -n "$expected_token" ]]; then
+        local current_token=""
+        current_token=$(_update_lock_read_owner "$control_path" "$use_sudo") || return 1
+        [[ "$current_token" == "$expected_token" ]] || return 1
+    fi
     if [[ "$use_sudo" == "true" ]]; then
         _update_lock_sudo /bin/test -f "$control_path" 2> /dev/null || return 1
         ! _update_lock_sudo /bin/test -L "$control_path" 2> /dev/null || return 1
@@ -255,8 +263,9 @@ _update_acquire_lock() {
         [[ -f "$lock_path" && ! -L "$lock_path" ]] || return 1
     fi
     # Same mutex choice as install.sh: prefer the kernel lock, fall back to an
-    # atomic mkdir where /usr/bin/lockf was never shipped (#1348). Requiring it
-    # made `mo update` unusable on every macOS before it existed.
+    # atomic mkdir where /usr/bin/lockf was never shipped (#1348). Occupied
+    # mkdir generations require manual checks; stale tokens are not recovery
+    # proof. Requiring lockf would make older macOS unable to update.
     local mutex_dir=""
     if [[ ! -x /usr/bin/lockf ]]; then
         [[ -x /bin/mkdir ]] || return 1
@@ -271,41 +280,63 @@ _update_acquire_lock() {
         control_path=$(/usr/bin/mktemp "$(dirname "$lock_path")/control.XXXXXX") || return 1
     fi
     token="$owner_pid|$owner_start|${control_path##*.}"
+    if [[ "$use_sudo" == "true" ]]; then
+        # shellcheck disable=SC2016 # The child shell expands its positional arguments.
+        _update_lock_sudo /bin/sh -c 'printf "%s\n" "$1" > "$2"' sh "$token" "$control_path" || return 1
+    else
+        printf '%s\n' "$token" > "$control_path" || return 1
+    fi
 
     # shellcheck disable=SC2016 # The lock-holder shell expands these values.
     local holder_script='
         token="$1"; owner_pid="$2"; owner_start="$3"; lock_path="$4"; control_path="$5"; mutex_dir="$6"
-        [ -f "$control_path" ] || exit 1
-        if [ -n "$mutex_dir" ] && ! /bin/mkdir "$mutex_dir" 2>/dev/null; then
-            previous=$(/bin/cat "$lock_path" 2>/dev/null || true)
-            previous_pid=${previous%%|*}
-            previous_rest=${previous#*|}
-            previous_start=${previous_rest%%|*}
-            owner_gone=1
-            if [ -n "$previous_pid" ] && kill -0 "$previous_pid" 2>/dev/null; then
-                current_start=$(LC_ALL=C /bin/ps -p "$previous_pid" -o lstart= 2>/dev/null |
-                    /usr/bin/sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//" | /usr/bin/head -1)
-                if [ "$current_start" = "$previous_start" ]; then
-                    owner_gone=0
+        mutex_identity=""; marker_identity=""; current_start=""
+        [ -f "$control_path" ] && [ ! -L "$control_path" ] || exit 1
+        [ "$(/bin/cat "$control_path" 2>/dev/null)" = "$token" ] || exit 1
+        if [ -n "$mutex_dir" ]; then
+            if ! /bin/mkdir "$mutex_dir" 2>/dev/null; then
+                # Never reclaim an occupied directory: its token can belong to
+                # an older generation while a new owner is still publishing.
+                previous=$(/bin/cat "$mutex_dir/owner" 2>/dev/null || true)
+                previous_pid=${previous%%|*}
+                previous_rest=${previous#*|}
+                previous_start=${previous_rest%%|*}
+                if [ -n "$previous_pid" ] && kill -0 "$previous_pid" 2>/dev/null; then
+                    current_start=$(LC_ALL=C /bin/ps -p "$previous_pid" -o lstart= 2>/dev/null |
+                        /usr/bin/sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//" | /usr/bin/head -1)
+                    [ -n "$current_start" ] && [ "$current_start" = "$previous_start" ] && exit 73
                 fi
+                exit 74
             fi
-            [ "$owner_gone" = 1 ] || exit 1
-            /bin/rmdir "$mutex_dir" 2>/dev/null || exit 1
-            /bin/mkdir "$mutex_dir" 2>/dev/null || exit 1
+            mutex_identity=$(/usr/bin/stat -f%d:%i "$mutex_dir" 2>/dev/null) || exit 75
+            if ! (umask 077; set -C; printf "%s\n" "$token" > "$mutex_dir/owner"); then
+                exit 75
+            fi
+            marker_identity=$(/usr/bin/stat -f%d:%i "$mutex_dir/owner" 2>/dev/null) || exit 75
         fi
-        if ! printf "%s\n" "$token" > "$lock_path"; then
-            [ -n "$mutex_dir" ] && /bin/rmdir "$mutex_dir" 2>/dev/null
-            exit 1
-        fi
-        while [ -f "$control_path" ]; do
+        printf "%s\n" "$token" > "$lock_path" || exit 75
+        while [ -f "$control_path" ] && [ ! -L "$control_path" ] &&
+            [ "$(/bin/cat "$control_path" 2>/dev/null)" = "$token" ]; do
             kill -0 "$owner_pid" 2>/dev/null || break
             current_start=$(LC_ALL=C /bin/ps -p "$owner_pid" -o lstart= 2>/dev/null |
                 /usr/bin/sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//" | /usr/bin/head -1)
-            [ "$current_start" = "$owner_start" ] || break
+            # Unknown process metadata retains the lease. Only a positive pid
+            # reuse proof or loss of this generation control ends it.
+            [ -z "$current_start" ] || [ "$current_start" = "$owner_start" ] || break
             /bin/sleep 0.1
         done
-        /bin/rm -f "$control_path" # SAFE: exact mktemp-created update lock control file.
-        [ -n "$mutex_dir" ] && /bin/rmdir "$mutex_dir" 2>/dev/null
+        if [ -f "$control_path" ] && [ ! -L "$control_path" ] &&
+            [ "$(/bin/cat "$control_path" 2>/dev/null)" = "$token" ]; then
+            /bin/rm -f "$control_path" # SAFE: exact token-bound control file created for this attempt
+        fi
+        if [ -n "$mutex_dir" ] && [ ! -L "$mutex_dir" ] && [ ! -L "$mutex_dir/owner" ] &&
+            [ "$(/usr/bin/stat -f%d:%i "$mutex_dir" 2>/dev/null)" = "$mutex_identity" ] &&
+            [ "$(/usr/bin/stat -f%d:%i "$mutex_dir/owner" 2>/dev/null)" = "$marker_identity" ] &&
+            [ "$(/bin/cat "$mutex_dir/owner" 2>/dev/null)" = "$token" ] &&
+            [ "$(/bin/cat "$lock_path" 2>/dev/null)" = "$token" ]; then
+            /bin/rm -f "$mutex_dir/owner" || exit 75 # SAFE: identity-checked owner marker for this mkdir generation
+            /bin/rmdir "$mutex_dir" 2>/dev/null || exit 75
+        fi
         exit 0
     '
     # Spelled out rather than built as a command array: an empty array expanded
@@ -330,14 +361,28 @@ _update_acquire_lock() {
 
     while [[ "$attempt" -lt 100 ]]; do
         if ! kill -0 "$holder_pid" 2> /dev/null; then
-            wait "$holder_pid" 2> /dev/null || true
-            _update_lock_remove_control "$control_path" "$use_sudo" "$lock_path" || true
+            local holder_status=0
+            wait "$holder_pid" 2> /dev/null || holder_status=$?
+            if [[ -n "$mutex_dir" ]]; then
+                case "$holder_status" in
+                    73)
+                        log_error "An install or update owner is still running for $mutex_dir"
+                        log_error "Wait for that operation to finish, then retry"
+                        ;;
+                    74 | 75)
+                        log_error "$mutex_dir could not be bound to a completed owner generation"
+                        log_error "Inspect its owner file and running install/update processes; only after confirming none can write, move this holder aside and retry"
+                        ;;
+                esac
+            fi
+            _update_lock_remove_control "$control_path" "$use_sudo" "$lock_path" "$token" || true
             return 1
         fi
         owner_value=$(_update_lock_read_owner "$lock_path" "$use_sudo" || true)
         if [[ "$owner_value" == "$token" ]]; then
             UPDATE_LOCK_CONTROL="$control_path"
             UPDATE_LOCK_HOLDER_PID="$holder_pid"
+            UPDATE_LOCK_TOKEN="$token"
             UPDATE_LOCK_ACQUIRED=true
             return 0
         fi
@@ -345,7 +390,7 @@ _update_acquire_lock() {
         attempt=$((attempt + 1))
     done
 
-    _update_lock_remove_control "$control_path" "$use_sudo" "$lock_path" || true
+    _update_lock_remove_control "$control_path" "$use_sudo" "$lock_path" "$token" || true
     wait "$holder_pid" 2> /dev/null || true
     return 1
 }
@@ -356,11 +401,13 @@ _update_release_lock() {
     local control_path="${3:-}"
     local holder_pid="${4:-}"
     local acquired="${5:-false}"
+    local token="${6:-${UPDATE_LOCK_TOKEN:-}}"
     [[ "$acquired" == "true" ]] || return 0
-    _update_lock_remove_control "$control_path" "$use_sudo" "$lock_path" || true
+    _update_lock_remove_control "$control_path" "$use_sudo" "$lock_path" "$token" || true
     [[ "$holder_pid" =~ ^[0-9]+$ ]] && wait "$holder_pid" 2> /dev/null || true
     UPDATE_LOCK_CONTROL=""
     UPDATE_LOCK_HOLDER_PID=""
+    UPDATE_LOCK_TOKEN=""
     UPDATE_LOCK_ACQUIRED=false
 }
 
@@ -395,6 +442,7 @@ _update_verify_installed_generation() {
     local lock_control="$UPDATE_LOCK_CONTROL"
     local lock_holder_pid="$UPDATE_LOCK_HOLDER_PID"
     local lock_acquired="$UPDATE_LOCK_ACQUIRED"
+    local lock_token="$UPDATE_LOCK_TOKEN"
     local verification_status=0
     local installed_channel=""
     local installed_receipt=""
@@ -441,7 +489,7 @@ _update_verify_installed_generation() {
     fi
 
     _update_release_lock "$verification_lock" "$lock_uses_sudo" \
-        "$lock_control" "$lock_holder_pid" "$lock_acquired"
+        "$lock_control" "$lock_holder_pid" "$lock_acquired" "$lock_token"
     return "$verification_status"
 }
 
@@ -998,12 +1046,14 @@ show_help() {
 
 # Update flow (Homebrew or installer).
 update_mole() (
+    mole_local_generation_management_guard update || exit "$?"
     local force_update="${1:-false}"
     local nightly_update="${2:-false}"
     local update_interrupted=false
     local sudo_keepalive_pid=""
     local UPDATE_LOCK_CONTROL=""
     local UPDATE_LOCK_HOLDER_PID=""
+    local UPDATE_LOCK_TOKEN=""
     local UPDATE_LOCK_ACQUIRED=false
 
     # Cleanup function for sudo keepalive
@@ -1011,7 +1061,7 @@ update_mole() (
         [[ -n "$sudo_keepalive_pid" ]] && _stop_sudo_keepalive "$sudo_keepalive_pid" || true
         if [[ -n "${verification_lock:-}" && "$UPDATE_LOCK_ACQUIRED" == "true" ]]; then
             _update_release_lock "$verification_lock" "${lock_uses_sudo:-false}" \
-                "$UPDATE_LOCK_CONTROL" "$UPDATE_LOCK_HOLDER_PID" "$UPDATE_LOCK_ACQUIRED"
+                "$UPDATE_LOCK_CONTROL" "$UPDATE_LOCK_HOLDER_PID" "$UPDATE_LOCK_ACQUIRED" "$UPDATE_LOCK_TOKEN"
         fi
     }
     trap '_update_cleanup; update_interrupted=true; echo ""; exit 130' INT TERM

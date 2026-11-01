@@ -7,12 +7,6 @@ setup_file() {
 	ORIGINAL_HOME="${HOME:-}"
 	export ORIGINAL_HOME
 
-	# Capture real GOCACHE before HOME is replaced with a temp dir.
-	# Without this, go build would use $HOME/Library/Caches/go-build inside the
-	# temp dir (empty), causing a full cold rebuild on every test run (~6s).
-	ORIGINAL_GOCACHE="$(go env GOCACHE 2>/dev/null || true)"
-	export ORIGINAL_GOCACHE
-
 	HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-cli-home.XXXXXX")"
 	export HOME
 
@@ -26,18 +20,14 @@ setup_file() {
 		STATUS_BIN="$MOLE_TEST_STATUS_BIN"
 		export ANALYZE_BIN STATUS_BIN
 	elif command -v go > /dev/null 2>&1; then
-		# Build Go binaries from current source for JSON tests.
-		# Point GOPATH/GOMODCACHE/GOCACHE at the real home so local focused runs
-		# can reuse caches when the full runner did not prebuild helpers.
-		ANALYZE_BIN="$(mktemp "${TMPDIR:-/tmp}/analyze-go.XXXXXX")"
-		STATUS_BIN="$(mktemp "${TMPDIR:-/tmp}/status-go.XXXXXX")"
-		GOPATH="${ORIGINAL_HOME}/go" GOMODCACHE="${ORIGINAL_HOME}/go/pkg/mod" \
-			GOCACHE="${ORIGINAL_GOCACHE}" \
-			go build -o "$ANALYZE_BIN" "$PROJECT_ROOT/cmd/analyze" 2>/dev/null
-		GOPATH="${ORIGINAL_HOME}/go" GOMODCACHE="${ORIGINAL_HOME}/go/pkg/mod" \
-			GOCACHE="${ORIGINAL_GOCACHE}" \
-			go build -o "$STATUS_BIN" "$PROJECT_ROOT/cmd/status" 2>/dev/null
-		CLI_OWNS_GO_HELPERS=1
+		# The full runner and focused CLI tests build the same native-fixture
+		# adapter; CLI/main/JSON/watch remain the current production source.
+		CLI_GO_HELPER_DIR="$(mktemp -d "${TMPDIR%/}/mole-cli-helpers.XXXXXX")"
+		# shellcheck source=tests/support/build_go_cli_helpers.sh
+		source "$PROJECT_ROOT/tests/support/build_go_cli_helpers.sh"
+		mole_build_go_cli_helpers "$CLI_GO_HELPER_DIR" || return $?
+		ANALYZE_BIN="$MOLE_TEST_ANALYZE_BIN"
+		STATUS_BIN="$MOLE_TEST_STATUS_BIN"
 		export ANALYZE_BIN STATUS_BIN
 	fi
 }
@@ -137,6 +127,29 @@ SCRIPT
 	run env HOME="$HOME" PATH="$fake_bin:$PATH" MOLE_HOMEBREW_DETECT_TIMEOUT=1 "$PROJECT_ROOT/mole" --version
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"Install: Manual"* ]]
+}
+
+@test "mole invoked through a cross-directory symlink still sources lib" {
+	local link_dir
+	link_dir="$(mktemp -d "${BATS_TEST_TMPDIR}/mole-abs-link.XXXXXX")"
+	ln -s "$PROJECT_ROOT/mole" "$link_dir/mole"
+	run env HOME="$HOME" "$link_dir/mole" --help
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"mo clean"* ]] || return 1
+}
+
+@test "mole invoked through a Homebrew-style prefix symlink still sources lib" {
+	local prefix cellar
+	prefix="$(mktemp -d "${BATS_TEST_TMPDIR}/mole-brew-prefix.XXXXXX")"
+	cellar="$prefix/Cellar/mole/9.9.9/bin"
+	mkdir -p "$prefix/bin" "$cellar"
+	cp "$PROJECT_ROOT/mole" "$cellar/mole"
+	chmod +x "$cellar/mole"
+	cp -R "$PROJECT_ROOT/lib" "$prefix/bin/lib"
+	ln -s "$cellar/mole" "$prefix/bin/mole"
+	run env HOME="$HOME" "$prefix/bin/mole" --help
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"mo clean"* ]] || return 1
 }
 
 @test "mole --version shows nightly channel metadata" {
@@ -754,4 +767,24 @@ print(f"watch_lines={len(lines)}")
 PY
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"watch_lines=3"* ]]
+}
+
+@test "user CLI entrypoints refuse root before loading shared user state" {
+    for entry in mole bin/clean.sh bin/optimize.sh bin/purge.sh bin/uninstall.sh bin/installer.sh bin/touchid.sh bin/completion.sh; do
+        # Only the EUID guard. Stopping at the first SCRIPT_DIR= assignment
+        # would pull the mole symlink walker into a bash -c prefix, where
+        # BASH_SOURCE is not a real file.
+        prefix=$(awk '
+            /^if \[\[ "\$EUID"/ { keep=1 }
+            keep { print }
+            /^fi$/ && keep { exit }
+        ' "$PROJECT_ROOT/$entry")
+        # Execute the actual source prefix, substituting only the read-only UID
+        # so the test never requests root or runs a maintenance command.
+        run /bin/bash -c "${prefix//\$EUID/0}"
+        [ "$status" -eq 1 ] || return 1
+        [[ "$output" == *"Run Mole without sudo"* ]] || return 1
+        run /bin/bash -c "${prefix//\$EUID/501}"
+        [ "$status" -eq 0 ] || return 1
+    done
 }

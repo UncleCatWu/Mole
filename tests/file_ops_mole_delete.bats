@@ -346,7 +346,9 @@ EOF
 @test "Microsoft Word app path uses the direct Trash mover without trash or Finder" {
     local fake_home="$SANDBOX/home"
     local trace="$SANDBOX/direct-route.log"
+    local app_fixture="$SANDBOX/Applications/Microsoft Word.app"
     mkdir -p "$fake_home"
+    mkdir -p "$app_fixture"
 
     run /bin/bash --noprofile --norc <<EOF
 $(prelude)
@@ -366,14 +368,17 @@ osascript() {
     printf 'osascript:%s\n' "\$*" >> "$trace"
     return 98
 }
-_mole_path_requires_direct_trash "/Applications/Microsoft Word.app"
-! _mole_path_requires_direct_trash "/Applications/Utilities/Microsoft Word.app"
-! _mole_path_requires_direct_trash "/Applications/Microsoft Word.app/Contents"
-_mole_move_to_trash "/Applications/Microsoft Word.app" false
+_mole_path_requires_direct_trash "/Applications/Microsoft Word.app" || exit 1
+if _mole_path_requires_direct_trash "/Applications/Utilities/Microsoft Word.app"; then exit 1; fi
+if _mole_path_requires_direct_trash "/Applications/Microsoft Word.app/Contents"; then exit 1; fi
+# The real absolute classifier is asserted above; route a private equivalent
+# through the mocked mover without granting a live Applications mutation.
+_mole_path_requires_direct_trash() { [[ "\$1" == "$app_fixture" ]]; }
+_mole_move_to_trash "$app_fixture" false
 EOF
 
     [ "$status" -eq 0 ]
-    grep -qF "direct:/Applications/Microsoft Word.app:false" "$trace"
+    grep -qF "direct:$app_fixture:false" "$trace"
     [[ "$(grep -c '^trash:' "$trace" 2> /dev/null || true)" -eq 0 ]] || return 1
     [[ "$(grep -c '^osascript:' "$trace" 2> /dev/null || true)" -eq 0 ]]
 }
@@ -391,12 +396,17 @@ EOF
 
 @test "application Trash falls back to Finder after a direct TCC denial" {
     local trace="$SANDBOX/app-finder-fallback.log"
+    local app_fixture="$SANDBOX/Applications/Developer.app"
+    mkdir -p "$app_fixture"
 
     run /bin/bash --noprofile --norc <<EOF
 $(prelude)
 unset MOLE_TEST_TRASH_DIR
 unset MOLE_TEST_NO_AUTH
 export MOLE_DELETE_MODE=trash
+_mole_path_is_application_bundle "/Applications/Developer.app" || exit 1
+_mole_path_requires_direct_trash() { [[ "\$1" == "$app_fixture" ]]; }
+_mole_path_is_application_bundle() { [[ "\$1" == "$app_fixture" ]]; }
 _mole_move_path_to_user_trash() {
     printf 'direct:%s:%s\n' "\$1" "\$2" >> "$trace"
     return "\$MOLE_ERR_PRIVACY_DENIED"
@@ -405,12 +415,12 @@ _mole_move_app_to_trash_via_finder() {
     printf 'finder:%s\n' "\$1" >> "$trace"
     return 0
 }
-_mole_move_to_trash "/Applications/Developer.app" false
+_mole_move_to_trash "$app_fixture" false
 EOF
 
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
-    [[ "$(grep -c '^direct:/Applications/Developer.app:false$' "$trace" 2> /dev/null || true)" -eq 1 ]] || return 1
-    [[ "$(grep -c '^finder:/Applications/Developer.app$' "$trace" 2> /dev/null || true)" -eq 1 ]]
+    [[ "$(grep -Fc "direct:$app_fixture:false" "$trace" 2> /dev/null || true)" -eq 1 ]] || return 1
+    [[ "$(grep -Fc "finder:$app_fixture" "$trace" 2> /dev/null || true)" -eq 1 ]]
 }
 
 @test "Trash mode refuses sudo-required app below mutable Applications" {

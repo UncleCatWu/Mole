@@ -5,6 +5,13 @@
 
 set -euo pipefail
 
+# User state and installed tools must never run with inherited root privileges.
+# Individual maintenance operations request administrator access themselves.
+if [[ "$EUID" -eq 0 ]]; then
+    printf '%s\n' 'Run Mole without sudo; it requests administrator access when needed.' >&2
+    exit 1
+fi
+
 # Preserve user's locale for app display name lookup.
 readonly MOLE_UNINSTALL_USER_LC_ALL="${LC_ALL:-}"
 readonly MOLE_UNINSTALL_USER_LANG="${LANG:-}"
@@ -1247,7 +1254,7 @@ scan_applications() {
             cleanup_spinner() { exit 0; }
             trap cleanup_spinner TERM INT EXIT
             [[ -f "$scan_status_file" ]] || exit 0
-            local spinner_chars="|/-\\"
+            mo_load_spinner_frames
             local i=0
             : > "$spinner_shown_file"
             while true; do
@@ -1255,7 +1262,7 @@ scan_applications() {
                 status_line=$(cat "$scan_status_file" 2> /dev/null || echo "")
                 IFS='|' read -r status_message status_completed status_total <<< "$status_line"
                 [[ -z "$status_message" ]] && status_message="Scanning applications..."
-                local c="${spinner_chars:$((i % 4)):1}"
+                local c="${MO_SPINNER_FRAMES[$((i % ${#MO_SPINNER_FRAMES[@]}))]}"
                 if [[ "$status_completed" =~ ^[0-9]+$ && "$status_total" =~ ^[0-9]+$ && $status_total -gt 0 ]]; then
                     printf "\r\033[K%s %s %d/%d" "$c" "$status_message" "$status_completed" "$status_total" >&2
                 else

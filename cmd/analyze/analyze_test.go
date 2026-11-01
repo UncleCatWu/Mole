@@ -315,7 +315,7 @@ func TestPerformScanForJSONCountsTopLevelFiles(t *testing.T) {
 }
 
 func TestDeletePathWithProgress(t *testing.T) {
-	skipIfFinderUnavailable(t)
+	useFixtureTrash(t)
 
 	parent := t.TempDir()
 	target := filepath.Join(parent, "target")
@@ -2291,7 +2291,7 @@ func TestManualRefreshBypassesNestedSubdirCache(t *testing.T) {
 	}
 }
 
-func TestCacheBypassSkipsHomeLibraryOverviewSnapshot(t *testing.T) {
+func TestHomeLibraryScanNeverUsesOverviewSnapshot(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	resetOverviewSnapshotForTest()
@@ -2318,7 +2318,7 @@ func TestCacheBypassSkipsHomeLibraryOverviewSnapshot(t *testing.T) {
 		largeFileMinSize := int64(largeFileWarmupMinSize)
 		result, err := scanLiveTarget(
 			ctx,
-			liveScanTarget{name: "Library", path: library, kind: liveScanTargetHomeLibrary},
+			liveScanTarget{name: "Library", path: library, kind: liveScanTargetDirectory},
 			make(chan fileEntry, maxLargeFiles*2),
 			&largeFileMinSize,
 			limiter,
@@ -2335,8 +2335,8 @@ func TestCacheBypassSkipsHomeLibraryOverviewSnapshot(t *testing.T) {
 		return result
 	}
 
-	if got := scanTarget(scanCacheReuse).TotalSize; got != 1 {
-		t.Fatalf("expected reuse policy to return snapshot size 1, got %d", got)
+	if got := scanTarget(scanCacheReuse).TotalSize; got <= 1 {
+		t.Fatalf("full Library scan reused a differently scoped overview snapshot: %d", got)
 	}
 	if got := scanTarget(scanCacheBypass).TotalSize; got <= 1 {
 		t.Fatalf("expected bypass policy to scan live Library size, got %d", got)
@@ -2361,8 +2361,8 @@ func TestCacheBypassSkipsHomeLibraryOverviewSnapshot(t *testing.T) {
 		return 0
 	}
 
-	if got := scanHome(scanCacheReuse); got != 1 {
-		t.Fatalf("expected concurrent reuse policy to return snapshot size 1, got %d", got)
+	if got := scanHome(scanCacheReuse); got <= 1 {
+		t.Fatalf("concurrent Home scan reused a differently scoped Library overview snapshot: %d", got)
 	}
 	if got := scanHome(scanCacheBypass); got <= 1 {
 		t.Fatalf("expected concurrent bypass policy to scan live Library size, got %d", got)
@@ -2377,8 +2377,9 @@ func TestLiveScanStartPreservesEntryFilterBackingList(t *testing.T) {
 	m := newModel(root, false)
 	m.entryFilter = "app"
 	start := liveScanStartMsg{
-		id:   1,
-		path: root,
+		requestID: m.scanRequestID,
+		id:        1,
+		path:      root,
 		entries: []dirEntry{
 			{Name: "apps", Path: apps, Size: -1, IsDir: true},
 			{Name: "logs", Path: logs, Size: -1, IsDir: true},

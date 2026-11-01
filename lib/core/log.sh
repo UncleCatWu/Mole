@@ -4,17 +4,22 @@
 
 set -euo pipefail
 
+_MOLE_LOG_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/core/test_boundary.sh
+source "$_MOLE_LOG_SOURCE_DIR/test_boundary.sh"
+_mole_test_require_context || return $?
+_mole_test_guard_mutation_path "${HOME}/Library/Logs/mole/mole.log" || return $?
+
 # Prevent multiple sourcing
 if [[ -n "${MOLE_LOG_LOADED:-}" ]]; then
     return 0
 fi
-readonly MOLE_LOG_LOADED=1
 
 # Ensure base.sh is loaded for colors and icons
 if [[ -z "${MOLE_BASE_LOADED:-}" ]]; then
     _MOLE_CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     # shellcheck source=lib/core/base.sh
-    source "$_MOLE_CORE_DIR/base.sh"
+    source "$_MOLE_CORE_DIR/base.sh" || return $?
 fi
 
 # ============================================================================
@@ -28,10 +33,11 @@ readonly LOG_MAX_SIZE_DEFAULT=1048576   # 1MB
 readonly OPLOG_MAX_SIZE_DEFAULT=5242880 # 5MB
 
 # Ensure log directory and file exist with correct ownership
-ensure_user_file "$LOG_FILE"
+ensure_user_file "$LOG_FILE" || return $?
 if [[ "${MO_NO_OPLOG:-}" != "1" ]]; then
-    ensure_user_file "$OPERATIONS_LOG_FILE"
+    ensure_user_file "$OPERATIONS_LOG_FILE" || return $?
 fi
+readonly MOLE_LOG_LOADED=1
 
 # ============================================================================
 # Log Rotation
@@ -41,7 +47,8 @@ append_log_line() {
     local file_path="$1"
     local line="${2:-}"
 
-    ensure_user_file "$file_path"
+    _mole_test_guard_mutation_path "$file_path" || return $?
+    ensure_user_file "$file_path" || return $?
     printf '%s\n' "$line" >> "$file_path" 2> /dev/null || true
 }
 
@@ -49,12 +56,15 @@ append_log_lines() {
     local file_path="$1"
     shift
 
-    ensure_user_file "$file_path"
+    _mole_test_guard_mutation_path "$file_path" || return $?
+    ensure_user_file "$file_path" || return $?
     printf '%s\n' "$@" >> "$file_path" 2> /dev/null || true
 }
 
 # Rotate log file if it exceeds maximum size
 rotate_log_once() {
+    _mole_test_guard_mutation_path "$LOG_FILE" || return $?
+    _mole_test_guard_mutation_path "$OPERATIONS_LOG_FILE" || return $?
     # Skip if already checked this session
     [[ -n "${MOLE_LOG_ROTATED:-}" ]] && return 0
     export MOLE_LOG_ROTATED=1

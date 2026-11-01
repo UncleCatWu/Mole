@@ -324,6 +324,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 format_uninstall_preview_path "$HOME/preview-size-file"
 EOF
     )"
@@ -337,6 +339,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 get_path_size_kb() { return "$SIZE_RC"; }
 for SIZE_RC in 124 130; do
     rc=0
@@ -357,6 +361,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 request_sudo_access() { return 0; }
 start_inline_spinner() { :; }
@@ -402,6 +408,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 export MOLE_DELETE_MODE=trash
 
 start_inline_spinner() { :; }
@@ -445,6 +453,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 export MOLE_DELETE_MODE=permanent
 
 start_inline_spinner() { :; }
@@ -489,6 +499,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 start_inline_spinner() { :; }
 stop_inline_spinner() { :; }
@@ -527,6 +539,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 apps_data=(
 	"0|$HOME/Applications/Shared.app|Shared|com.example.Shared|0|Never|0"
@@ -567,6 +581,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 # The survivor's id differs from the selected app's only in case. On a default
 # APFS volume both apps read and write the SAME ~/Library/Preferences plist, so
@@ -611,6 +627,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 pkg_receipt_nonstandard_app_paths() { :; }
 
 printf '%s\n' \
@@ -659,6 +677,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 pkg_receipt_nonstandard_app_paths() { :; }
 
 write_bundle_id() {
@@ -719,6 +739,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 pkg_receipt_nonstandard_app_paths() { :; }
 
 printf '%s\n' \
@@ -752,6 +774,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 pkg_receipt_nonstandard_app_paths() { :; }
 
 printf '%s\n' \
@@ -787,6 +811,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 printf '%s\n' \
     '<?xml version="1.0" encoding="UTF-8"?>' \
@@ -893,6 +919,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 pkg_receipt_nonstandard_app_paths() { :; }
 
 selected_apps=("0|$APP_ROOT/Selected.app|Selected|com.example.partial|0|Never")
@@ -926,6 +954,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 pkg_receipt_nonstandard_app_paths() { :; }
 
 app_path="$HOME/Applications/Race.app"
@@ -982,6 +1012,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 app_path="$HOME/Applications/Race.app"
 mkdir -p "$app_path/Contents"
@@ -1045,6 +1077,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 pkg_receipt_nonstandard_app_paths() { :; }
 
 selected="$HOME/Applications/Selected.app"
@@ -1108,6 +1142,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 pkg_receipt_nonstandard_app_paths() { :; }
 
 first="$HOME/Applications/First.app"
@@ -1198,6 +1234,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 pkg_receipt_nonstandard_app_paths() { :; }
 
 first="$HOME/Applications/First.app"
@@ -1339,6 +1377,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 request_sudo_access() { return 0; }
 start_inline_spinner() { :; }
@@ -1363,9 +1403,9 @@ total_size_cleaned=0
 
 printf '\n' | batch_uninstall_applications
 
-# The selected bundle and its name-keyed leftovers are gone.
+# The selected bundle is gone; the live sibling keeps all shared/name state.
 [[ ! -d "$HOME/Applications/Shared-beta.app" ]] || { echo "WRONG: beta bundle preserved"; exit 1; }
-[[ ! -d "$HOME/Library/Caches/Shared-beta" ]] || { echo "WRONG: beta name cache preserved"; exit 1; }
+[[ -d "$HOME/Library/Caches/Shared-beta" ]] || { echo "WRONG: name cache removed despite live sibling"; exit 1; }
 
 # The surviving install and every bundle-id-keyed path are untouched.
 [[ -d "$HOME/Applications/Shared.app" ]] || { echo "WRONG: surviving install removed"; exit 1; }
@@ -1407,6 +1447,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 request_sudo_access() { return 0; }
 start_inline_spinner() { :; }
@@ -1438,14 +1480,14 @@ total_size_cleaned=0
 printf '\n' | batch_uninstall_applications > /dev/null 2>&1
 
 [[ ! -d "$HOME/Applications/SharedName-beta.app" ]] || { echo "WRONG: beta bundle preserved"; exit 1; }
-[[ ! -d "$HOME/Library/Caches/SharedName-beta" ]] || { echo "WRONG: beta's own cache preserved"; exit 1; }
+[[ -d "$HOME/Library/Caches/SharedName-beta" ]] || { echo "WRONG: name cache removed despite live sibling"; exit 1; }
 [[ -d "$HOME/Applications/SharedName.app" ]] || { echo "WRONG: survivor removed"; exit 1; }
 [[ -d "$HOME/Library/Application Support/SharedName" ]] || { echo "WRONG: survivor app support removed"; exit 1; }
 [[ -d "$HOME/Library/Caches/SharedName" ]] || { echo "WRONG: survivor cache removed"; exit 1; }
 [[ -f "$HOME/Library/Preferences/SharedName.plist" ]] || { echo "WRONG: survivor prefs removed"; exit 1; }
 [[ ! -f "$HOME/login.log" ]] || { echo "WRONG: login item removed on colliding name"; cat "$HOME/login.log"; exit 1; }
 [[ -f "$HOME/Library/Logs/DiagnosticReports/SharedName-2026-07-03-101010.ips" ]] || { echo "WRONG: survivor crash reports deleted under sibling guard"; exit 1; }
-grep -q "UNLOAD:.*com.thirdparty.betahelper.plist" "$HOME/unload.log" 2> /dev/null || { echo "WRONG: path-referenced agent of the selected app not unloaded under guard"; exit 1; }
+grep -q "UNLOAD:.*com.thirdparty.betahelper.plist" "$HOME/unload.log" 2> /dev/null || { echo "WRONG: selected-app path-referenced agent not unloaded"; exit 1; }
 ! grep -q "com.thirdparty.stablehelper.plist" "$HOME/unload.log" 2> /dev/null || { echo "WRONG: survivor's agent unloaded"; cat "$HOME/unload.log"; exit 1; }
 
 # Case 2: basenames collide too (same SharedName.app in two folders).
@@ -1537,6 +1579,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 start_inline_spinner() { :; }
 stop_inline_spinner() { :; }
@@ -1565,6 +1609,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 request_sudo_access() { return 0; }
 start_inline_spinner() { :; }
@@ -1622,6 +1668,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 request_sudo_access() { return 0; }
 start_inline_spinner() { :; }
@@ -1984,6 +2032,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 request_sudo_access() { return 0; }
 start_inline_spinner() { :; }
@@ -2043,6 +2093,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 trace="$HOME/trace.log"
 launchctl() {
@@ -2091,6 +2143,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 request_sudo_access() { return 0; }
 start_inline_spinner() { :; }
@@ -2356,6 +2410,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 valid_data=$(printf '/path/one
 /path/two' | base64)
@@ -2371,6 +2427,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 if result=$(decode_file_list "not-valid-base64!!!" "TestApp" 2>/dev/null); then
     [[ -z "$result" ]] || exit 1
@@ -2392,6 +2450,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 run_with_timeout() {
     shift
@@ -2423,6 +2483,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 is_uninstall_dry_run() { return 1; }
 run_with_timeout() { shift; "$@"; }
@@ -2449,6 +2511,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 # Regression for App Cleaner 9 (#helper bootout): bundle ids are not paths,
 # so routing them through decode_file_list blanked the list and skipped the
@@ -2620,6 +2684,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 empty_data=$(printf '' | base64)
 result=$(decode_file_list "$empty_data" "TestApp" 2>/dev/null) || true
@@ -2634,6 +2700,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 bad_data=$(printf 'relative/path' | base64)
 if result=$(decode_file_list "$bad_data" "TestApp" 2>/dev/null); then
@@ -2651,6 +2719,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 test_paths="/path/to/file1
 /path/to/file2"
@@ -2673,6 +2743,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 test_home="$HOME/launchservices-refresh-home"
 mkdir -p "$test_home"
@@ -2710,6 +2782,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 test_home="$HOME/launchservices-unregister-home"
 mkdir -p "$test_home/Upper.APP" "$test_home/Plain.bundle"
@@ -3171,6 +3245,117 @@ INNER
     [ "$status" -eq 0 ]
 }
 
+@test "select_apps_for_uninstall keeps menu line width within 80 columns for Yesterday items (#1573)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TERM="xterm-256color" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/ui/app_selector.sh"
+
+long_app_name="Visual Studio Code - Insiders Edition Long Title For App"
+apps_data=("1700000000|/Applications/Test.app|$long_app_name|com.example.test|100MB|Yesterday|102400")
+selected_apps=()
+drain_pending_input() { :; }
+
+captured_option=""
+paginated_multi_select() {
+    captured_option="$2"
+    MOLE_SELECTION_RESULT=""
+    return 1
+}
+
+tput() { echo 80; }
+select_apps_for_uninstall || true
+
+normal_line="  ○ $captured_option"
+active_line="${ICON_ARROW} ○ $captured_option"
+
+# Standard 80-column terminal must not wrap or leave orphan 'ay' characters
+[[ ${#normal_line} -le 80 ]] || {
+    printf 'normal line length %d exceeds 80: %s\n' "${#normal_line}" "$normal_line" >&2
+    exit 1
+}
+[[ $(get_display_width "$normal_line") -le 80 ]] || {
+    printf 'normal line display width %d exceeds 80\n' "$(get_display_width "$normal_line")" >&2
+    exit 1
+}
+[[ $(get_display_width "$active_line") -le 80 ]] || {
+    printf 'active line display width %d exceeds 80\n' "$(get_display_width "$active_line")" >&2
+    exit 1
+}
+INNER
+
+    [ "$status" -eq 0 ]
+}
+
+@test "select_apps_for_uninstall keeps Steam and Yesterday rows within 80 columns (#1573)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TERM="xterm-256color" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/ui/app_selector.sh"
+
+long_app_name="Visual Studio Code - Insiders Edition Long Title For App"
+apps_data=("1700000000|/Applications/SteamGame.app|$long_app_name|com.example.steam|N/A (Steam-managed)|Yesterday|95")
+selected_apps=()
+drain_pending_input() { :; }
+
+captured_option=""
+paginated_multi_select() {
+    captured_option="$2"
+    MOLE_SELECTION_RESULT=""
+    return 1
+}
+
+tput() { echo 80; }
+select_apps_for_uninstall || true
+
+normal_line="  ○ $captured_option"
+active_line="${ICON_ARROW} ○ $captured_option"
+
+[[ "$captured_option" == *"    Steam |"* ]] || {
+    printf 'selector missing compact Steam label: %s\n' "$captured_option" >&2
+    exit 1
+}
+[[ "$captured_option" != *"N/A (Steam-managed)"* ]] || {
+    printf 'selector still used the 19-column Steam label: %s\n' "$captured_option" >&2
+    exit 1
+}
+[[ $(get_display_width "$normal_line") -le 80 ]] || {
+    printf 'normal line display width %d exceeds 80: %s\n' "$(get_display_width "$normal_line")" "$normal_line" >&2
+    exit 1
+}
+[[ $(get_display_width "$active_line") -le 80 ]] || {
+    printf 'active line display width %d exceeds 80: %s\n' "$(get_display_width "$active_line")" "$active_line" >&2
+    exit 1
+}
+INNER
+
+    [ "$status" -eq 0 ]
+}
+
+@test "format_app_display keeps Yesterday rows inside a 40-column terminal (#1573)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TERM="xterm-256color" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/ui/app_selector.sh"
+
+name=$(printf 'A%.0s' {1..70})
+row=$(format_app_display "$name" "1023.5MB" "Yesterday" 40)
+normal_line="  ○ $row"
+[[ "$row" == *Yesterday* ]] || {
+    printf 'missing Yesterday: %s\n' "$row" >&2
+    exit 1
+}
+[[ $(get_display_width "$normal_line") -le 40 ]] || {
+    printf '40-col overflow width=%d: %s\n' "$(get_display_width "$normal_line")" "$normal_line" >&2
+    exit 1
+}
+INNER
+
+    [ "$status" -eq 0 ]
+}
+
 @test "paginated menu can ignore one initial Enter for uninstall launch guard" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TERM="xterm-256color" /bin/bash --noprofile --norc << 'INNER'
 set -euo pipefail
@@ -3502,6 +3687,8 @@ INNER
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 app_path="$HOME/Applications/Current.app"
 mkdir -p "$app_path"
@@ -3552,6 +3739,8 @@ INNER
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 app_path="$HOME/Applications/Interrupted.app"
 mkdir -p "$app_path"
@@ -3595,6 +3784,8 @@ INNER
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 app_path="$HOME/Applications/TimedOut.app"
 mkdir -p "$app_path"
@@ -3644,6 +3835,8 @@ INNER
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 app_path="$HOME/Applications/TimedOut.app"
 related_path="$HOME/Library/Caches/com.example.TimedOut"
@@ -3701,6 +3894,8 @@ INNER
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 app_path="$HOME/Applications/UniFi-Discover.app"
 mkdir -p "$app_path"
@@ -4009,6 +4204,8 @@ _bg_items_runner() {
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 launchctl() { return "${LAUNCHCTL_RC}"; }
 _uninstall_match_loaded_background_items "$DETAIL" -- "$SUCCESS_PATH"
 EOF
@@ -4038,6 +4235,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 helpers=$(printf 'com.wiheads.paste.helper' | base64)
 detail="Paste|/Applications/Paste.app|unknown|0|||false|false|false||||$helpers|guard"
@@ -4062,6 +4261,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 launchctl() { return 0; }
 detail="Paste|/Applications/Paste.app|com.wiheads.paste|0|||false|false|false||||"
 result=$(_uninstall_match_loaded_background_items "$detail" -- "/Applications/Paste.app")
@@ -4180,4 +4381,59 @@ EOF
     [[ "$output" == *"|Foo|"* ]] || return 1
     [[ "$output" == *"|Bar|"* ]] || return 1
     [[ "$output" != *"Foo Bar"* ]] || return 1
+}
+
+@test "batch uninstall reports an inconclusive Homebrew scan before any removal (#1579, #1580)" {
+    run env HOME="$HOME/batch-brew-failure" PROJECT_ROOT="$PROJECT_ROOT" \
+        /bin/bash --noprofile --norc <<'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+
+app_path="$HOME/Applications/TimedOut.app"
+mkdir -p "$app_path"
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+_batch_refresh_selected_app_bundle_id() { printf 'com.example.TimedOut\n'; }
+official_uninstaller_vendor() { return 1; }
+uninstall_bundle_id_has_surviving_sibling() { return 1; }
+uninstall_live_bundle_has_other_install() {
+    _MOLE_UNINSTALL_LIVE_SIBLING_FINGERPRINT=""
+    _MOLE_UNINSTALL_LIVE_SIBLING_PATHS=()
+    return 1
+}
+pgrep() { return 1; }
+get_brew_cask_name() { return 2; }
+get_file_owner() { whoami; }
+get_path_size_kb() { echo "UNEXPECTED_SIZE"; }
+find_app_files() { echo "UNEXPECTED_DISCOVERY"; return 99; }
+stop_launch_services() { echo "UNEXPECTED_TEARDOWN"; }
+unregister_app_bundle() { echo "UNEXPECTED_TEARDOWN"; }
+remove_login_item() { echo "UNEXPECTED_TEARDOWN"; }
+force_kill_app() { echo "UNEXPECTED_TEARDOWN"; }
+mole_delete() { echo "UNEXPECTED_DELETE"; }
+
+selected_apps=("0|$app_path|TimedOut|com.example.TimedOut|0|Never")
+files_cleaned=0
+total_items=0
+total_size_cleaned=0
+rc=0
+batch_uninstall_applications || rc=$?
+printf 'RC=%s\n' "$rc"
+[[ $rc -eq 1 ]]
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=1"* ]] || return 1
+    [[ "$output" == *"Homebrew ownership check"* ]] || return 1
+    [[ "$output" == *"nothing was removed"* ]] || return 1
+    [[ "$output" == *"'TimedOut' matches a Homebrew cask brew cannot read"* ]] || return 1
+    [[ "$output" == *"brew info --cask"* ]] || return 1
+    # A cask brew cannot parse still lists cleanly, so pointing the user at
+    # `brew list --cask` diagnoses nothing.
+    [[ "$output" != *"brew list --cask"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_SIZE"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_DISCOVERY"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_TEARDOWN"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_DELETE"* ]]
 }

@@ -26,7 +26,17 @@ import (
 // stale on-disk cache entries are rejected instead of silently reused.
 // v2: analyze deduplicates hardlinked files to match `du`.
 // v3: ordinary Parallels VM storage is included instead of skipped by name.
-const cacheSchemaVersion = 3
+// v4: overview snapshots contain overview measurements only; full directory
+// scans no longer populate the differently scoped Home/Downloads/Library rows.
+const cacheSchemaVersion = 4
+
+var saveCompletedScan = saveCacheToDiskWithOptions
+
+func cloneScanResult(result scanResult) scanResult {
+	result.Entries = slices.Clone(result.Entries)
+	result.LargeFiles = slices.Clone(result.LargeFiles)
+	return result
+}
 
 type overviewSizeSnapshot struct {
 	Size          int64     `json:"size"`
@@ -157,32 +167,43 @@ func loadStoredOverviewSize(path string) (int64, error) {
 }
 
 func storeOverviewSize(path string, size int64) error {
+	return storeOverviewSizeWithContext(context.Background(), path, size)
+}
+
+func storeOverviewSizeWithContext(ctx context.Context, path string, size int64) error {
 	if path == "" || size <= 0 {
 		return fmt.Errorf("invalid overview size")
 	}
 	overviewSnapshotMu.Lock()
 	defer overviewSnapshotMu.Unlock()
-	if err := ensureOverviewSnapshotCacheLocked(); err != nil {
-		return err
-	}
-	if overviewSnapshotCache == nil {
-		overviewSnapshotCache = make(map[string]overviewSizeSnapshot)
-	}
-	// Re-measuring a directory usually returns the size already on record, and
-	// every save re-serializes and rewrites the entire store. Skip the write
-	// while the recorded value still stands; the timestamp is only refreshed
-	// often enough to keep a live entry from aging out.
-	if existing, ok := overviewSnapshotCache[path]; ok && existing.Size == size &&
-		time.Since(existing.Updated) < overviewCacheTTL/overviewRefreshDivisor {
-		return nil
-	}
-	overviewSnapshotCache[path] = overviewSizeSnapshot{
-		Size:          size,
-		Updated:       time.Now(),
-		SchemaVersion: cacheSchemaVersion,
-	}
-	evictOverviewSnapshotsLocked()
-	return persistOverviewSnapshotLocked()
+	// Acquire the store lock before the publication lock. Cancellation must
+	// remain able to revoke work that is queued behind another store writer.
+	return overviewPublicationFromContext(ctx).commit(func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := ensureOverviewSnapshotCacheLocked(); err != nil {
+			return err
+		}
+		if overviewSnapshotCache == nil {
+			overviewSnapshotCache = make(map[string]overviewSizeSnapshot)
+		}
+		// Re-measuring a directory usually returns the size already on record, and
+		// every save re-serializes and rewrites the entire store. Skip the write
+		// while the recorded value still stands; the timestamp is only refreshed
+		// often enough to keep a live entry from aging out.
+		if existing, ok := overviewSnapshotCache[path]; ok && existing.Size == size &&
+			time.Since(existing.Updated) < overviewCacheTTL/overviewRefreshDivisor {
+			return nil
+		}
+		overviewSnapshotCache[path] = overviewSizeSnapshot{
+			Size:          size,
+			Updated:       time.Now(),
+			SchemaVersion: cacheSchemaVersion,
+		}
+		evictOverviewSnapshotsLocked()
+		return persistOverviewSnapshotLocked()
+	})
 }
 
 // evictOverviewSnapshotsLocked keeps the store bounded by dropping the oldest
@@ -255,12 +276,9 @@ func loadOverviewCachedSize(path string) (int64, error) {
 	if snapshot, err := loadStoredOverviewSize(path); err == nil {
 		return snapshot, nil
 	}
-	cacheEntry, err := loadCacheFromDisk(path)
-	if err != nil {
-		return 0, err
-	}
-	_ = storeOverviewSize(path, cacheEntry.TotalSize)
-	return cacheEntry.TotalSize, nil
+	// A directory cache may include Library, cloud placeholders, or recent
+	// Downloads. It cannot stand in for this overview row's measurement.
+	return 0, fmt.Errorf("overview snapshot not found")
 }
 
 // moleCacheRoot is the single definition of the shared cache location; both
@@ -729,6 +747,28 @@ func invalidateCache(path string) {
 	removeOverviewSnapshots(path)
 }
 
+func invalidateRemovedPathCaches(paths []string) map[string]bool {
+	affected := make(map[string]bool)
+	for _, path := range paths {
+		if path == "" || !filepath.IsAbs(path) {
+			continue
+		}
+		for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+			affected[current] = true
+			if filepath.Dir(current) == current {
+				break
+			}
+		}
+	}
+	all := make([]string, 0, len(affected))
+	for path := range affected {
+		removeCacheEntry(path)
+		all = append(all, path)
+	}
+	removeOverviewSnapshots(all...)
+	return affected
+}
+
 // invalidateCacheTree invalidates the cache for path and all its direct
 // child directories so that a rescan does not reuse stale subdirectory
 // sizes. See #812.
@@ -810,10 +850,9 @@ func prefetchOverviewCache(ctx context.Context) {
 				return
 			}
 
-			size, err := measureOverviewSize(path)
-			if err == nil && size > 0 {
-				_ = storeOverviewSize(path, size)
-			}
+			// The measuring helper publishes only its overview scope. Downloads
+			// must use the same age filter as its foreground insight row.
+			_, _ = measureInsightSizeWithContext(ctx, path)
 		})
 	}
 	wg.Wait()

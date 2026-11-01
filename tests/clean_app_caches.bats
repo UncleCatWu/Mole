@@ -949,6 +949,114 @@ EOF
     [[ "$output" != *"users/global/"* ]] || return 1
 }
 
+@test "clean_notion_service_worker_caches targets CacheStorage in every Electron partition" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+partitions="$HOME/Library/Application Support/Notion/Partitions"
+mkdir -p "$partitions/notion/Service Worker/CacheStorage"
+mkdir -p "$partitions/notion-second/Service Worker/CacheStorage"
+# A partition with no Service Worker cache, and the siblings that must survive.
+mkdir -p "$partitions/empty-partition"
+mkdir -p "$partitions/notion/Service Worker/ScriptCache"
+mkdir -p "$partitions/notion/Service Worker/Database"
+mkdir -p "$partitions/notion/Local Storage"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+notion_running() { return 1; }
+clean_service_worker_cache() { echo "SW|$1|$2|$3"; }
+clean_notion_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    local base="$HOME/Library/Application Support/Notion/Partitions"
+    [[ "$output" == *"SW|Notion|$base/notion/Service Worker/CacheStorage|_notion_service_worker_delete_guard_allows"* ]] || return 1
+    [[ "$output" == *"SW|Notion|$base/notion-second/Service Worker/CacheStorage|_notion_service_worker_delete_guard_allows"* ]] || return 1
+    [[ "$output" != *"empty-partition"* ]] || return 1
+    [[ "$output" != *"ScriptCache"* ]] || return 1
+    [[ "$output" != *"Database"* ]] || return 1
+    [[ "$output" != *"Local Storage"* ]]
+}
+
+@test "clean_notion_service_worker_caches defers every partition while Notion is running" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mkdir -p "$HOME/Library/Application Support/Notion/Partitions/notion/Service Worker/CacheStorage/origin/cache"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+notion_running() { return 0; }
+mole_defer_cleanup_family() { echo "DEFER:$1"; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+clean_notion_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"DEFER:Notion"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]]
+}
+
+@test "clean_notion_service_worker_caches fails closed on unknown owner state" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mkdir -p "$HOME/Library/Application Support/Notion/Partitions/notion/Service Worker/CacheStorage/origin/cache"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+notion_running() { return 2; }
+mole_defer_cleanup_family() { echo "UNEXPECTED_DEFER:$1"; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+note_activity() { :; }
+clean_notion_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"Notion Service Worker · stopped (process state unknown)"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_DEFER"* ]]
+}
+
+@test "clean_notion_service_worker_caches refuses a symlinked partitions root" {
+    local iso="$HOME/iso-notion-root-symlink"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mkdir -p "$HOME/Library/Application Support/Notion" "$HOME/outside/notion/Service Worker/CacheStorage"
+touch "$HOME/outside/notion/Service Worker/CacheStorage/private"
+ln -s "$HOME/outside" "$HOME/Library/Application Support/Notion/Partitions"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+notion_running() { return 1; }
+clean_service_worker_cache() { echo "SW|$2"; }
+clean_notion_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"outside"* ]] || return 1
+    [[ "$output" != *"SW|"* ]]
+}
+
+@test "clean_notion_service_worker_caches refuses a symlinked cache child" {
+    local iso="$HOME/iso-notion-child-symlink"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+sw="$HOME/Library/Application Support/Notion/Partitions/notion/Service Worker"
+mkdir -p "$sw" "$HOME/outside"
+touch "$HOME/outside/private"
+ln -s "$HOME/outside" "$sw/CacheStorage"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+notion_running() { return 1; }
+clean_service_worker_cache() { echo "SW|$2"; }
+clean_notion_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"outside"* ]] || return 1
+    [[ "$output" != *"SW|"* ]]
+}
+
 @test "clean_feishu_service_worker_caches preserves pipe characters in profile paths" {
     local pipe_home="$HOME/home|pipe"
     run env HOME="$pipe_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
@@ -1325,10 +1433,17 @@ JSON
 
     run_editor_extension_cleanup
 
-    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
     local hits
     hits=$(printf '%s\n' "$output" | grep -c "CLEAN:$ext_root/pub.ext-1.0.0" || true)
-    [ "$hits" -eq 1 ] || { echo "expected 1 offer, got $hits"; echo "$output"; return 1; }
+    [ "$hits" -eq 1 ] || {
+        echo "expected 1 offer, got $hits"
+        echo "$output"
+        return 1
+    }
     [[ "$output" == *"Obsolete VS Code extension"* ]] || [[ "$output" == *"CLEAN:"* ]]
 }
 
@@ -1347,7 +1462,10 @@ JSON
 
     run_editor_extension_cleanup
 
-    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
     [[ "$output" == *"CLEAN:$ext_root/pub.obsolete-0.9.0"* ]] || return 1
     [[ "$output" != *"CLEAN:$ext_root/pub.private-1.0.0"* ]] || return 1
 }
@@ -1701,6 +1819,7 @@ INNER
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 _MOLE_COMPLETE_LSOF_MODE=direct
+ps() { printf '  PID PPID COMM ARGS\n  901 1 fixture fixture\n'; }
 pgrep() { return 1; }
 lsof() { return 1; }
 oplog_enabled() { return 1; }
@@ -1712,7 +1831,10 @@ safe_remove "$db" true
 [[ ! -e "$db" ]]
 INNER
 
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
     [[ ! -e "$db" ]]
 }
 
@@ -2075,7 +2197,7 @@ INNER
     make_fusion_version_dir "$old" "2.0.100"
     ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
 
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'INNER'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
@@ -2371,22 +2493,42 @@ INNER
     make_fusion_version_dir "$current" "2.0.200"
     touch "$prod/Autodesk Fusion.app"
 
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 /bin/bash --noprofile --norc << 'INNER'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc << 'INNER'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 alias_path="$HOME/Library/Application Support/Autodesk/webdeploy/production/Autodesk Fusion.app"
 target="$HOME/Library/Application Support/Autodesk/webdeploy/production/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Autodesk Fusion.app"
+mkdir -p "$HOME/bin"
+export MOLE_TEST_ALIAS_PATH="$alias_path" MOLE_TEST_ALIAS_TARGET="$target"
+cat > "$HOME/bin/alias-provider" <<'PROVIDER'
+#!/bin/bash
+[[ "${!#}" == "$MOLE_TEST_ALIAS_PATH" ]] || exit 79
+printf '%s\n' "$MOLE_TEST_ALIAS_TARGET"
+PROVIDER
+chmod +x "$HOME/bin/alias-provider"
+# The kernel denies X_OK for its forbidden native executable, too. Pin the
+# two absolute source sites, then bind only their command path to this private
+# executable while preserving the complete production guard and resolver.
+resolver=$(declare -f _autodesk_fusion_resolve_current_dir)
+[[ "$(printf '%s\n' "$resolver" | grep -oF '/usr/bin/osascript' | wc -l | tr -d ' ')" -eq 2 ]] || exit 1
+eval "$(printf '%s\n' "$resolver" | sed 's@/usr/bin/osascript@"$HOME/bin/alias-provider"@g')"
+# The native branch still refuses in no-auth mode before the provider runs.
+rc=0
+_autodesk_fusion_resolve_current_dir "${alias_path%/*}" "$((SECONDS + 10))" || rc=$?
+[[ $rc -eq 1 ]] || exit 1
 run_with_timeout() {
     shift
     if [[ "$1" == "/usr/bin/osascript" ]]; then
-        [[ "${!#}" == "$alias_path" ]] || return 79
-        printf '%s\n' "$target"
-        return 0
+        shift
+        "$HOME/bin/alias-provider" "$@"
+        return $?
     fi
     "$@"
 }
-_autodesk_fusion_resolve_current_version \
+# Only this fully mocked metadata call enters the native-alias branch;
+# the kernel policy continues to deny any real osascript execution.
+MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 _autodesk_fusion_resolve_current_version \
     "$HOME/Library/Application Support/Autodesk/webdeploy/production" \
     "$((SECONDS + 10))"
 printf 'CURRENT:%s|%s\n' \
@@ -2711,4 +2853,14 @@ EOF
     [ "$status" -eq 0 ] || return 1
     [[ "$output" == *"BOUND:$iso/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/log/wechat.log"* ]] || return 1
     [[ "$output" == *"PARENT:$iso/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/log"* ]]
+}
+
+@test "obsolete false and nonboolean values preserve installed extensions" {
+    local ext_root="$HOME/.vscode/extensions"
+    mkdir -p "$ext_root/keep-false" "$ext_root/keep-string" "$ext_root/remove-true"
+    printf '%s\n' '{"keep-false":false,"keep-string":"true","remove-true":true}' > "$ext_root/.obsolete"
+    run_editor_extension_cleanup
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$ext_root/remove-true"* ]] || return 1
+    [[ "$output" != *"CLEAN:$ext_root/keep-"* ]] || return 1
 }

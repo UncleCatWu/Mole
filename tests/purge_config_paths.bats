@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 
 setup_file() {
+    export MOLE_PURGE_YES=1
     PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
     export PROJECT_ROOT
     

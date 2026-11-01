@@ -27,7 +27,10 @@ setup() {
 		return 1
 	fi
 	rm -rf "${HOME:?}"/*
-	mkdir -p "$HOME/source" "$HOME/config/bin" "$HOME/install"
+	mkdir -p "$HOME/source" "$HOME/config/bin" "$HOME/install" "$HOME/tmp"
+	export TMPDIR="$HOME/tmp"
+	source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+	fixture_prepare_install_probe
 	cat > "$HOME/source/mole" << 'MOLE'
 VERSION="1.2.3"
 MOLE
@@ -549,6 +552,7 @@ log_error() { echo "ERROR:$*"; }
 log_success() { echo "SUCCESS:$*"; }
 log_admin() { echo "ADMIN:$*"; }
 download_binary() { echo "DOWNLOAD_CALLED:$1"; return 0; }
+resolve_source_dir() { :; }
 sudo() {
 	echo "sudo: a password is required" >&2
 	return 1
@@ -582,14 +586,15 @@ ICON_ERROR='err'
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR/lib/core" "$SOURCE_DIR"
 touch "$CONFIG_DIR/lib/core/common.sh"
 # The old entry script survived a failed copy: runnable, wrong version.
-printf '#!/bin/bash\nVERSION="1.45.0"\nexit 0\n' > "$INSTALL_DIR/mole"
+printf '#!/bin/bash\nVERSION="1.45.0"\nif [[ "$1" == --version ]]; then echo "Mole version 1.45.0"; fi\nexit 0\n' > "$INSTALL_DIR/mole"
 chmod +x "$INSTALL_DIR/mole"
 printf '#!/bin/bash\nVERSION="1.47.0"\n' > "$SOURCE_DIR/mole"
 
 log_error() { echo "ERROR:$*"; }
 log_warning() { echo "WARNING:$*"; }
+run_install_probe_with_timeout() { shift; "$@"; }
 
-verify_installation
+verify_installation || exit $?
 echo "UNEXPECTED_PASS"
 EOF
 
@@ -620,6 +625,7 @@ chmod +x "$INSTALL_DIR/mole"
 cat > "$fake_bin/gtimeout" <<'TIMEOUT'
 #!/bin/bash
 printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5" >> "$PROBE_TRACE"
+if [[ "$5" == --version ]]; then printf 'Mole version 9.9.9\n'; exit 0; fi
 exit 124
 TIMEOUT
 chmod +x "$fake_bin/gtimeout"
@@ -756,6 +762,11 @@ EOF
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 unset TMPDIR
+fixture_default_temp="$HOME/tmp"
+mktemp() {
+    [[ "$*" == *"/tmp/mole."* ]] || return 2
+    command mktemp -d "$fixture_default_temp/mole.XXXXXX"
+}
 log_error() { printf 'ERROR:%s\n' "$*"; }
 stop_line_spinner() { :; }
 release_install_lock() { :; }
@@ -773,6 +784,7 @@ tmp_lines="$(sed -n '/^[[:space:]]*tmp="\$(mktemp -d/{p;n;p;q;}' "$PROJECT_ROOT/
 eval "$tmp_lines"
 source_tmp="$INSTALL_SOURCE_TMP"
 printf 'downloaded source\n' > "$source_tmp/payload"
+TMPDIR="$fixture_default_temp"; export TMPDIR
 cleanup_installer
 
 [[ -z "$INSTALL_SOURCE_TMP" ]] || exit 1
@@ -809,6 +821,8 @@ eval "$(sed -n '/^needs_sudo() {/,/^}/p' "$PROJECT_ROOT/install.sh")"
 eval "$(sed -n '/^ensure_sudo_ready() {/,/^}/p' "$PROJECT_ROOT/install.sh")"
 eval "$(sed -n '/^maybe_sudo() {/,/^}/p' "$PROJECT_ROOT/install.sh")"
 eval "$(sed -n '/^install_lock_has_unsafe_ancestor() {/,/^get_remote_main_commit_hash() {/p' "$PROJECT_ROOT/install.sh" | sed '$d')"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions install_lock_
 log_error() { printf 'ERROR:%s\n' "$*"; }
 
 [[ "$(/usr/bin/stat -f%Lp "$INSTALL_DIR")" == "775" ]] || exit 1
@@ -943,7 +957,7 @@ grep -q "trap 'cleanup_installer' EXIT" "$PROJECT_ROOT/install.sh"
 for lock_reason in $(grep -oE 'INSTALL_LOCK_FAILURE="[a-z_]+"' "$PROJECT_ROOT/install.sh" |
     sed 's/.*="//;s/"//' | sort -u); do
     [[ "$lock_reason" == "busy" ]] && continue
-    grep -qE "^[[:space:]]+${lock_reason}\)\$" "$PROJECT_ROOT/install.sh" || {
+    grep -qE "^[[:space:]]+([^)]* \| )?${lock_reason}( \| [^)]*)?\)\$" "$PROJECT_ROOT/install.sh" || {
         echo "MISSING_LOCK_BRANCH:$lock_reason"
         exit 1
     }
@@ -1002,6 +1016,8 @@ mkdir -p "$INSTALL_DIR"
 eval "$(sed -n '/^safe_rm() {/,/^}/p' "$PROJECT_ROOT/install.sh")"
 eval "$(sed -n '/^install_lock_has_unsafe_ancestor() {/,/^install_lock_process_start() {/p' "$PROJECT_ROOT/install.sh" | sed '$d')"
 eval "$(sed -n '/^normalize_install_dir() {/,/^}/p' "$PROJECT_ROOT/install.sh")"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_ancestor_check install_lock_
 
 normalize_install_dir
 [[ "$INSTALL_DIR" == "$(pwd -P)/relative/bin" ]] || exit 1
@@ -1236,13 +1252,21 @@ eval "$(sed -n '/^safe_rm() {/,/^}/p' "$PROJECT_ROOT/install.sh")"
 mktemp_line=$(grep -m1 -E '^[[:space:]]*tmp="\$\(mktemp -d' "$PROJECT_ROOT/install.sh" | sed 's/^[[:space:]]*//')
 [[ -n "$mktemp_line" ]] || { echo "NO_MKTEMP_LINE"; exit 1; }
 
+fixture_temp="$HOME/tmp"
 for scenario in unset darwin slash; do
     case "$scenario" in
         unset)  unset TMPDIR ;;
-        darwin) TMPDIR="$(getconf DARWIN_USER_TEMP_DIR)"; export TMPDIR ;;
-        slash)  TMPDIR="$(getconf DARWIN_USER_TEMP_DIR)"; TMPDIR="${TMPDIR%/}/"; export TMPDIR ;;
+        darwin) TMPDIR="$fixture_temp"; export TMPDIR ;;
+        slash)  TMPDIR="$fixture_temp/"; export TMPDIR ;;
     esac
+    mktemp() {
+        if [[ "$scenario" == unset ]]; then
+            [[ "$*" == *"/tmp/mole."* ]] || return 2
+            command mktemp -d "$fixture_temp/mole.XXXXXX"
+        else command mktemp "$@"; fi
+    }
     eval "$mktemp_line"
+    TMPDIR="$fixture_temp"; export TMPDIR
     [[ -d "$tmp" ]] || { echo "NO_DIR:$scenario"; exit 1; }
     safe_rm "$tmp" || { echo "REFUSED:$scenario"; exit 1; }
     [[ ! -e "$tmp" ]] || { echo "LEFT_BEHIND:$scenario"; exit 1; }
@@ -1282,6 +1306,8 @@ for fn in install_lock_command install_lock_has_unsafe_ancestor install_lock_pre
 	eval "$body"
 done
 
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions install_lock_
 acquire_install_lock || { echo "ACQUIRE_FAILED:$INSTALL_LOCK_FAILURE"; exit 1; }
 mutex="$INSTALL_DIR/.mole-update.lock/holder"
 [[ -d "$mutex" ]] || { echo "NO_MUTEX_HELD"; exit 1; }
@@ -1337,4 +1363,28 @@ EOF
 		echo "claimed ownership with no cellar anywhere"
 		return 1
 	fi
+}
+
+@test "install.sh refuses a root invocation before writing anything" {
+	run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_INNER'
+set -euo pipefail
+eval "$(sed -n '/^refuse_root_invocation() {/,/^}/p' "$PROJECT_ROOT/install.sh")"
+if refuse_root_invocation 0 2> "$HOME/root.err"; then
+    echo "ROOT_ACCEPTED"
+else
+    echo "ROOT_REFUSED"
+fi
+cat "$HOME/root.err"
+refuse_root_invocation 501 && echo "USER_ACCEPTED"
+EOF_INNER
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
+	[[ "$output" == *"ROOT_REFUSED"* ]] || return 1
+	[[ "$output" == *"Run Mole without sudo"* ]] || return 1
+	[[ "$output" == *"USER_ACCEPTED"* ]] || return 1
+	# The gate must run at top level, before any install work starts.
+	run grep -Fn "refuse_root_invocation \"\${EUID:-0}\" || exit 1" "$PROJECT_ROOT/install.sh"
+	[ "$status" -eq 0 ]
 }

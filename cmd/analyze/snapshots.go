@@ -30,12 +30,16 @@ func (m model) detectLocalSnapshotsCmd() tea.Cmd {
 	if run == nil {
 		run = runLocalSnapshotCommand
 	}
-	return localSnapshotProbeCmd(run, m.snapshotProbeID)
+	return m.trackWork(localSnapshotProbeCmd(run, m.snapshotProbeID, m.lifetimeContext()))
 }
 
-func localSnapshotProbeCmd(run localSnapshotCommandRunner, probeID int64) tea.Cmd {
+func localSnapshotProbeCmd(run localSnapshotCommandRunner, probeID int64, parents ...context.Context) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), localSnapshotProbeTimeout)
+		parent := context.Background()
+		if len(parents) > 0 && parents[0] != nil {
+			parent = parents[0]
+		}
+		ctx, cancel := context.WithTimeout(parent, localSnapshotProbeTimeout)
 		defer cancel()
 
 		output, err := run(ctx, "/usr/bin/tmutil", "listlocalsnapshotdates", "/")

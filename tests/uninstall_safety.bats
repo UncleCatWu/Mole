@@ -374,6 +374,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 trace="$HOME/mole_delete.log"
 mole_delete() {
@@ -426,6 +428,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/fixtures/uninstall_inventory_adapter.sh"
+fixture_bind_uninstall_inventory
 
 trace="$HOME/side_effects.log"
 
@@ -464,6 +468,7 @@ for bad_id in "-g" "NSGlobalDomain" "com-example"; do
 	total_size_cleaned=0
 
 	batch_uninstall_applications </dev/null
+	grep -q "^mole_delete:$HOME/Applications/TestApp.app|false$" "$trace" || exit 1
 
 	if grep -q '^defaults:' "$trace" || grep -q 'ByHost' "$trace"; then
 		echo "unexpected domain cleanup side effect for $bad_id"

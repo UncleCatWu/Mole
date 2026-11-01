@@ -65,13 +65,15 @@ type historyEntry struct {
 }
 
 type scanResultMsg struct {
-	path   string
-	result scanResult
-	err    error
-	stale  bool
+	requestID int64
+	path      string
+	result    scanResult
+	err       error
+	stale     bool
 }
 
 type liveScanStartMsg struct {
+	requestID     int64
 	id            int64
 	path          string
 	entries       []dirEntry
@@ -110,15 +112,18 @@ const (
 )
 
 type overviewSizeMsg struct {
-	Path  string
-	Index int
-	Size  int64
-	Err   error
+	RequestID int64
+	Path      string
+	Index     int
+	Size      int64
+	Err       error
 }
 
 type tickMsg time.Time
 
 type deleteProgressMsg struct {
+	operationID  int64
+	parentPath   string
 	done         bool
 	err          error
 	count        int64
@@ -127,6 +132,7 @@ type deleteProgressMsg struct {
 }
 
 type model struct {
+	lifecycle           *analyzerLifecycle
 	path                string
 	history             []historyEntry
 	entries             []dirEntry
@@ -147,12 +153,17 @@ type model struct {
 	deleteTarget        *dirEntry
 	deleting            bool
 	deleteCount         *int64
+	deleteOperationID   int64
+	deleteParentPath    string
+	deleteCancel        context.CancelFunc
+	quitAfterDelete     bool
 	cache               map[string]historyEntry
 	largeSelected       int
 	largeOffset         int
 	overviewSizeCache   map[string]int64
 	overviewScanning    bool
 	overviewScanningSet map[string]bool // Track which paths are currently being scanned
+	overviewRequestIDs  map[string]int64
 	width               int             // Terminal width
 	height              int             // Terminal height
 	multiSelected       map[string]bool // Track multi-selected items by path (safer than index)
@@ -175,15 +186,20 @@ type model struct {
 	// Directory (drill-down) view incremental filter, mirroring the Top-files
 	// one. entriesAll is the full non-empty entry list; entries is the rendered,
 	// possibly filtered view. Disabled in overview mode.
-	entriesAll          []dirEntry
-	entryFilter         string
-	entryFiltering      bool
-	liveScanID          int64
-	liveScanCancel      context.CancelFunc
-	liveScanEvents      <-chan liveScanEventMsg
-	liveScanningPaths   map[string]bool
-	autoSortLiveEntries bool
-	liveSortMode        liveSortMode
+	entriesAll             []dirEntry
+	entryFilter            string
+	entryFiltering         bool
+	liveScanID             int64
+	scanRequestID          int64
+	scanRequestPublication *scanPublication
+	scanRequestContext     context.Context
+	scanRequestCancel      context.CancelFunc
+	cacheSavePublication   *scanPublication
+	liveScanCancel         context.CancelFunc
+	liveScanEvents         <-chan liveScanEventMsg
+	liveScanningPaths      map[string]bool
+	autoSortLiveEntries    bool
+	liveSortMode           liveSortMode
 }
 
 func (m model) inOverviewMode() bool {

@@ -1936,6 +1936,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+USER=$(/usr/bin/stat -f %Su "$HOME")
 
 test() {
     if [[ "$1" == "-e" || "$1" == "-w" ]]; then
@@ -1995,26 +1996,21 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 
-mdutil() {
-    if [[ "$1" == "-s" ]]; then
-        echo "Indexing enabled."
-        return 0
-    fi
-    return 0
+run_with_timeout() {
+    shift
+    case "$*" in
+        "mdutil -s /") echo "probe:status" >&2; echo "Indexing enabled." ;;
+        "mdfind kMDItemFSName == 'Applications'") echo "speed" >> "$HOME/spotlight-probes" ;;
+        *) echo "Unexpected bounded command: $*" >&2; return 2 ;;
+    esac
 }
-export -f mdutil
-
-mdfind() {
-    return 0
-}
-export -f mdfind
-
-date() {
-    echo "1000"
-}
-export -f date
+is_ac_power() { return 0; }
+get_epoch_seconds() { echo "1000"; }
+sleep() { [[ "$*" == "1" ]]; }
 
 execute_optimization spotlight_index_optimize
+[[ "$(wc -l < "$HOME/spotlight-probes" | tr -d " ")" == 2 ]] || exit 1
+[[ "$(optimize_outcome_count unchanged)" == 1 ]] || exit 1
 EOF
 
     [ "$status" -eq 0 ]

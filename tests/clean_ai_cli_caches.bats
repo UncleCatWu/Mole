@@ -294,8 +294,9 @@ for component in Library Caches; do
     touch "$target"
     CASE_HOME="$case_home" TARGET="$target" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'INNER'
 set -euo pipefail
-HOME="$CASE_HOME"
 source "$PROJECT_ROOT/bin/clean.sh"
+# Bind logging to a canonical private HOME before testing a cleanup ancestor.
+HOME="$CASE_HOME"
 pgrep() { return 1; }
 clean_codex_desktop_caches
 [[ -f "$TARGET" ]] || exit 1
@@ -304,6 +305,24 @@ done
 EOF
 
     assert_run_success
+}
+
+@test "cleanup source refuses logging through a symlinked Library ancestor" {
+    local fixture_home="$HOME/logging-linked-library"
+    mkdir -p "$fixture_home/outside"
+    ln -s "$fixture_home/outside" "$fixture_home/Library"
+    run env HOME="$fixture_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+echo "UNEXPECTED_SOURCE_SUCCESS"
+EOF
+    [[ "$status" == 16 ]] || {
+        echo "$output"
+        return 1
+    }
+    assert_output_contains "mole test boundary refused (symlink-ancestor)"
+    assert_output_not_contains "UNEXPECTED_SOURCE_SUCCESS"
+    [[ ! -e "$fixture_home/outside/Logs/mole/mole.log" ]]
 }
 
 @test "clean_codex_desktop_caches rejects a symlinked Codex root" {
@@ -377,6 +396,12 @@ source "$PROJECT_ROOT/lib/clean/dev.sh"
 safe_clean() { echo "SAFE_CLEAN:$2|$1"; }
 clean_service_worker_cache() { echo "SWC:$1"; }
 note_activity() { :; }
+pgrep() {
+    case "$*" in
+        "-x Antigravity" | "-f /Antigravity.app/" | "-x gemini" | "-f antigravity-browser-profile") return 1 ;;
+        *) return 2 ;;
+    esac
+}
 clean_antigravity_caches
 EOF
 
@@ -392,6 +417,26 @@ EOF
     assert_output_contains "SWC:Antigravity"
     assert_output_not_contains "Default/Extensions"
     assert_output_not_contains "Default/Storage"
+}
+
+@test "clean_antigravity_caches preserves eligible browser cache on unknown owner state" {
+    local fixture_home="$HOME/antigravity-unknown"
+    local target="$fixture_home/.gemini/antigravity-browser-profile/Default/Cache/owned.bin"
+    mkdir -p "$(dirname "$target")"
+    touch "$target"
+    run env HOME="$fixture_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+pgrep() { return 2; }
+safe_clean() { echo "UNEXPECTED_SINK:$*"; }
+note_activity() { :; }
+clean_antigravity_caches
+EOF
+    assert_run_success
+    assert_output_contains "Antigravity/Gemini caches · skipped (process state unknown)"
+    assert_output_not_contains "UNEXPECTED_SINK:"
+    [[ -f "$target" ]]
 }
 
 @test "clean_antigravity_caches is a no-op when the profile is absent" {

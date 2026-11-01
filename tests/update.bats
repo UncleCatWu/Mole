@@ -9,6 +9,10 @@ setup() {
 	HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-update-home.XXXXXX")"
 	TEST_ROOT="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-update-case.XXXXXX")"
 	export HOME TEST_ROOT
+	export TMPDIR="$TEST_ROOT/tmp"
+	mkdir -p "$TMPDIR"
+	source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+	fixture_prepare_install_probe
 }
 
 teardown() {
@@ -31,6 +35,7 @@ make_manual_mole_install() {
 		"$PROJECT_ROOT/mole" > "$install_dir/mole"
 	cp "$PROJECT_ROOT/mo" "$install_dir/mo"
 	cp -R "$PROJECT_ROOT/lib" "$config_dir/lib"
+	fixture_patch_install_probe_file "$config_dir/lib/manage/update.sh"
 	printf '#!/bin/bash\nexit 0\n' > "$config_dir/bin/analyze-go"
 	printf '#!/bin/bash\nexit 0\n' > "$config_dir/bin/status-go"
 	chmod +x "$install_dir/mole" "$install_dir/mo" "$config_dir/bin/analyze-go" "$config_dir/bin/status-go"
@@ -596,6 +601,8 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 VERSION="0.0.1"
 SCRIPT_DIR="$HOME/config"
 source "$PROJECT_ROOT/lib/manage/update.sh"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions _update_lock_
 
 background_commit=$(get_latest_commit_from_github api-only)
 [[ -z "$background_commit" ]] || exit 1
@@ -1366,6 +1373,8 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 VERSION="0.0.1"
 SCRIPT_DIR="$HOME/config"
 source "$PROJECT_ROOT/lib/manage/update.sh"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions _update_lock_
 
 mkdir -p "$HOME/install/bin"
 /bin/chmod 0775 "$HOME/install/bin"
@@ -1516,6 +1525,8 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 VERSION="0.0.1"
 SCRIPT_DIR="$HOME/config"
 source "$PROJECT_ROOT/lib/manage/update.sh"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions _update_lock_
 
 expected_commit="def5678bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 export expected_commit
@@ -1573,6 +1584,8 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 VERSION="0.0.1"
 SCRIPT_DIR="$HOME/config"
 source "$PROJECT_ROOT/lib/manage/update.sh"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions _update_lock_
 
 curl() {
 	cat <<'INSTALLER'
@@ -1620,6 +1633,8 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 VERSION="0.0.1"
 SCRIPT_DIR="$HOME/config"
 source "$PROJECT_ROOT/lib/manage/update.sh"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions _update_lock_
 
 curl() {
 	printf '%s\n' '#!/usr/bin/env bash' 'exit 0'
@@ -1655,6 +1670,8 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 VERSION="0.0.1"
 SCRIPT_DIR="$HOME/config"
 source "$PROJECT_ROOT/lib/manage/update.sh"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions _update_lock_
 
 curl() {
 	cat <<'INSTALLER'
@@ -1691,6 +1708,8 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 VERSION="0.0.1"
 SCRIPT_DIR="$HOME/config"
 source "$PROJECT_ROOT/lib/manage/update.sh"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions _update_lock_
 
 curl() {
 	cat <<'INSTALLER'
@@ -1737,6 +1756,8 @@ set -euo pipefail
 VERSION="0.0.0"
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/manage/update.sh"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions _update_lock_
 
 root="$HOME/sudo-predicate"
 mkdir -p "$root/locked-parent/bin" "$root/locked-parent-missing" "$root/locked-bin/bin"
@@ -1787,6 +1808,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/manage/update.sh"
+source "$PROJECT_ROOT/tests/fixtures/install_probe_adapter.sh"
+fixture_bind_install_probe_functions _update_lock_
 # A flaky or absent brew must not flip the on-disk evidence to "manual":
 # that verdict is what let the manual updater overwrite brew's symlinks.
 brew_mole_formula_installed() { return 1; }

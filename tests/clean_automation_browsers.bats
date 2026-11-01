@@ -23,11 +23,12 @@ teardown_file() {
     fi
 }
 
-# Stub binaries: ps emits one orphaned cliDaemon (ppid 1), one reparented
-# Chrome on an automation profile, one automation Chrome whose harness is
-# still alive (must survive), one reparented automation Chrome too young to
-# judge (must survive), and one unrelated browser (must survive). getconf
-# points the profile scan at the test temp root.
+# Stub binaries: ps emits one playwright-cli session daemon (ppid 1 by design,
+# must survive), one reparented Chrome on an automation profile, one
+# automation Chrome whose harness is still alive (must survive), one
+# reparented automation Chrome too young to judge (must survive), and one
+# unrelated browser (must survive). getconf points the profile scan at the
+# test temp root.
 make_process_stubs() {
     mkdir -p "$HOME/bin" "$HOME/tmproot"
     cat > "$HOME/bin/ps" <<'SCRIPT'
@@ -85,9 +86,9 @@ EOF
     cat > "$HOME/bin/ps" <<'SCRIPT'
 #!/bin/bash
 if [[ "$1" == "-Ao" ]]; then
-    printf '%s\n' '  901     1 02-01:00:00 Mon Aug 31 01:02:03 2026 /opt/homebrew/bin/node playwright-core/lib/entry/cliDaemon.js daemon'
+    printf '%s\n' '  902     1 01-20:00:00 Tue Sep  1 02:03:04 2026 /Applications/Chrome.app/x --user-data-dir=/tmp/playwright_chromiumdev_profile-old'
 else
-    printf '%s\n' '  901     1 02-01:00:00 Fri Sep  4 11:12:13 2026 /Applications/Safari.app/Contents/MacOS/Safari'
+    printf '%s\n' '  902     1 01-20:00:00 Fri Sep  4 11:12:13 2026 /Applications/Safari.app/Contents/MacOS/Safari'
 fi
 SCRIPT
     chmod +x "$HOME/bin/ps"
@@ -106,9 +107,9 @@ SCRIPT
     cat > "$HOME/bin/ps" <<'SCRIPT'
 #!/bin/bash
 if [[ "$1" == "-Ao" || ! -e "$TERM_MARKER" ]]; then
-    printf '%s\n' '  901     1 02-01:00:00 Mon Aug 31 01:02:03 2026 /opt/homebrew/bin/node playwright-core/lib/entry/cliDaemon.js daemon'
+    printf '%s\n' '  902     1 01-20:00:00 Tue Sep  1 02:03:04 2026 /Applications/Chrome.app/x --user-data-dir=/tmp/playwright_chromiumdev_profile-old'
 else
-    printf '%s\n' '  901     1 02-01:00:00 Fri Sep  4 11:12:13 2026 /Applications/Safari.app/Contents/MacOS/Safari'
+    printf '%s\n' '  902     1 01-20:00:00 Fri Sep  4 11:12:13 2026 /Applications/Safari.app/Contents/MacOS/Safari'
 fi
 SCRIPT
     chmod +x "$HOME/bin/ps"
@@ -130,8 +131,8 @@ note_activity() { :; }
 clean_dev_automation_browsers
 EOF
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
-    grep -q 'KILL -TERM 901' "$HOME/kill.trace" || return 1
-    ! grep -q 'KILL -9 901' "$HOME/kill.trace" || { cat "$HOME/kill.trace"; return 1; }
+    grep -q 'KILL -TERM 902' "$HOME/kill.trace" || return 1
+    ! grep -q 'KILL -9 902' "$HOME/kill.trace" || { cat "$HOME/kill.trace"; return 1; }
 }
 
 @test "kills only automation processes whose owner is gone" {
@@ -140,9 +141,11 @@ EOF
 
     run_cleanup false
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
-    [[ "$output" == *"stopped 2 processes"* ]] || { echo "$output"; return 1; }
-    grep -q 'KILL -TERM 901' "$HOME/kill.trace" || return 1
+    [[ "$output" == *"stopped 1 processes"* ]] || { echo "$output"; return 1; }
     grep -q 'KILL -TERM 902' "$HOME/kill.trace" || return 1
+    # The playwright-cli daemon is spawned detached and unref'd, so ppid 1 is
+    # its steady state for an active session. Killing it ends a live session.
+    ! grep -q ' 901' "$HOME/kill.trace" || return 1
     # A live automation run keeps its parent, so it is never signaled however
     # long it has been running. This is the call age alone cannot make.
     ! grep -q ' 903' "$HOME/kill.trace" || return 1
@@ -158,7 +161,7 @@ EOF
 
     run_cleanup true
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
-    [[ "$output" == *"would stop 2 processes"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"would stop 1 processes"* ]] || { echo "$output"; return 1; }
     [ ! -s "$HOME/kill.trace" ] || { cat "$HOME/kill.trace"; return 1; }
 }
 
@@ -179,6 +182,20 @@ EOF
     # In-use profile (pgrep hit) and fresh profile (under 2h) stay.
     [[ "$output" != *"SAFE_CLEAN"*"profile-live"* ]] || { echo "$output"; return 1; }
     [[ "$output" != *"SAFE_CLEAN"*"profile-fresh"* ]] || { echo "$output"; return 1; }
+}
+
+@test "a profile is kept when pgrep cannot answer" {
+    make_process_stubs
+    : > "$HOME/kill.trace"
+    mkdir -p "$HOME/tmproot/playwright_chromiumdev_profile-stale"
+    touch -t 202601010000 "$HOME/tmproot/playwright_chromiumdev_profile-stale"
+    # Exit 2 is a pgrep usage/regex failure, not "no process found".
+    printf '#!/bin/bash\nexit 2\n' > "$HOME/bin/pgrep"
+    chmod +x "$HOME/bin/pgrep"
+
+    run_cleanup false
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"SAFE_CLEAN"* ]] || { echo "$output"; return 1; }
 }
 
 @test "quiet no-op when nothing leaked" {

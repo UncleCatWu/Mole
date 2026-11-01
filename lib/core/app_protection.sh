@@ -749,6 +749,7 @@ find_vendor_nested_app_paths() {
     local bundle_id="$1"
     local app_name="$2"
     shift 2
+    _mole_uninstall_is_zed_channel "$bundle_id" "$app_name" && return 0
     local _MOLE_UNINSTALL_DISCOVERY_DEADLINE="${_MOLE_UNINSTALL_DISCOVERY_DEADLINE:-$((SECONDS + MOLE_TIMEOUT_DISK_VERIFY_SEC))}"
 
     [[ -n "$app_name" && ${#app_name} -ge 4 ]] || return 0
@@ -804,6 +805,7 @@ find_shared_app_paths() {
     local bundle_id="$1"
     local app_name="$2"
     shift 2
+    _mole_uninstall_is_zed_channel "$bundle_id" "$app_name" && return 0
     local _MOLE_UNINSTALL_DISCOVERY_DEADLINE="${_MOLE_UNINSTALL_DISCOVERY_DEADLINE:-$((SECONDS + MOLE_TIMEOUT_DISK_VERIFY_SEC))}"
 
     [[ -n "$app_name" && ${#app_name} -ge 5 ]] || return 0
@@ -951,6 +953,16 @@ _mole_uninstall_embedded_bundle_ids() {
 }
 
 # Locate files associated with an application
+# Channels have distinct bundle ids but share Zed settings and databases.
+# Basename evidence also protects shared roots when bundle metadata is missing.
+_mole_uninstall_is_zed_channel() {
+    local bundle_lower name_lower
+    bundle_lower=$(_mole_uninstall_lower "${1:-}")
+    name_lower=$(_mole_uninstall_lower "${2:-}")
+    [[ "$bundle_lower" =~ ^dev\.zed\.zed(-[a-z0-9_-]+)?$ ||
+        "$name_lower" =~ ^zed([[:space:]]+(nightly|preview|beta|alpha|dev|canary|stable|release|rc|lts))?$ ]]
+}
+
 find_app_files() {
     local bundle_id="$1"
     local app_name="$2"
@@ -998,6 +1010,14 @@ find_app_files() {
         bundle_id_valid="true"
     fi
 
+    # Zed channels own their exact bundle-id state but share name-derived
+    # roots (settings, databases, extensions). Removing one channel cannot
+    # authorize removing those roots, even when no sibling was in the menu.
+    local collect_app_name_paths=true
+    if _mole_uninstall_is_zed_channel "$bundle_id" "$app_name"; then
+        collect_app_name_paths=false
+    fi
+
     # Standard path patterns for user-level files. App-name templates must never
     # be built from an empty display name, otherwise dotdir/XDG paths collapse to
     # broad roots like "$HOME/." or "$HOME/.config/". Do not derive a top-level
@@ -1005,7 +1025,7 @@ find_app_files() {
     # and Docker collide with shared CLI/config roots on case-insensitive APFS.
     # App-specific top-level dotdirs require an explicit product rule below.
     local -a user_patterns=()
-    if [[ -n "$app_name" && ${#app_name} -ge 2 ]]; then
+    if [[ "$collect_app_name_paths" == "true" && -n "$app_name" && ${#app_name} -ge 2 ]]; then
         user_patterns+=(
             "$HOME/Library/Application Support/$app_name"
             "$HOME/Library/Caches/$app_name"
@@ -1070,7 +1090,7 @@ find_app_files() {
     # display name (case-insensitive, APFS is too) and continuing at an
     # uppercase-or-digit word boundary. Only two literal-path variants come
     # out: the raw leaf and the split that keeps the display name intact.
-    if [[ "$bundle_id_valid" == "true" && ${#app_name} -ge 3 ]]; then
+    if [[ "$collect_app_name_paths" == "true" && "$bundle_id_valid" == "true" && ${#app_name} -ge 3 ]]; then
         local bundle_leaf="${bundle_id##*.}"
         local app_name_nospace="${app_name// /}"
         local bundle_leaf_lower app_name_nospace_lower
@@ -1102,7 +1122,7 @@ find_app_files() {
 
     # Add all naming variants to cover inconsistent app directory naming
     # Issue #377: Apps create directories with various naming conventions
-    if [[ ${#app_name} -gt 3 && "$app_name" =~ [[:space:]] ]]; then
+    if [[ "$collect_app_name_paths" == "true" && ${#app_name} -gt 3 && "$app_name" =~ [[:space:]] ]]; then
         user_patterns+=(
             # Compound naming (MaestroStudio, Maestro_Studio, Maestro-Studio)
             "$HOME/Library/Application Support/$nospace_name"
@@ -1131,7 +1151,7 @@ find_app_files() {
     fi
 
     # Add base name variants for versioned apps (e.g., "Zed Nightly" -> check for "zed")
-    if [[ "$base_name" != "$app_name" && ${#base_name} -gt 2 ]]; then
+    if [[ "$collect_app_name_paths" == "true" && "$base_name" != "$app_name" && ${#base_name} -gt 2 ]]; then
         user_patterns+=(
             "$HOME/Library/Application Support/$base_name"
             "$HOME/Library/Caches/$base_name"
@@ -1143,22 +1163,6 @@ find_app_files() {
             "$HOME/.cache/$base_lowercase"
             "$HOME/.local/share/$base_lowercase"
         )
-    fi
-
-    # Issue #422: Zed channel builds can leave data under another channel bundle id.
-    # Example: uninstalling dev.zed.Zed-Nightly should also detect dev.zed.Zed-Preview leftovers.
-    if [[ "$bundle_id_valid" == "true" && "$bundle_id" =~ ^dev\.zed\.Zed- ]] && [[ -d "$HOME/Library/HTTPStorages" ]]; then
-        discovery_scan_rc=0
-        _mole_uninstall_materialize_find0 "$discovery_scan_file" \
-            "$HOME/Library/HTTPStorages" -maxdepth 1 \
-            -name "dev.zed.Zed-*" -print0 || discovery_scan_rc=$?
-        if [[ $discovery_scan_rc -ne 0 ]]; then
-            rm -f -- "$discovery_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
-            return "$discovery_scan_rc"
-        fi
-        while IFS= read -r -d '' zed_http_storage; do
-            files_to_clean+=("$zed_http_storage")
-        done < "$discovery_scan_file"
     fi
 
     # Process standard patterns. user_patterns can be empty when app_name is
@@ -1211,7 +1215,7 @@ find_app_files() {
     # Many professional apps store the product under a vendor folder rather
     # than directly under Application Support. Match only when the vendor token
     # comes from the bundle id to avoid broad name-only deletion.
-    if [[ "$bundle_id_valid" == "true" ]]; then
+    if [[ "$collect_app_name_paths" == "true" && "$bundle_id_valid" == "true" ]]; then
         local vendor_nested_path vendor_nested_output=""
         discovery_scan_rc=0
         vendor_nested_output=$(find_vendor_nested_app_paths "$bundle_id" "$app_name" \
@@ -1391,7 +1395,7 @@ find_app_files() {
     # Minimum 5-char threshold prevents false positives (e.g., "Time" matching system agents)
     # Short-name apps (e.g., Zoom, Arc) are still cleaned via bundle_id matching above
     # Security: Common words are excluded to prevent matching unrelated plist files
-    if [[ ${#app_name} -ge 5 ]] && [[ -d ~/Library/LaunchAgents ]]; then
+    if [[ "$collect_app_name_paths" == "true" && ${#app_name} -ge 5 ]] && [[ -d ~/Library/LaunchAgents ]]; then
         # Skip generic words that collide with many unrelated LaunchAgents.
         # Shared with the system-level scan in find_app_system_files();
         # defined in app_protection_data.sh.
@@ -1729,6 +1733,10 @@ find_app_system_files() {
     local bundle_id="$1"
     local app_name="$2"
     local _MOLE_UNINSTALL_DISCOVERY_DEADLINE="${_MOLE_UNINSTALL_DISCOVERY_DEADLINE:-$((SECONDS + MOLE_TIMEOUT_DISK_VERIFY_SEC))}"
+    local collect_app_name_paths=true
+    if _mole_uninstall_is_zed_channel "$bundle_id" "$app_name"; then
+        collect_app_name_paths=false
+    fi
     local -a system_files=()
     local system_scan_file=""
     system_scan_file=$(create_temp_file) || return 1
@@ -1745,36 +1753,40 @@ find_app_system_files() {
 
     # Standard system path patterns
     local -a system_patterns=(
-        "/Library/Application Support/$app_name"
         "/Library/Application Support/$bundle_id"
         "/Library/LaunchAgents/$bundle_id.plist"
         "/Library/LaunchDaemons/$bundle_id.plist"
         "/Library/Preferences/$bundle_id.plist"
-        "/Library/Preferences/$app_name"
-        "/Library/Preferences/$app_name.plist"
         "/Library/Receipts/$bundle_id.bom"
         "/Library/Receipts/$bundle_id.plist"
-        "/Library/Frameworks/$app_name.framework"
-        "/Library/Internet Plug-Ins/$app_name.plugin"
-        "/Library/Input Methods/$app_name.app"
         "/Library/Input Methods/$bundle_id.app"
-        "/Library/Audio/Plug-Ins/Components/$app_name.component"
-        "/Library/Audio/Plug-Ins/VST/$app_name.vst"
-        "/Library/Audio/Plug-Ins/VST3/$app_name.vst3"
-        "/Library/Audio/Plug-Ins/Digidesign/$app_name.dpm"
-        "/Library/QuickLook/$app_name.qlgenerator"
-        "/Library/PreferencePanes/$app_name.prefPane"
-        "/Library/Screen Savers/$app_name.saver"
         "/Library/Caches/$bundle_id"
-        "/Library/Caches/$app_name"
-        "/Library/Extensions/$app_name.kext"
-        "/Library/StartupItems/$app_name"
-        "/Library/Logs/$app_name"
         "/Library/Logs/$bundle_id"
     )
+    if [[ "$collect_app_name_paths" == "true" ]]; then
+        system_patterns+=(
+            "/Library/Application Support/$app_name"
+            "/Library/Preferences/$app_name"
+            "/Library/Preferences/$app_name.plist"
+            "/Library/Frameworks/$app_name.framework"
+            "/Library/Internet Plug-Ins/$app_name.plugin"
+            "/Library/Input Methods/$app_name.app"
+            "/Library/Audio/Plug-Ins/Components/$app_name.component"
+            "/Library/Audio/Plug-Ins/VST/$app_name.vst"
+            "/Library/Audio/Plug-Ins/VST3/$app_name.vst3"
+            "/Library/Audio/Plug-Ins/Digidesign/$app_name.dpm"
+            "/Library/QuickLook/$app_name.qlgenerator"
+            "/Library/PreferencePanes/$app_name.prefPane"
+            "/Library/Screen Savers/$app_name.saver"
+            "/Library/Caches/$app_name"
+            "/Library/Extensions/$app_name.kext"
+            "/Library/StartupItems/$app_name"
+            "/Library/Logs/$app_name"
+        )
+    fi
 
     # Add all naming variants for apps with spaces in name
-    if [[ ${#app_name} -gt 3 && "$app_name" =~ [[:space:]] ]]; then
+    if [[ "$collect_app_name_paths" == "true" && ${#app_name} -gt 3 && "$app_name" =~ [[:space:]] ]]; then
         system_patterns+=(
             "/Library/Application Support/$nospace_name"
             "/Library/Caches/$nospace_name"
@@ -1866,7 +1878,7 @@ find_app_system_files() {
     # are removed with sudo, so mirror the (stricter) user-level guard above:
     # require >=5 chars, skip generic collision words, and skip Apple's own
     # plists. A short or generic app name must not match unrelated system agents.
-    if [[ ${#app_name} -ge 5 ]] && ! [[ "$app_name" =~ ^(${LAUNCH_AGENT_NAME_COMMON_WORDS})$ ]]; then
+    if [[ "$collect_app_name_paths" == "true" && ${#app_name} -ge 5 ]] && ! [[ "$app_name" =~ ^(${LAUNCH_AGENT_NAME_COMMON_WORDS})$ ]]; then
         for base in /Library/LaunchAgents /Library/LaunchDaemons; do
             [[ -d "$base" ]] || continue
             system_scan_rc=0
@@ -1925,7 +1937,7 @@ find_app_system_files() {
     # words case-insensitively and require each matched variant to be at least
     # 5 characters, since nospace variants can be shorter than app_name itself.
     local -a helper_name_variants=()
-    if ! _mole_uninstall_is_common_app_name "$app_name"; then
+    if [[ "$collect_app_name_paths" == "true" ]] && ! _mole_uninstall_is_common_app_name "$app_name"; then
         local name_variant
         for name_variant in "$lowercase_name" "$lowercase_nospace" "$lowercase_hyphen" "$lowercase_underscore"; do
             if [[ ${#name_variant} -ge 5 ]]; then

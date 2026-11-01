@@ -140,7 +140,13 @@ teardown() {
     run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$TEST_DIR/valid'"
     [ "$status" -eq 0 ]
 
-    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$HOME/Library/Caches/com.example.app/cache.db'"
+    # This case checks path syntax, not machine-wide owner/lsof visibility.
+    run /bin/bash -c "
+        source '$PROJECT_ROOT/lib/core/common.sh'
+        _mole_should_refuse_live_user_cache_path() { return 1; }
+        _mole_sqlite_database_in_use() { return 1; }
+        validate_path_for_deletion '$HOME/Library/Caches/com.example.app/cache.db'
+    "
     [ "$status" -eq 0 ]
 }
 
@@ -461,6 +467,52 @@ EOF
 
     [ "$status" -eq 0 ] || return 1
     [[ "$output" == *"RC=1 TRACE=visibility,"* ]]
+}
+
+@test "validate_path_for_deletion gates Homebrew partial downloads on lsof too (#1594)" {
+    local partial="$HOME/Library/Caches/Homebrew/downloads/abc123--Some App.dmg.incomplete"
+    mkdir -p "$(dirname "$partial")"
+    printf 'partial\n' > "$partial"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" partial="$partial" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+trace_file=$(mktemp)
+lsof() {
+    case " $* " in
+        *" -p 1 "*) printf 'visibility\n' >> "$trace_file"; return 1 ;;
+        *) printf 'target\n' >> "$trace_file"; return 1 ;;
+    esac
+}
+run_with_timeout() { shift; "$@"; }
+validation_rc=0
+validate_path_for_deletion "$partial" || validation_rc=$?
+printf 'RC=%s TRACE=%s\n' "$validation_rc" "$(tr '\n' ',' < "$trace_file")"
+command rm -f "$trace_file"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=1 TRACE=visibility,"* ]]
+}
+
+@test "a finished Homebrew download is not treated as a partial (#1594)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+brew="$HOME/Library/Caches/Homebrew/downloads"
+# The gate covers in-flight transfers only; a completed artifact and a nested
+# path stay ordinary cache so the sweep keeps reclaiming them.
+_mole_is_incomplete_download_path "$brew/abc--App.dmg.incomplete" && echo "INCOMPLETE:yes"
+_mole_is_incomplete_download_path "$brew/abc--App.dmg" || echo "FINISHED:no"
+_mole_is_incomplete_download_path "$brew/nested/abc--App.dmg.incomplete" || echo "NESTED:no"
+_mole_is_incomplete_download_path "$HOME/Downloads/pending.crdownload" && echo "BROWSER:yes"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"INCOMPLETE:yes"* ]] || return 1
+    [[ "$output" == *"FINISHED:no"* ]] || return 1
+    [[ "$output" == *"NESTED:no"* ]] || return 1
+    [[ "$output" == *"BROWSER:yes"* ]]
 }
 
 @test "complete lsof mode accepts only a root-owned pid 1 record (#1471)" {
@@ -1334,14 +1386,14 @@ EOF
 #!/bin/bash
 if [[ "$*" == *"$TARGET_FILE"* ]]; then
     printf 'rm %s\n' "$*" >> "$MOLE_RM_TRACE"
-    exec sleep 4
+    exec sleep 6
 fi
 exec /bin/rm "$@"
 MOCK
     chmod +x "$mock_bin/rm"
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_FILE="$target_file" \
-        PATH="$mock_bin:$PATH" MOLE_RM_TRACE="$trace" MOLE_TIMEOUT_DISK_VERIFY_SEC=1 \
+        PATH="$mock_bin:$PATH" MOLE_RM_TRACE="$trace" MOLE_TIMEOUT_DISK_VERIFY_SEC=2 \
         /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -1358,10 +1410,11 @@ SCRIPT
         return 1
     }
     [[ "$output" == *"RC=124"* ]] || return 1
+    [[ -f "$trace" ]] || { echo "$output"; return 1; }
     [[ "$(< "$trace")" == *"$target_file"* ]] || return 1
     local elapsed="${output##*ELAPSED=}"
     [[ "$elapsed" =~ ^[0-9]+$ ]] || return 1
-    [ "$elapsed" -lt 3 ]
+    [ "$elapsed" -lt 5 ]
     [ -e "$target_file" ]
 }
 

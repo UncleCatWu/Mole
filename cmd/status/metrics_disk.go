@@ -47,6 +47,7 @@ var skipDiskFSTypes = map[string]bool{
 var (
 	diskPartitionsFunc = disk.Partitions
 	diskUsageFunc      = disk.Usage
+	diskIOCountersFunc = disk.IOCounters
 )
 
 const (
@@ -73,7 +74,6 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 	var (
 		disks      []DiskStatus
 		seenDevice = make(map[string]bool)
-		seenVolume = make(map[string]bool)
 	)
 	for _, part := range partitions {
 		if shouldSkipDiskPartition(part) {
@@ -98,11 +98,9 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 		if total < 1<<30 {
 			continue
 		}
-		// Use size-based dedupe key for shared pools.
-		volKey := fmt.Sprintf("%s:%d", part.Fstype, total)
-		if seenVolume[volKey] {
-			continue
-		}
+		// APFS volumes in one synthesized container share a base device.
+		// Equal capacity alone is not evidence of a shared pool: independent
+		// disks of the same model commonly have exactly the same byte count.
 		used := usage.Used
 		usedPercent := usage.UsedPercent
 		purgeable := uint64(0)
@@ -122,7 +120,6 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 			Purgeable:   purgeable,
 		})
 		seenDevice[baseDevice] = true
-		seenVolume[volKey] = true
 	}
 
 	if useCorrections {
@@ -473,7 +470,7 @@ func uint64AbsDiff(a, b uint64) uint64 {
 }
 
 func (c *Collector) collectDiskIO(now time.Time) DiskIOStatus {
-	counters, err := disk.IOCounters()
+	counters, err := diskIOCountersFunc()
 	if err != nil || len(counters) == 0 {
 		return DiskIOStatus{}
 	}

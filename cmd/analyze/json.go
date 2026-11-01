@@ -89,14 +89,12 @@ func performOverviewScanForJSONWithEntries(path string, insightEntries, overview
 		insightPaths[insight.Path] = true
 	}
 
-	var totalSize int64
 	entries := make([]dirEntry, 0, len(overviewEntries))
 	for _, entry := range measureOverviewEntriesForJSON(overviewEntries, insightPaths) {
 		// Match the TUI: omit scanned insight/tool entries that ended up empty.
 		if entry.Size == 0 {
 			continue
 		}
-		totalSize += entry.Size
 		entries = append(entries, entry)
 	}
 
@@ -108,7 +106,7 @@ func performOverviewScanForJSONWithEntries(path string, insightEntries, overview
 		Path:      path,
 		Overview:  true,
 		Entries:   jsonEntriesFromDirEntries(entries, true, insightPaths),
-		TotalSize: totalSize,
+		TotalSize: sumKnownEntrySizes(entries),
 	}
 }
 

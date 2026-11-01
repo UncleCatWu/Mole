@@ -62,7 +62,7 @@ setup() {
     [[ "$result" =~ .mobiledev ]]
 }
 
-@test "find_app_files extracts base name from version suffix (Zed Nightly -> zed)" {
+@test "find_app_files preserves shared Zed name roots when uninstalling a channel" {
     mkdir -p "$HOME/.config/zed"
     mkdir -p "$HOME/Library/Application Support/Zed"
     echo "test" > "$HOME/.config/zed/settings.json"
@@ -70,20 +70,78 @@ setup() {
 
     result=$(find_app_files "dev.zed.Zed-Nightly" "Zed Nightly")
 
-    [[ "$result" =~ .config/zed ]] || return 1
-    [[ "$result" =~ "Library/Application Support/Zed" ]]
+    [[ "$result" != *"/.config/zed"* ]] || return 1
+    [[ "$result" != *"Library/Application Support/Zed"* ]] || return 1
+    [[ -f "$HOME/.config/zed/settings.json" && -f "$HOME/Library/Application Support/Zed/cache.db" ]]
 }
 
-@test "find_app_files detects Zed channel variants in HTTPStorages only" {
-    mkdir -p "$HOME/Library/HTTPStorages/dev.zed.Zed-Preview"
+@test "find_app_files keeps another installed Zed channel while collecting its own exact state" {
+    mkdir -p "$HOME/Library/HTTPStorages/dev.zed.Zed-Preview" \
+        "$HOME/Library/HTTPStorages/dev.zed.Zed-Nightly" \
+        "$HOME/Applications/Zed Preview.app/Contents"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string dev.zed.Zed-Preview' \
+        "$HOME/Applications/Zed Preview.app/Contents/Info.plist" >/dev/null 2>&1
     mkdir -p "$HOME/Library/Application Support/Firefox/Profiles/default/storage/default/https+++zed.dev"
     echo "test" > "$HOME/Library/HTTPStorages/dev.zed.Zed-Preview/data"
     echo "test" > "$HOME/Library/Application Support/Firefox/Profiles/default/storage/default/https+++zed.dev/data"
 
     result=$(find_app_files "dev.zed.Zed-Nightly" "Zed Nightly")
 
-    [[ "$result" =~ Library/HTTPStorages/dev\.zed\.Zed-Preview ]] || return 1
+    [[ "$result" != *"Library/HTTPStorages/dev.zed.Zed-Preview"* ]] || return 1
+    [[ "$result" == *"Library/HTTPStorages/dev.zed.Zed-Nightly"* ]] || return 1
+    [[ -f "$HOME/Library/HTTPStorages/dev.zed.Zed-Preview/data" ]] || return 1
     [[ ! "$result" =~ storage/default/https\+\+\+zed\.dev ]]
+}
+
+@test "Zed channel leftovers never enter vendor or LaunchAgent name fallbacks" {
+    mkdir -p "$HOME/Library/Application Support/zed/Zed-Nightly-shared" \
+        "$HOME/Library/LaunchAgents" "$HOME/Library/HTTPStorages/dev.zed.Zed-Nightly"
+    printf shared > "$HOME/Library/LaunchAgents/com.shared.Zed Nightly.plist"
+    printf owned > "$HOME/Library/LaunchAgents/dev.zed.Zed-Nightly.plist"
+    result=$(find_app_files "dev.zed.Zed-Nightly" "Zed Nightly")
+    [[ "$result" == *"HTTPStorages/dev.zed.Zed-Nightly"* ]] || return 1
+    [[ "$result" == *"LaunchAgents/dev.zed.Zed-Nightly.plist"* ]] || return 1
+    [[ "$result" != *"zed/Zed-Nightly-shared"* ]] || return 1
+    [[ "$result" != *"com.shared.Zed Nightly.plist"* ]]
+}
+
+@test "Zed system name paths stay excluded while exact channel and other app paths remain" {
+    run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+fixture_source="${ZED_SYSTEM_BASELINE:-$PROJECT_ROOT/lib/core/app_protection.sh}"
+body=$(sed -n '/^find_app_system_files() {/,/^}/p' "$fixture_source")
+[[ -n "$body" ]] || exit 1
+system_root="$HOME/system"
+# Avoid Bash 3.2's slow global replacements with long private fixture paths.
+body=$(printf '%s\n' "$body" | python3 -c '
+import sys
+body = sys.stdin.read()
+root = sys.argv[1]
+body = body.replace("/Library", root + "/Library")
+body = body.replace("/Users/Shared", root + "/Shared")
+body = body.replace("/private/var/db/receipts", root + "/receipts")
+sys.stdout.write(body)
+' "$system_root")
+eval "$body"
+find_app_receipt_files() { return 0; }
+mkdir -p "$system_root/Library/Application Support/Zed Nightly" \
+    "$system_root/Library/Application Support/dev.zed.Zed-Nightly" \
+    "$system_root/Library/Application Support/TestStudio" \
+    "$system_root/Library/LaunchAgents" "$system_root/Library/PrivilegedHelperTools"
+printf shared > "$system_root/Library/LaunchAgents/com.shared.Zed Nightly.plist"
+printf owned > "$system_root/Library/LaunchAgents/dev.zed.Zed-Nightly.plist"
+printf shared > "$system_root/Library/PrivilegedHelperTools/Zed Nightly-helper"
+result=$(find_app_system_files dev.zed.Zed-Nightly 'Zed Nightly')
+[[ "$result" == *"Application Support/dev.zed.Zed-Nightly"* ]] || { printf 'EXACT_SUPPORT_MISSING:%s\n' "$result"; exit 1; }
+[[ "$result" == *"LaunchAgents/dev.zed.Zed-Nightly.plist"* ]] || { printf 'EXACT_AGENT_MISSING:%s\n' "$result"; exit 1; }
+[[ "$result" != *"Zed Nightly"* ]] || { printf 'NAME_PATH_COLLECTED:%s\n' "$result"; exit 1; }
+control=$(find_app_system_files com.example.TestStudio TestStudio)
+[[ "$control" == *"Application Support/TestStudio"* ]] || exit 1
+printf 'EXACT_CHANNEL_PRESENT; ALL_NAME_PATHS_EXCLUDED; NON_ZED_CONTROL_PRESENT\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == *"EXACT_CHANNEL_PRESENT; ALL_NAME_PATHS_EXCLUDED; NON_ZED_CONTROL_PRESENT"* ]]
 }
 
 @test "find_app_files detects multiple naming variants simultaneously" {
@@ -300,16 +358,16 @@ find_app_files 'invalid_bundle' ''"
     [[ "$result" != *".config/codex"* ]]
 }
 
-@test "find_app_files still removes Zed XDG state (independent-CLI list must not over-protect)" {
+@test "find_app_files preserves channel-shared Zed XDG state" {
     # Sanity check that the deny-list does not break legitimate GUI-app XDG
-    # cleanup added for #377. Zed is a GUI app that owns ~/.config/zed and
-    # ~/.local/share/zed and must still be picked up on uninstall.
+    # Channels share these roots, so a single channel's removal is not
+    # ownership evidence for their settings and databases.
     mkdir -p "$HOME/.config/zed"
     mkdir -p "$HOME/.local/share/zed"
 
     result=$(find_app_files "dev.zed.Zed-Nightly" "Zed Nightly")
 
-    [[ "$result" == *".config/zed"* ]] || [[ "$result" == *".local/share/zed"* ]]
+    [[ "$result" != *".config/zed"* && "$result" != *".local/share/zed"* ]]
 }
 
 @test "find_app_files keeps Raycast v2 data when uninstalling Raycast v1 (#1202)" {

@@ -25,6 +25,10 @@ var (
 	powerCacheTTL   = 30 * time.Second
 )
 
+const batteryCommandTimeout = time.Second
+
+var errNoBatteryData = errors.New("no battery data found")
+
 func collectBatteries() (batts []BatteryStatus, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -35,12 +39,16 @@ func collectBatteries() (batts []BatteryStatus, err error) {
 
 	// macOS: pmset for real-time percentage/status.
 	if runtime.GOOS == "darwin" && commandExists("pmset") {
-		if out, err := runCmd(context.Background(), "pmset", "-g", "batt"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), batteryCommandTimeout)
+		defer cancel()
+		if out, err := runCmd(ctx, "pmset", "-g", "batt"); err == nil {
 			// Health/cycles/capacity from AppleSmartBattery and cached system_profiler.
 			health, cycles, capacity := getCachedPowerData()
 			if batts := parsePMSet(out, health, cycles, capacity); len(batts) > 0 {
 				return batts, nil
 			}
+		} else {
+			return nil, err
 		}
 	}
 
@@ -68,7 +76,7 @@ func collectBatteries() (batts []BatteryStatus, err error) {
 		return batts, nil
 	}
 
-	return nil, errors.New("no battery data found")
+	return nil, errNoBatteryData
 }
 
 func parsePMSet(raw string, health string, cycles int, capacity int) []BatteryStatus {

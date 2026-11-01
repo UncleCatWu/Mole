@@ -386,7 +386,7 @@ clean_editor_obsolete_extensions() {
             safe_clean "$target" "Obsolete $editor_label extension"
         done < <(plutil -convert xml1 -o - "$obsolete_file" 2> /dev/null |
             plutil -p - 2> /dev/null |
-            sed -nE 's/^[[:space:]]*"([^"]+)"[[:space:]]*=>.*/\1/p')
+            sed -nE 's/^[[:space:]]*"([^"]+)"[[:space:]]*=>[[:space:]]*true[[:space:]]*$/\1/p')
     done
 }
 # Code editors.
@@ -498,6 +498,83 @@ clean_feishu_service_worker_caches() {
         if [[ $guarded_rc -eq 75 ]]; then
             mole_report_guard_stop "Feishu/Lark Service Worker" \
                 mole_defer_cleanup_family "Feishu/Lark"
+            return 0
+        fi
+        [[ $guarded_rc -eq 0 ]] || return "$guarded_rc"
+    done
+}
+# Notion's desktop app renders the workspace in an Electron partition
+# (`Partitions/<name>/`), and the web app it loads there is a service worker
+# app: every workspace, page bundle, and asset version it precaches lands in
+# that partition's CacheStorage and is never evicted, so it grows without
+# bound. The partition sits under Application Support, which no browser
+# cleaner walks, and `~/Library/Caches/notion.id` above reaches none of it.
+#
+# Value is the reporter's, not measured here: 5+ GB on their machine (#1587),
+# with no Notion install on hand to confirm the reclaim or to check that login
+# and workspace load survive it. The partition layout itself was verified
+# against the Electron apps present locally, which all place
+# `Partitions/<name>/Service Worker/CacheStorage` exactly here.
+#
+# Same contract as Feishu/Lark: the shared Service Worker cleaner, CacheStorage
+# only and never the sibling ScriptCache (#785 #964 #968) or Database, both
+# roots refused when reached through a symlink, and the process guard rechecked
+# at every sink. Pages live on Notion's servers and auth lives in Cookies /
+# Local Storage, neither of which this path touches; a cleared bundle is
+# re-precached on next open.
+notion_running() {
+    mole_pgrep_any \
+        -x "Notion" \
+        -f '/Notion[.]app/'
+}
+
+_notion_service_worker_delete_guard_allows() {
+    mole_clean_process_guard notion_running "Notion started"
+}
+
+clean_notion_service_worker_caches() {
+    local partitions_root="$HOME/Library/Application Support/Notion/Partitions"
+    [[ -d "$partitions_root" ]] || return 0
+    local physical_root
+    physical_root=$(cd -P "$partitions_root" 2> /dev/null && pwd -P) || return 0
+    if [[ "$physical_root" != "$partitions_root" ]]; then
+        debug_log "Refusing symlinked Notion partitions root: $partitions_root -> $physical_root"
+        return 0
+    fi
+
+    local -a cache_paths=()
+    local _partition cache_path physical_cache
+    for _partition in "$partitions_root"/*; do
+        [[ -d "$_partition" ]] || continue
+        cache_path="${_partition%/}/Service Worker/CacheStorage"
+        [[ -d "$cache_path" ]] || continue
+        physical_cache=$(cd -P "$cache_path" 2> /dev/null && pwd -P) || continue
+        if [[ "$physical_cache" != "$cache_path" ]]; then
+            debug_log "Refusing symlinked Notion Service Worker cache: $cache_path -> $physical_cache"
+            continue
+        fi
+        cache_paths+=("$cache_path")
+    done
+    [[ ${#cache_paths[@]} -gt 0 ]] || return 0
+
+    local _MOLE_CLEAN_GUARD_REASON=""
+    if ! _notion_service_worker_delete_guard_allows; then
+        mole_report_guard_stop "Notion Service Worker" \
+            mole_defer_cleanup_family "Notion"
+        return 0
+    fi
+
+    local cleanup_deadline=$((SECONDS + MOLE_TIMEOUT_DISK_VERIFY_SEC))
+    local cache_index guarded_rc=0
+    for ((cache_index = 0; cache_index < ${#cache_paths[@]}; cache_index++)); do
+        cache_path="${cache_paths[$cache_index]}"
+        guarded_rc=0
+        clean_service_worker_cache "Notion" "$cache_path" \
+            _notion_service_worker_delete_guard_allows \
+            "$cleanup_deadline" || guarded_rc=$?
+        if [[ $guarded_rc -eq 75 ]]; then
+            mole_report_guard_stop "Notion Service Worker" \
+                mole_defer_cleanup_family "Notion"
             return 0
         fi
         [[ $guarded_rc -eq 0 ]] || return "$guarded_rc"
@@ -736,6 +813,7 @@ clean_communication_apps() {
     safe_clean ~/Library/Caches/com.tencent.qq/* "QQ cache"
     safe_clean ~/Library/Caches/com.feishu.*/* "Feishu cache"
     clean_feishu_service_worker_caches
+    # Notion partitions remain review-only until local reclaim and recovery are verified.
     if [[ -d ~/Library/Application\ Support/Microsoft/Teams ]]; then
         safe_clean ~/Library/Application\ Support/Microsoft/Teams/Cache/* "Microsoft Teams legacy cache"
         safe_clean ~/Library/Application\ Support/Microsoft/Teams/Application\ Cache/* "Microsoft Teams legacy application cache"

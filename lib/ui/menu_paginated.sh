@@ -3,6 +3,9 @@
 
 set -euo pipefail
 
+# shellcheck source=lib/ui/menu_traps.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/menu_traps.sh"
+
 # Terminal control functions
 enter_alt_screen() {
     if command -v tput > /dev/null 2>&1 && [[ -t 1 ]]; then
@@ -247,15 +250,10 @@ paginated_multi_select() {
     # are gone. Degrading to `trap -` then is harmless (the caller's trap was
     # already restored on the normal-exit path below).
     # shellcheck disable=SC2329
-    _menu_restore_traps() {
-        if [[ -n "${_menu_saved_exit:-}" ]]; then eval "${_menu_saved_exit}"; else trap - EXIT; fi
-        if [[ -n "${_menu_saved_int:-}" ]]; then eval "${_menu_saved_int}"; else trap - INT; fi
-        if [[ -n "${_menu_saved_term:-}" ]]; then eval "${_menu_saved_term}"; else trap - TERM; fi
-    }
 
     # Cleanup function
     _pm_cleanup() {
-        _menu_restore_traps
+        mole_menu_restore_traps "${_menu_saved_exit:-}" "${_menu_saved_int:-}" "${_menu_saved_term:-}"
         unset MOLE_READ_KEY_FORCE_CHAR
         export MOLE_MENU_SORT_MODE="${sort_mode:-name}"
         export MOLE_MENU_SORT_REVERSE="${sort_reverse:-false}"
@@ -988,7 +986,7 @@ paginated_multi_select() {
                     final_result="${selected_indices[*]}"
                 fi
 
-                _menu_restore_traps
+                mole_menu_restore_traps "${_menu_saved_exit:-}" "${_menu_saved_int:-}" "${_menu_saved_term:-}"
                 MOLE_SELECTION_RESULT="$final_result"
                 unset MOLE_READ_KEY_FORCE_CHAR
                 export MOLE_MENU_SORT_MODE="${sort_mode:-name}"

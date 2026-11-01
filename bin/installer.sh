@@ -4,6 +4,13 @@
 
 set -euo pipefail
 
+# User state and installed tools must never run with inherited root privileges.
+# Individual maintenance operations request administrator access themselves.
+if [[ "$EUID" -eq 0 ]]; then
+    printf '%s\n' 'Run Mole without sudo; it requests administrator access when needed.' >&2
+    exit 1
+fi
+
 # shellcheck disable=SC2154
 # External variables set by menu_paginated.sh and environment
 declare MOLE_SELECTION_RESULT
@@ -64,14 +71,16 @@ is_installer_zip() {
 
     [[ ${#ZIP_LIST_CMD[@]} -gt 0 ]] || return 1
 
-    if ! "${ZIP_LIST_CMD[@]}" "$zip" 2> /dev/null |
-        head -n "$cap" |
-        awk '
-            /\.(app|pkg|dmg|xip)(\/|$)/ { found=1; exit 0 }
-            END { exit found ? 0 : 1 }
-        '; then
-        return 1
-    fi
+    # Drain the complete bounded listing. Early head/awk exits send SIGPIPE to
+    # a healthy large producer and can turn an installer into a false miss.
+    local listing="" listing_rc=0
+    listing=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        "${ZIP_LIST_CMD[@]}" "$zip" 2> /dev/null) || listing_rc=$?
+    [[ $listing_rc -eq 0 ]] || return "$listing_rc"
+    awk -v cap="$cap" '
+        NR <= cap && /\.(app|pkg|dmg|xip)(\/|$)/ { found=1 }
+        END { exit found ? 0 : 1 }
+    ' <<< "$listing" || return 1
 
     return 0
 }
@@ -608,8 +617,12 @@ execute_installer_delete_plan() {
             continue
         fi
 
-        local current_size
-        if ! current_size=$(installer_file_size_bytes "$file_path"); then
+        local current_size size_rc=0
+        current_size=$(installer_file_size_bytes "$file_path") || size_rc=$?
+        if [[ $size_rc -eq 124 || $size_rc -ge 128 ]]; then
+            record_installer_delete_failure "$file_path" "size cancelled (status $size_rc)"
+            return "$size_rc"
+        elif [[ $size_rc -ne 0 ]]; then
             record_installer_delete_failure "$file_path" "size unavailable"
             continue
         fi
@@ -618,7 +631,12 @@ execute_installer_delete_plan() {
             continue
         fi
 
-        if mole_delete "$file_path" false; then
+        local delete_rc=0
+        mole_delete "$file_path" false || delete_rc=$?
+        if [[ $delete_rc -eq 124 || $delete_rc -ge 128 ]]; then
+            record_installer_delete_failure "$file_path" "cancelled (status $delete_rc)"
+            return "$delete_rc"
+        elif [[ $delete_rc -eq 0 ]]; then
             if [[ "${MOLE_DRY_RUN:-0}" == "1" ]] || [[ ! -e "$file_path" && ! -L "$file_path" ]]; then
                 total_size_freed_kb=$((total_size_freed_kb + ((current_size + 1023) / 1024)))
                 total_deleted=$((total_deleted + 1))

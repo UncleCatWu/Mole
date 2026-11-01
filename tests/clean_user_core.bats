@@ -14,6 +14,15 @@ setup_file() {
     MOLE_TEST_MODE=1
     export MOLE_TEST_MODE
 
+    # clean_browsers reaches the Chrome, Edge, and Brave old-version cleaners,
+    # which default to the real /Applications bundles. Cases that stub pgrep as
+    # "not running" would otherwise delete a staged browser version on the Mac
+    # running the suite, including the one a live browser is still using.
+    MOLE_CHROME_APP_PATHS="$HOME/Applications/Google Chrome.app"
+    MOLE_EDGE_APP_PATHS="$HOME/Applications/Microsoft Edge.app"
+    MOLE_BRAVE_APP_PATHS="$HOME/Applications/Brave Browser.app"
+    export MOLE_CHROME_APP_PATHS MOLE_EDGE_APP_PATHS MOLE_BRAVE_APP_PATHS
+
     mkdir -p "$HOME"
 }
 
@@ -24,6 +33,27 @@ teardown_file() {
     if [[ -n "${ORIGINAL_HOME:-}" ]]; then
         export HOME="$ORIGINAL_HOME"
     fi
+}
+
+@test "browser old-version cleaners stay inside the fixture HOME" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+_clean_chromium_old_versions() {
+    shift 3
+    printf 'APP:%s\n' "$@"
+}
+clean_chrome_old_versions
+clean_edge_old_versions
+clean_brave_old_versions
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"APP:$HOME/Applications/Google Chrome.app"* ]] || return 1
+    [[ "$output" == *"APP:$HOME/Applications/Microsoft Edge.app"* ]] || return 1
+    [[ "$output" == *"APP:$HOME/Applications/Brave Browser.app"* ]] || return 1
+    [[ "$output" != *"APP:/Applications/"* ]]
 }
 
 @test "clean_user_essentials respects Trash whitelist" {
@@ -66,7 +96,7 @@ EOF
     mkdir -p "$(dirname "$partial")"
     printf 'partial\n' > "$partial"
 
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -97,7 +127,7 @@ EOF
     printf 'partial\n' > "$partial"
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" partial="$partial" \
-        /bin/bash --noprofile --norc <<'EOF'
+        /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/bin/clean.sh"
@@ -182,7 +212,7 @@ EOF
         "$test_home/Library/Caches/deno/origin-data" \
         "$test_home/Library/Caches/ordinary-app/junk"
 
-    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -223,7 +253,10 @@ clean_user_essentials
 [[ ! -e "$HOME/Library/Caches/ordinary-app" ]]
 EOF
 
-    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
     [[ "$output" != *"User app cache|$test_home/Library/Caches/deno"* ]] || return 1
     [[ "$output" == *"User app cache|$test_home/Library/Caches/ordinary-app"* ]] || return 1
     rm -rf "$test_home"
@@ -242,7 +275,7 @@ EOF
 
     run env HOME="$nested_home" PROJECT_ROOT="$PROJECT_ROOT" \
         DENO_DIR="$nested_home/Library/Caches/tool-root/deno" \
-        /bin/bash --noprofile --norc <<'EOF'
+        /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -278,10 +311,13 @@ clean_user_essentials
 [[ -d "$HOME/Library/Caches/tool-root/deno/origin-data" ]] || exit 1
 [[ ! -e "$HOME/Library/Caches/ordinary-app" ]]
 EOF
-    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
 
     run env HOME="$linked_home" PROJECT_ROOT="$PROJECT_ROOT" \
-        /bin/bash --noprofile --norc <<'EOF'
+        /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -318,7 +354,10 @@ clean_user_essentials
 [[ -d "$HOME/Library/Caches/physical-deno/origin-data" ]] || exit 1
 [[ ! -e "$HOME/Library/Caches/ordinary-app" ]]
 EOF
-    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
     rm -rf "$nested_home" "$linked_home"
 }
 
@@ -328,7 +367,7 @@ EOF
 
     run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" \
         DENO_DIR="$test_home/Library/Caches" \
-        /bin/bash --noprofile --norc <<'EOF'
+        /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -358,7 +397,10 @@ safe_clean_guarded() {
 clean_user_essentials
 EOF
 
-    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
     [[ "$output" != *"CLEAN=User app cache"* ]] || return 1
     [[ "$output" == *"CLEAN=User app logs"* ]] || return 1
     # Refusing silently would drop the whole category from the section with no
@@ -385,7 +427,7 @@ EOF
     ln -s "$test_home/Library/Caches/deno-old" "$test_home/Library/Caches/deno"
 
     run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
-        /bin/bash --noprofile --norc <<'EOF'
+        /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/bin/clean.sh"
 DRY_RUN=false
@@ -410,7 +452,10 @@ safe_remove() {
 clean_user_essentials
 EOF
 
-    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
     [[ -d "$test_home/Library/Caches/ordinary-app" ]] || {
         echo "sink deleted the retargeted Deno root"
         return 1
@@ -441,7 +486,7 @@ EOF
     printf '%s\n' "$test_home/.cache/keep-my-own-thing/*" > "$test_home/.config/mole/whitelist"
 
     run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" \
-        /bin/bash --noprofile --norc <<'EOF'
+        /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 load_mole_whitelist "$HOME"
@@ -460,7 +505,10 @@ done
 is_path_whitelisted "$HOME/.cache/keep-my-own-thing/x" && printf 'CUSTOM_KEPT\n'
 EOF
 
-    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
     [[ "$output" != *"EXPOSED="* ]] || {
         echo "$output"
         return 1
@@ -576,7 +624,7 @@ clean_trash
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Trash · removed 1 items, 1 skipped"* ]] || return 1
+    [[ "$output" == *"Trash · removed 1 items, 1 could not be removed"* ]] || return 1
     [[ -e "$HOME/.Trash/two.tmp" ]]
     [[ ! -e "$HOME/.Trash/one.tmp" ]]
 }
@@ -936,6 +984,7 @@ source "$PROJECT_ROOT/lib/clean/user.sh"
 start_section_spinner() { :; }
 stop_section_spinner() { :; }
 note_activity() { :; }
+record_dry_run_cleanup_target() { return 0; }
 safe_remove() { :; }
 update_progress_if_needed() { return 1; }
 should_protect_data() { return 1; }
@@ -957,11 +1006,11 @@ EOF
     local total_kb
     total_kb=$(printf '%s\n' "$output" | sed -n 's/.*TOTAL_KB=\([0-9][0-9]*\).*/\1/p' | tail -1)
     [[ -n "$total_kb" ]] || return 1
-	[[ "$total_kb" -ge 2 ]]
+    [[ "$total_kb" -ge 2 ]]
 }
 
 @test "clean_application_support_logs reuses exact item sizes at removal" {
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc <<'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -972,7 +1021,12 @@ update_progress_if_needed() { return 1; }
 should_protect_data() { return 1; }
 is_critical_system_component() { return 1; }
 app_support_item_size_bytes() { printf '2048\n'; }
-safe_remove() { printf 'REMOVE=%s SILENT=%s SIZE=%s\n' "$1" "$2" "${3:-missing}" >> "$HOME/remove-calls"; }
+safe_remove() {
+    printf 'REMOVE=%s SILENT=%s SIZE=%s\n' "$1" "$2" "${3:-missing}" >> "$HOME/remove-calls"
+    command rm -rf -- "$1" # SAFE: exact private fixture target simulating successful safe_remove
+    [[ ! -e "$1" && ! -L "$1" ]] || return 1
+    _MOLE_SAFE_REMOVE_OUTCOME=removed
+}
 files_cleaned=0
 total_size_cleaned=0
 total_items=0
@@ -990,9 +1044,9 @@ command rm -rf "$HOME/Library/Application Support/TestApp" \
     "$HOME/remove-calls"
 EOF
 
-	[ "$status" -eq 0 ] || return 1
-	[[ "$output" == *"REMOVE=$HOME/Library/Application Support/TestApp/Code Cache/nested SILENT=true SIZE=2"* ]] || return 1
-	[[ "$output" == *"REMOVE=$HOME/Library/Group Containers/group.com.apple.contentdelivery/Logs/event.log SILENT=true SIZE=2"* ]] || return 1
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"REMOVE=$HOME/Library/Application Support/TestApp/Code Cache/nested SILENT=true SIZE=2"* ]] || return 1
+    [[ "$output" == *"REMOVE=$HOME/Library/Group Containers/group.com.apple.contentdelivery/Logs/event.log SILENT=true SIZE=2"* ]] || return 1
 }
 
 @test "clean_application_support_logs uses bulk clean for large Application Support directories" {
@@ -1005,6 +1059,7 @@ source "$PROJECT_ROOT/lib/clean/user.sh"
 start_section_spinner() { echo "SPIN:$1"; }
 stop_section_spinner() { :; }
 note_activity() { :; }
+record_dry_run_cleanup_target() { return 0; }
 safe_remove() { echo "REMOVE:$1"; }
 update_progress_if_needed() { return 1; }
 should_protect_data() { return 1; }
@@ -1191,11 +1246,11 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"Group Containers logs/caches"* ]] || return 1
-	[[ "$output" == *"PASS"* ]]
+    [[ "$output" == *"PASS"* ]]
 }
 
 @test "clean_group_container_caches reuses exact item sizes at removal" {
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc <<'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -1217,15 +1272,15 @@ printf 'cache\n' > "$item"
 clean_group_container_caches
 EOF
 
-	[ "$status" -eq 0 ] || return 1
-	[[ "$output" == *"REMOVE=$HOME/Library/Group Containers/group.com.example.tool/Library/Caches/cache.db SILENT=true SIZE=77"* ]] || return 1
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"REMOVE=$HOME/Library/Group Containers/group.com.example.tool/Library/Caches/cache.db SILENT=true SIZE=77"* ]] || return 1
 }
 
 @test "clean_group_container_caches dry run omits a live nested non-SQLite cache (#1471)" {
     local live_target="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/ComputerUse"
     local idle_target="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/IdleCache"
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true \
-        live_target="$live_target" idle_target="$idle_target" /bin/bash --noprofile --norc <<'EOF'
+        live_target="$live_target" idle_target="$idle_target" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -1278,7 +1333,7 @@ EOF
     local model_parent="$model_home/Library/Group Containers/TEAM.com.example.shared/Library/Caches/Vision"
     local idle_target="$model_home/Library/Group Containers/TEAM.com.example.shared/Library/Caches/ZIdle"
     run env HOME="$model_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 \
-        model_parent="$model_parent" idle_target="$idle_target" /bin/bash --noprofile --norc <<'EOF'
+        model_parent="$model_parent" idle_target="$idle_target" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/bin/clean.sh"
 start_section_spinner() { :; }
@@ -1333,7 +1388,7 @@ EOF
 }
 
 @test "explicit App Container cleanup families expose one cumulative probe deadline (#1471)" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
@@ -1380,7 +1435,7 @@ EOF
 
 @test "process_container_cache counts only items safe_remove actually removed (#1471)" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
-        /bin/bash --noprofile --norc <<'EOF'
+        /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -1415,7 +1470,7 @@ EOF
     local refused_home
     refused_home=$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-refused-group.XXXXXX")
     run env HOME="$refused_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
-        /bin/bash --noprofile --norc <<'EOF'
+        /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -1741,11 +1796,20 @@ EOF
 }
 
 @test "clean_browsers calls expected cache paths" {
+    mkdir -p "$HOME/Library/Caches/Firefox" \
+        "$HOME/Library/Application Support/Firefox/Profiles/default/cache2"
+    touch "$HOME/Library/Caches/Firefox/candidate" \
+        "$HOME/Library/Application Support/Firefox/Profiles/default/cache2/candidate"
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
+pgrep() { return 1; }
 safe_clean() { echo "$2"; }
+clean_chrome_old_versions() { echo "OLD_VERSION_MOCK:Chrome"; }
+clean_edge_old_versions() { echo "OLD_VERSION_MOCK:Edge"; }
+clean_edge_updater_old_versions() { echo "OLD_VERSION_MOCK:EdgeUpdater"; }
+clean_brave_old_versions() { echo "OLD_VERSION_MOCK:Brave"; }
 clean_service_worker_cache() { :; }
 note_activity() { :; }
 files_cleaned=0
@@ -1757,7 +1821,8 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"Safari cache"* ]] || return 1
     [[ "$output" == *"Firefox cache"* ]] || return 1
-    [[ "$output" == *"Puppeteer browser cache"* ]]
+    [[ "$output" == *"Puppeteer browser cache"* ]] || return 1
+    [[ "$output" == *"OLD_VERSION_MOCK:Chrome"* ]]
 }
 
 @test "clean_browsers never enters Firefox cleanup while Firefox is running" {
@@ -1772,6 +1837,12 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
 pgrep() { [[ "$*" == "-x Firefox" ]]; }
 safe_clean() { echo "SAFE_CLEAN:${!#}"; }
+# This case tests Firefox dispatch only. The old-version paths include real
+# /Applications bundles and use safe_remove directly, bypassing safe_clean.
+clean_chrome_old_versions() { echo "OLD_VERSION_MOCK:Chrome"; }
+clean_edge_old_versions() { echo "OLD_VERSION_MOCK:Edge"; }
+clean_edge_updater_old_versions() { echo "OLD_VERSION_MOCK:EdgeUpdater"; }
+clean_brave_old_versions() { echo "OLD_VERSION_MOCK:Brave"; }
 clean_service_worker_cache() { :; }
 note_activity() { :; }
 clean_browsers
@@ -1782,7 +1853,11 @@ EOF
         return 1
     }
     [[ "$output" != *"SAFE_CLEAN:Firefox cache"* ]] || return 1
-    [[ "$output" != *"SAFE_CLEAN:Firefox profile cache"* ]]
+    [[ "$output" != *"SAFE_CLEAN:Firefox profile cache"* ]] || return 1
+    [[ "$output" == *"OLD_VERSION_MOCK:Chrome"* ]] || return 1
+    [[ "$output" == *"OLD_VERSION_MOCK:Edge"* ]] || return 1
+    [[ "$output" == *"OLD_VERSION_MOCK:EdgeUpdater"* ]] || return 1
+    [[ "$output" == *"OLD_VERSION_MOCK:Brave"* ]]
 }
 
 @test "clean_browsers fails closed when the Chrome process probe errors" {
@@ -2331,8 +2406,9 @@ EOF
 }
 
 # Regression for discussion #583: the only Dia row used to be
-# ~/Library/Caches/company.thebrowser.dia, which on a real install holds nothing
-# but Sentry crash state. The actual Chromium caches live under
+# ~/Library/Caches/company.thebrowser.dia, where that measurement found Sentry
+# state, not Chromium caches; the directory can also contain Sparkle updates.
+# The actual Chromium caches live under
 # ~/Library/Caches/Dia/User Data and ~/Library/Application Support/Dia/User Data,
 # so `mo clean` reclaimed 0 bytes from Dia. Paths below were measured on Dia
 # 1.41.1 (bundle company.thebrowser.dia), not inferred from Chromium convention.
@@ -2527,6 +2603,100 @@ EOF
     }
 }
 
+@test "large files skip a timed-out Mail size check and keep later rows (#1576)" {
+    local review_home="$HOME/large-review-mail-timeout"
+    mkdir -p \
+        "$review_home/Library/Mail" \
+        "$review_home/Library/Developer/Xcode/DerivedData"
+
+    run env HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+docker() { return 1; }
+defaults() { return 1; }
+du() { printf '2097152 %s\n' "${2:-/tmp}"; }
+# Cover both the current get_path_size_kb Mail rows and the review-dir
+# helper that sizes through run_with_timeout + du.
+get_path_size_kb() {
+    [[ "$1" == "$HOME/Library/Mail" ]] && return 124
+    printf '2097152\n'
+}
+run_with_timeout() {
+    shift
+    [[ "${!#}" == "$HOME/Library/Mail" ]] && return 124
+    "$@"
+}
+check_large_file_candidates
+echo AFTER_LARGE_FILES
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"AFTER_LARGE_FILES"* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"Mail data"* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"Xcode DerivedData"* ]] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "large files still cancel when Mail sizing is interrupted (#1576)" {
+    local review_home="$HOME/large-review-mail-signal"
+    mkdir -p \
+        "$review_home/Library/Mail" \
+        "$review_home/Library/Developer/Xcode/DerivedData"
+
+    run env HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -uo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+docker() { return 1; }
+defaults() { return 1; }
+du() { printf '2097152 %s\n' "${2:-/tmp}"; }
+get_path_size_kb() {
+    [[ "$1" == "$HOME/Library/Mail" ]] && return 130
+    printf '2097152\n'
+}
+run_with_timeout() {
+    shift
+    [[ "${!#}" == "$HOME/Library/Mail" ]] && return 130
+    "$@"
+}
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+check_large_file_candidates
+echo AFTER_LARGE_FILES
+EOF
+
+    [ "$status" -eq 130 ] || {
+        echo "status=$status $output"
+        return 1
+    }
+    [[ "$output" != *"AFTER_LARGE_FILES"* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"Xcode DerivedData"* ]] || {
+        echo "$output"
+        return 1
+    }
+}
+
 @test "external volume cleanup discards a partial metadata scan before deletion" {
     local test_home="$HOME/external-partial-scan"
     local volume="$test_home/External"
@@ -2536,7 +2706,7 @@ EOF
 
     run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" \
         VOLUME="$volume" METADATA_FILE="$metadata_file" \
-        /bin/bash --noprofile --norc <<'EOF'
+        /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -2563,6 +2733,7 @@ mktemp_file() {
     printf '%s\n' "$HOME/external-scan.list"
 }
 run_with_timeout() {
+    printf '%s\n' "$*" > "$HOME/find.trace"
     printf '%s\0' "$METADATA_FILE"
     if [[ "$probe_mode" == complete ]]; then
         return 0
@@ -2603,6 +2774,9 @@ MOLE_CLEAN_CANCEL_STATUS=0
 clean_external_volume_target "$VOLUME" > "$HOME/complete.output" 2>&1
 grep -Fq "REMOVE:$METADATA_FILE" "$HOME/remove.trace" || exit 1
 [[ "$files_cleaned" -eq 1 ]] || exit 1
+grep -Fq "$VOLUME/.TemporaryItems" "$HOME/find.trace" || exit 1
+grep -Fq "$VOLUME/.Trashes" "$HOME/find.trace" || exit 1
+grep -Fq -- '-prune' "$HOME/find.trace" || exit 1
 EOF
 
     [ "$status" -eq 0 ] || {
@@ -2612,4 +2786,129 @@ EOF
     [[ "$output" == *"PARTIAL_RC=7 CANCEL=0 FILES=0"* ]] || return 1
     [[ "$output" == *"PARTIAL_RC=124 CANCEL=124 FILES=0"* ]] || return 1
     [[ "$output" == *"PARTIAL_RC=130 CANCEL=130 FILES=0"* ]] || return 1
+}
+
+@test "external volume cleanup refuses a replacement mounted during cleanup" {
+    local test_home="$HOME/external-volume-swap"
+    local volume="$test_home/External"
+    mkdir -p "$volume/.Trashes"
+    touch "$volume/.Trashes/cache.tmp"
+
+    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" VOLUME="$volume" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+
+DRY_RUN=false
+PROTECT_FINDER_METADATA=true
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+volume_generation=original
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+clean_ds_store_tree() { :; }
+should_protect_path() { return 1; }
+is_path_whitelisted() { return 1; }
+get_path_size_kb() { printf '1\n'; }
+mktemp_file() {
+    : > "$HOME/external-scan.list"
+    printf '%s\n' "$HOME/external-scan.list"
+}
+run_with_timeout() { return 0; }
+_mole_snapshot_path_identity() {
+    _MOLE_PATH_SNAPSHOT_PARENT="${1%/*}"
+    _MOLE_PATH_SNAPSHOT_PARENT_ID="1:1"
+    _MOLE_PATH_SNAPSHOT_TARGET_ID="2:2"
+}
+_mole_path_matches_identity() {
+    [[ "$1" != "$VOLUME" || "$volume_generation" == original ]]
+}
+safe_remove() {
+    volume_generation=swapped
+    local guard="${_MOLE_SAFE_REMOVE_FINAL_GUARD:-}"
+    [[ "$guard" == "_mole_external_volume_final_guard" ]] || exit 1
+    if "$guard" "$1"; then
+        printf 'REMOVE:%s\n' "$1" >> "$HOME/remove.trace"
+    fi
+    return 1
+}
+
+clean_external_volume_target "$VOLUME"
+[[ ! -e "$HOME/remove.trace" ]] || exit 1
+[[ "$files_cleaned" -eq 0 ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "external volume scan completes past root-owned metadata trees" {
+    local test_home="$HOME/external-owned-volume"
+    local volume="$test_home/External"
+    mkdir -p "$volume/.Spotlight-V100/Store-V2" "$volume/.fseventsd" \
+        "$volume/.DocumentRevisions-V100/staging" "$volume/Photos"
+    touch "$volume/Photos/._IMG_0001.jpg" "$volume/.Spotlight-V100/Store-V2/._index"
+    # Ownership-enabled volumes carry these as root-owned 700 directories.
+    chmod 000 "$volume/.Spotlight-V100/Store-V2" "$volume/.fseventsd" \
+        "$volume/.DocumentRevisions-V100/staging"
+
+    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" VOLUME="$volume" \
+        /bin/bash --noprofile --norc <<'EOF_INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+
+DRY_RUN=false
+PROTECT_FINDER_METADATA=true
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+clean_ds_store_tree() { :; }
+should_protect_path() { return 1; }
+is_path_whitelisted() { return 1; }
+get_path_size_kb() { printf '1\n'; }
+# The sink call discards stdout, so trace to a file.
+safe_remove() { printf 'REMOVE:%s\n' "$1" >> "$HOME/remove.trace"; return 0; }
+
+# Negative control: an unpruned walk over the same tree fails on EACCES.
+control_rc=0
+find -P "$VOLUME" -xdev -type f -name '._*' > /dev/null 2>&1 || control_rc=$?
+echo "CONTROL_FIND_RC=$control_rc"
+
+rc=0
+clean_external_volume_target "$VOLUME" || rc=$?
+echo "RC=$rc CANCEL=$MOLE_CLEAN_CANCEL_STATUS FILES=$files_cleaned"
+cat "$HOME/remove.trace"
+EOF_INNER
+    chmod 755 "$volume/.Spotlight-V100/Store-V2" "$volume/.fseventsd" \
+        "$volume/.DocumentRevisions-V100/staging"
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"CONTROL_FIND_RC=1"* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"RC=0 CANCEL=0 FILES=1"* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"REMOVE:$volume/Photos/._IMG_0001.jpg"* ]] || return 1
+    [[ "$output" != *"REMOVE:$volume/.Spotlight-V100"* ]]
 }
