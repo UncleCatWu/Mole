@@ -6416,10 +6416,27 @@ export MOLE_UNINSTALL_MODE=1 MOLE_DELETE_MODE=trash
 export MOLE_TEST_TRASH_DIR="$HOME/Trash" MOLE_TEST_NO_AUTH=1
 mkdir -p "$HOME/Applications/First.app" "$HOME/Applications/Second.app" "$HOME/Library/Caches/com.example.Shared"
 shared="$HOME/Library/Caches/com.example.Shared"
+shared_policy=$(_mole_normalize_deletion_policy_path "$shared")
 stop_launch_services() { :; }
 unregister_app_bundle() { :; }
-_mole_should_refuse_live_user_cache_path() { [[ "$1" == "$shared" && "$app_name" == First ]]; }
-_mole_is_critical_deletion_path() { [[ "$1" == "$shared" && "$app_name" == Second ]]; }
+_mole_should_refuse_live_user_cache_path() {
+    if [[ "$app_name" == First && ( "$1" == "$shared" || "$1" == "$shared_policy" || "$1" -ef "$shared" ) ]]; then
+        printf 'FIRST_LIVE_REFUSAL\n' > "$HOME/first-refusal.trace"
+        return 0
+    fi
+    return 1
+}
+# The disposable-temp allowlist precedes the critical-path helper in CI.
+# Inject this fixture's ordinary refusal at the shared validation entrypoint.
+eval "$(declare -f validate_path_for_deletion | /usr/bin/sed '1s/validate_path_for_deletion/_fixture_validate_deletion_path/')"
+validate_path_for_deletion() {
+    if [[ "${app_name:-}" == Second && ( "$1" == "$shared" || "$1" == "$shared_policy" || "$1" -ef "$shared" ) ]]; then
+        printf 'SECOND_VALIDATION_REFUSAL\n' > "$HOME/second-refusal.trace"
+        _MOLE_VALIDATION_REASON="protected"
+        return 1
+    fi
+    _fixture_validate_deletion_path "$@"
+}
 first="$HOME/Applications/First.app"
 second="$HOME/Applications/Second.app"
 encoded=$(printf '%s\n' "$shared" | base64 | tr -d '\n')
@@ -6444,6 +6461,7 @@ trap 'batch_exit=$?; printf "BATCH_EXIT=%s SUCCESS=%s FAILED=%s STAGE=%s\n" "$ba
 _batch_execute_removals
 [[ $success_count -eq 2 && $failed_count -eq 0 ]] || exit 1
 [[ ! -e "$first" && ! -e "$second" && -d "$shared" ]] || exit 1
+[[ -s "$HOME/first-refusal.trace" && -s "$HOME/second-refusal.trace" ]] || exit 1
 SCRIPT
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [[ "$output" == *"Kept (app may be active): ~/Library/Caches/com.example.Shared"* ]] || return 1

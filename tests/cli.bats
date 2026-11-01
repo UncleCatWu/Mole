@@ -860,12 +860,22 @@ EOF
 
 # --- JSON output mode tests ---
 
+create_analyze_json_fixture() {
+	local fixture="$BATS_TEST_TMPDIR/analyze-json"
+	mkdir -p "$fixture/nested"
+	printf 'top-level fixture\n' > "$fixture/sample.txt"
+	printf 'nested fixture\n' > "$fixture/nested/child.txt"
+	printf '%s\n' "$fixture"
+}
+
 @test "mo analyze --json outputs valid JSON with expected fields" {
 	if [[ ! -x "${ANALYZE_BIN:-}" ]]; then
 		skip "analyze binary not available (go not installed?)"
 	fi
 
-	run "$ANALYZE_BIN" --json /tmp
+	local analyze_dir
+	analyze_dir=$(create_analyze_json_fixture)
+	run "$ANALYZE_BIN" --json "$analyze_dir"
 	[ "$status" -eq 0 ]
 
 	# Validate it is parseable JSON
@@ -881,6 +891,8 @@ assert 'entries' in data, 'missing entries'
 assert 'total_size' in data, 'missing total_size'
 assert 'total_files' in data, 'missing total_files'
 assert isinstance(data['entries'], list), 'entries is not a list'
+assert data['total_files'] >= 1, 'fixture files were not counted'
+assert data['total_size'] > 0, 'nonempty fixture has no size'
 "
 }
 
@@ -889,13 +901,16 @@ assert isinstance(data['entries'], list), 'entries is not a list'
 		skip "analyze binary not available (go not installed?)"
 	fi
 
-	run "$ANALYZE_BIN" --json /tmp
+	local analyze_dir
+	analyze_dir=$(create_analyze_json_fixture)
+	run "$ANALYZE_BIN" --json "$analyze_dir"
 	[ "$status" -eq 0 ]
 
 	echo "$output" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 assert data['overview'] is False, 'explicit path should not be overview mode'
+assert {'sample.txt', 'nested'} <= {entry['name'] for entry in data['entries']}, 'fixture entries missing'
 for entry in data['entries']:
     assert 'name' in entry, 'entry missing name'
     assert 'path' in entry, 'entry missing path'
@@ -909,15 +924,18 @@ for entry in data['entries']:
 		skip "analyze binary not available (go not installed?)"
 	fi
 
-	run "$ANALYZE_BIN" --json /tmp
+	local analyze_dir
+	analyze_dir=$(create_analyze_json_fixture)
+	run "$ANALYZE_BIN" --json "$analyze_dir"
 	[ "$status" -eq 0 ]
 
 	echo "$output" | python3 -c "
 import sys, json
+from pathlib import Path
 data = json.load(sys.stdin)
-assert data['path'] == '/tmp' or data['path'] == '/private/tmp', \
+assert Path(data['path']).resolve() == Path(sys.argv[1]).resolve(), \
     f\"unexpected path: {data['path']}\"
-"
+" "$analyze_dir"
 }
 
 @test "mo status --json outputs valid JSON with expected fields" {
