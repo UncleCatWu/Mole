@@ -1,10 +1,12 @@
 #!/usr/bin/env bats
+
+load helpers/common
+
 # Orphaned simulator runtime detection: report a runtime no device uses,
 # stay silent on in-use runtimes, and never delete anything.
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_project_root
 }
 
 # $1 = `simctl runtime list -j` output, $2 = `simctl list devices -j` output

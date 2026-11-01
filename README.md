@@ -1,34 +1,35 @@
+<p align="right"><b>macOS</b> · <a href="https://github.com/tw93/Mole/tree/windows">Windows</a></p>
+
 <div align="center">
   <h1>Mole</h1>
-  <p><em>🐹 Clean, uninstall, analyze, optimize, and monitor your Mac. Free open-source CLI, plus a native Mac app.</em></p>
-</div>
-
-<p align="center">
+  <p><b>Deep clean, uninstall apps, optimize, analyze disk, and monitor your Mac. Free open-source CLI, plus a native Mac app.</b></p>
+  <p>English · <a href="README_CN.md">中文</a> · <a href="README_TW.md">繁體</a> · <a href="README_JA.md">日本語</a> · <a href="README_KR.md">한국어</a> · <a href="README_DE.md">Deutsch</a> · <a href="README_FR.md">Français</a> · <a href="README_UA.md">Українська</a> · <a href="README_RU.md">Русский</a></p>
   <a href="https://github.com/tw93/mole/stargazers"><img src="https://img.shields.io/github/stars/tw93/mole?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/tw93/mole/releases"><img src="https://img.shields.io/github/v/tag/tw93/mole?label=version&style=flat-square" alt="Version"></a>
+  <a href="https://github.com/tw93/mole/releases"><img src="https://img.shields.io/github/v/release/tw93/mole?label=version&style=flat-square" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL_v3-blue.svg?style=flat-square" alt="License"></a>
   <a href="https://github.com/tw93/mole/commits"><img src="https://img.shields.io/github/commit-activity/m/tw93/mole?style=flat-square" alt="Commits"></a>
   <a href="https://twitter.com/HiTw93"><img src="https://img.shields.io/badge/follow-Tw93-red?style=flat-square&logo=Twitter" alt="Twitter"></a>
   <a href="https://t.me/+9f9gf4ZrFSQ2OWVl"><img src="https://img.shields.io/badge/chat-Telegram-blueviolet?style=flat-square&logo=Telegram" alt="Telegram"></a>
-</p>
+</div>
 
 <p align="center">
   <img src="./docs/img/big-mole.png" alt="Mole cleanup results" width="1000" />
 </p>
 
-> 💡 This repo is the free open-source CLI (`mo`). Prefer a native app? [Mole for Mac](https://mole.fit/) is a separate download: cleanup, app management, maintenance, disk maps, and live status in one lightweight, VoiceOver-ready app. One license covers 2 Macs with lifetime updates and a 14-day refund. `brew install mole` installs the CLI only.
+> 💡 This repo is the free open-source CLI (`mo`). Prefer a native app? [Mole for Mac](https://mole.fit/) is a separate download with review-before-delete cleanup, tested leftovers for 800+ apps, maintenance, disk drill-downs, live status, and fan controls on supported Macs. On Windows, the native app is [Mole for Windows](https://mole.fit/windows). `brew install mole` installs the CLI only.
 
 ## Features
 
-- **All-in-one CLI toolkit**: Combines CleanMyMac, AppCleaner, DaisyDisk, and iStat Menus style workflows in a **single terminal binary**
-- **Deep cleaning**: Removes caches, logs, leftovers, and orphaned app data to **reclaim gigabytes of space**
-- **Smart uninstaller**: Removes apps plus launch agents, preferences, and **hidden remnants**
-- **Disk insights**: Visualizes usage, finds large files, **rebuilds caches**, and refreshes system services
-- **Live monitoring**: Shows real-time CPU, GPU, memory, disk, and network stats
+- **All-in-one CLI toolkit**: Combines CleanMyMac, AppCleaner, DaisyDisk, and iStat Menus style workflows in one terminal command
+- **Deep clean**: Removes caches, logs, leftovers, and orphaned app data to reclaim disk space
+- **Smart uninstaller**: Removes apps together with LaunchAgents, preferences, and leftovers
+- **Disk analyzer**: Visualizes disk usage with an interactive TUI, finds large files, and navigates directories
+- **System maintenance**: Flushes DNS, refreshes QuickLook/icons, and optimizes system databases
+- **Live monitoring**: Shows real-time CPU, memory, disk I/O, network traffic, and process stats
 
 ## Quick Start
 
-Mole requires macOS 12 or newer and supports both Intel and Apple Silicon Macs.
+Mole requires macOS 12 or newer and supports both Intel and Apple Silicon Macs. If Homebrew no longer supports your macOS version, use the script install instead.
 
 **Install via Homebrew**
 
@@ -36,15 +37,25 @@ Mole requires macOS 12 or newer and supports both Intel and Apple Silicon Macs.
 brew install mole
 ```
 
-If Homebrew no longer supports your macOS version, use the script below instead.
-
 **Or via script**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tw93/mole/main/install.sh | bash
 ```
 
-Mole is built for macOS. An experimental Windows version lives in the [windows branch](https://github.com/tw93/Mole/tree/windows).
+**With an AI agent**
+
+Tell your agent:
+
+> Install Mole for me by reading https://raw.githubusercontent.com/tw93/Mole/main/llms.txt
+
+Or install the skill yourself. With it, Claude Code, Codex, Cursor and other agents show every cleanup with `--dry-run` before anything is removed, and leave app uninstalls and administrator steps to you. Update with `npx skills update -g -y`.
+
+```bash
+npx skills add tw93/Mole -a claude-code codex cursor -g -y
+```
+
+As a host plugin: `/plugin marketplace add tw93/Mole` then `/plugin install mole@mole` in Claude Code, or `codex plugin marketplace add tw93/Mole` then `codex plugin add mole@mole` in Codex.
 
 **Run**
 
@@ -86,8 +97,6 @@ mo analyze /Volumes          # Analyze external drives only
 mo analyze /private/tmp      # Review user-owned temporary directories
 ```
 
-Selections made with `mo clean --whitelist` persist in `~/.config/mole/whitelist`.
-
 <details>
 <summary><strong>Other install options</strong></summary>
 
@@ -110,19 +119,38 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Add the same `PATH` export to `~/.zshrc` or your shell profile for new terminals. Mole updates the installation you invoked, so it keeps using this directory. Commands that change system-owned files may still request administrator access.
 
+**Nix**
+
+On macOS, Nix users can install the flake from `main`, which contains unreleased changes:
+
+```bash
+nix profile install github:tw93/mole/main#mole
+nix profile upgrade mole
+nix profile remove mole
+```
+
+For a declarative installation, add `github:tw93/mole/main` as a flake input and use its `packages.${system}.mole` package. Update or remove Mole through Nix; `mo update` and `mo remove` leave Nix-managed installations unchanged.
+
 </details>
 
-Prefer a walkthrough? Watch the [Mole tutorial video](https://www.youtube.com/watch?v=UEe9-w4CcQ0) by PAPAYA 電腦教室.
+**On Windows** ([Windows CLI](https://github.com/tw93/Mole/tree/windows))
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/tw93/Mole/windows/quick-install.ps1 | iex
+```
+
+Mole is only distributed through Homebrew, this repository and [mole.fit](https://mole.fit/). `molemac.com`, `moleapp.net` and `molefit.com` are not Mole, and the Windows app at `mole.bluecatbot.com` is a separate community project.
 
 ## Safety
 
 Mole can remove files, so it validates paths, protects shared and system-owned locations, and asks for confirmation when an action needs it. When Mole cannot prove an item is safe to change, it skips or refuses it.
 
-- `clean`, `uninstall`, `purge`, `installer`, and `remove` can delete files. Review them with `--dry-run` first, and add `--debug` when needed.
-- Run Mole without `sudo`; it requests administrator access only when needed.
-- `mo analyze` moves selected items to Trash after confirmation.
-- Cleanup activity is recorded in `~/Library/Logs/mole/operations.log`; review it with `mo history` or disable it with `MO_NO_OPLOG=1`.
-- Protect caches with `mo clean --whitelist`, or maintenance items with `mo optimize --whitelist`.
+- `clean`, `uninstall`, `purge`, `installer`, and `remove` can delete files, so review them with `--dry-run` first and add `--debug` when needed
+- Run Mole without `sudo`; it requests administrator access only when needed
+- `mo uninstall`, `mo analyze` route deletions to Trash by default after confirmation; `clean`, `purge`, and `installer` delete permanently. `mo uninstall --permanent` skips Trash
+- Cleanup activity is recorded in `~/Library/Logs/mole/operations.log`; review it with `mo history` or disable it with `MO_NO_OPLOG=1`
+- Protect caches with `mo clean --whitelist`, or maintenance items with `mo optimize --whitelist`
+- If the whitelist file cannot be read, `clean`, `purge`, and `optimize` stop instead of running without it
 
 Review [SECURITY.md](SECURITY.md) and [SECURITY_AUDIT.md](SECURITY_AUDIT.md) for reporting guidance, safety boundaries, and current limitations.
 
@@ -132,7 +160,7 @@ The examples below are shortened. Available items, sizes, and skip reasons depen
 
 ### Clean
 
-`mo clean` reviews known-safe caches, logs, temporary files, developer artifacts, and leftovers from apps that are no longer installed. Use `mo clean --dry-run` to preview eligible paths, and `mo clean --whitelist` to protect caches you want to keep.
+`mo clean` reviews known-safe caches, logs, temporary files, developer artifacts, and leftovers from apps that are no longer installed. It empties `~/.Trash` by default; to keep it, select Trash in `mo clean --whitelist`, the same menu that protects caches you want to keep. Volume Trashes such as `/Volumes/*/.Trashes` are not emptied with it. Selections persist in `~/.config/mole/whitelist`. Before adding custom paths, open the menu and press Enter to save the selections, then append one path per line. An existing file replaces the optional defaults; built-in safety protections still apply.
 
 ```text
 $ mo clean
@@ -159,14 +187,16 @@ Clean Your Mac
 
 ======================================================================
 Cleanup complete
-Tracked cleanup: 4.5GB | Items cleaned: 97 | Categories: 4
+Removed: 4.5GB · 97 items
 Free space: 223.5GB (+4.5GB)
 ======================================================================
 ```
 
 ### Uninstall
 
-`mo uninstall` removes an installed app together with related files that Mole can tie back to that app. It keeps shared data when another installed copy still uses it. Use `mo uninstall --dry-run` to review the plan. If the app is already gone, use `mo clean` to look for leftovers.
+`mo uninstall` removes an installed app together with related files that Mole can tie back to that app. It keeps shared data when another installed copy still uses it. If the app is already gone, use `mo clean` to look for leftovers.
+
+Personal data, including settings and plugins, is kept by default. Press `D` in the removal preview to select individual data paths. `mo uninstall --with-data` starts with that data selected, except browser profiles and App Group containers; the preview lists it separately and `D` still lets you keep any path. After removal, references in shell, Hook, or MCP configuration are listed by file and line only; Mole does not edit those configurations.
 
 ```text
 $ mo uninstall
@@ -179,20 +209,24 @@ Select Apps to Remove  1/3 selected
 
 Files to be removed:
 
-✓ Photoshop 2024, 12.80GB
+✓ Photoshop 2024, 4.20GB
   ✓ /Applications/Adobe Photoshop 2024/Adobe Photoshop 2024.app
-  ✓ ~/Library/Application Support/Adobe/Adobe Photoshop 2024
-  ✓ ~/Library/Preferences/com.adobe.Photoshop.plist
+
+Personal data kept:
+  ~/Library/Application Support/Adobe/Adobe Photoshop 2024
+  ~/Library/Preferences/com.adobe.Photoshop.plist
+
+D choose personal data
 
 ======================================================================
 Uninstall complete
-Removed 1 app, freed 12.80GB: Photoshop 2024
+Removed 1 app, freed 4.20GB: Photoshop 2024
 ======================================================================
 ```
 
 ### Optimize
 
-`mo optimize` runs bounded maintenance for supported Finder, network, database, and macOS services. Tasks that are unnecessary, unsafe at the moment, or unavailable are skipped with a reason. Use `mo optimize --dry-run` to preview the pass and `mo optimize --whitelist` to exclude tasks or path patterns.
+`mo optimize` runs bounded maintenance for supported Finder, network, database, and macOS services. Tasks that are unnecessary, unsafe at the moment, or unavailable are skipped with a reason. Use `mo optimize --whitelist` to exclude tasks or path patterns, such as a long-lived mounted disk image at `/Volumes/mail` that should not show up as a detach candidate.
 
 ```text
 $ mo optimize
@@ -204,32 +238,33 @@ Optimize
 PERFORMANCE DIAGNOSIS
   ✓ No sustained high-CPU bottleneck detected
 
-➤ DNS & Spotlight Check
-  → DNS cache flushed
-  → Spotlight index verified
-
 ➤ Finder Cache Refresh
-  → QuickLook thumbnails refreshed
-  → Icon services cache rebuilt
+  ✓ QuickLook thumbnails refreshed
+  ✓ Icon services cache rebuilt
+
+➤ Network Cache Refresh
+  ✓ DNS cache refreshed
 
 ➤ Database Optimization
   ◎ Close these apps before database optimization: Safari
 
 ➤ Disk Health
-  → Disk verify skipped (set MOLE_ENABLE_DISK_VERIFY=1 to enable)
+  ✓ Disk verify skipped
 
 ======================================================================
 Optimization Complete
-Applied 3 optimizations
-14 unchanged | 3 skipped | 1 unavailable
+Applied 2 optimizations
+13 unchanged | 3 skipped | 1 unavailable
 ======================================================================
 ```
 
-Path patterns work too, so you can keep a long-lived mounted disk image around, for example `/Volumes/mail`, without it showing up as a detach candidate.
-
 ### Analyze
 
-`mo analyze` opens a terminal disk explorer. It supports arrow keys and Vim navigation, filtering, multi-selection, Finder preview, and confirmed moves to Trash. External drives are skipped from the default overview; inspect them with `mo analyze /Volumes` or a specific mount path. Use `mo analyze /private/tmp` to review user-owned temporary files without turning them into automatic cleanup targets.
+`mo analyze` opens a terminal disk explorer. It supports arrow keys and Vim navigation, filtering, multi-selection, Finder preview, and confirmed moves to Trash. External drives are skipped from the default overview; inspect them with `mo analyze /Volumes` or a specific mount path. Use `mo analyze /private/tmp` to review user-owned temporary files without turning them into automatic cleanup targets. File-by-file scans count APFS clones that share all blocks once; fast folder estimates can still count shared blocks more than once.
+
+A size ending in `+` contains measured bytes from a partial scan; `unknown` means the size could not be measured. Results cut short by temporary failures such as timeouts do not replace complete cached measurements, and a later refresh can recover the missing data. Folders macOS will not let the terminal read stay partial until access changes. The terminal list keeps the 30 largest entries, so an unreadable entry may fall outside that list; the total still indicates a partial scan. Directory JSON output includes all scanned entries.
+
+`mo analyze --json /path` includes `scan_status` on the result and each entry: `complete`, `partial`, or `unavailable`. Numeric sizes contain measured bytes; a zero with `unavailable` does not mean an empty directory. Partial scans still exit successfully, so automation should inspect `scan_status`. Completeness applies within Mole's existing scan exclusions and does not promise an atomic filesystem snapshot.
 
 ```text
 $ mo analyze
@@ -247,6 +282,8 @@ Select a location to explore:
 ### Status
 
 `mo status` is a read-only dashboard for hardware, system pressure, disk activity, network traffic, power, and processes.
+
+When the IPv4 default route uses a tunnel, network graphs use that interface’s rates to avoid counting the same traffic again on its physical carrier. JSON retains per-interface rates, including the routed tunnel; idle non-default tunnels stay hidden.
 
 ```text
 $ mo status
@@ -271,16 +308,17 @@ Up      ▄▄▄▃▃▃▄▆▆▇█▁▁▁▁▁  0.02 MB/s      Code   
 Proxy   HTTP · 192.168.1.100             Chrome     ▮▮▮▯▯  28.3%
 ```
 
-The health score combines CPU, memory, disk capacity, SMART status, I/O, thermals, battery state, and uptime, with color-coded ranges. Press `k` to toggle the cat, `c` to cycle the number of CPU cores shown, or `q` to quit. Display preferences are saved.
+The health score combines CPU, memory, disk capacity, SMART status, I/O, thermals, battery state, and uptime, with color-coded ranges. Press `k` to toggle the cat, `c` to cycle the number of CPU cores shown, or `q` to quit; display preferences are saved.
 
 <details>
 <summary><strong>JSON, NDJSON, and process alerts</strong></summary>
 
-- `mo analyze --json ~/Documents` returns a one-time disk report as JSON.
-- `mo status --json` returns a one-time status snapshot as JSON.
-- `mo status | jq '.health_score'` switches to JSON automatically when output is piped.
-- `mo status --watch --interval 2s` streams newline-delimited JSON from a warm collector.
-- `mo history --json` returns cleanup activity as JSON.
+- `mo analyze --json ~/Documents` returns a one-time disk report as JSON
+- `mo status --json` returns a one-time status snapshot as JSON
+- `mo status | jq '.health_score'` switches to JSON automatically when output is piped
+- `mo status --watch --interval 2s` streams newline-delimited JSON from a warm collector
+- `mo history --json` returns cleanup activity as JSON. Sessions include `run_id` (an opaque string, empty when no identity was logged) and `attribution`: `run` for identified runs, `command` for legacy command-based grouping, or `ambiguous` when legacy markers cannot distinguish interruption from overlapping runs. Recorded actions remain available; ambiguous counts cannot be assigned reliably to individual runs. An empty `ended_at` means no end marker was recorded
+- `mo uninstall --list` returns installed apps as JSON with `name`, `bundle_id`, `source`, `uninstall_name`, `path` and `size`
 
 ```text
 $ mo analyze --json ~/Documents
@@ -323,15 +361,19 @@ reuse the latest successful sample with its original `process_collected_at` and 
 no zombies. Parent summaries contain at most three known owners;
 `zombie_parents_complete: false` means attribution was unavailable, incomplete, or truncated.
 
+If one collector fails, `mo status --json` still prints the metrics that were collected, reports the
+failure on stderr, and exits successfully, the same way `--watch` keeps streaming. It exits 1
+when none of CPU, memory, disk, or process metrics are available, or when JSON output fails.
+
 Status also supports read-only alerts for processes that stay above a CPU threshold. Use `--proc-cpu-threshold`, `--proc-cpu-window`, or `--proc-cpu-alerts=false` to tune or disable them.
 
 </details>
 
 ### Purge
 
-`mo purge` finds rebuildable project artifacts such as `node_modules`, `target`, `.build`, `build`, and `dist`. It groups artifacts by project and permanently deletes only the items you confirm. Artifacts with file activity in the last 7 days, or activity Mole cannot verify, are unselected by default. Mole uses `fd` when available and falls back to `find`. Directories containing deployment keypair files, nested Git repositories, or Git-tracked files are protected. Non-interactive runs require `mo purge --yes`; use `mo purge --dry-run` to review the candidates first.
+`mo purge` finds rebuildable project artifacts such as `node_modules`, `target`, `.build`, `build`, and `dist`. It groups artifacts by project and permanently deletes only the items you confirm. Artifacts with file activity in the last 7 days, or activity Mole cannot verify, are unselected by default. Mole uses `fd` when available and falls back to `find`, and protects directories containing deployment keypair files, nested Git repositories, or Git-tracked files. Non-interactive runs require `mo purge --yes`; use `mo purge --dry-run` to review the candidates first.
 
-Use Page Up/Down or `h`/`l` to move a page, `[`/`]` to jump between projects, and `X` to skip a project and advance. `/` searches project paths and artifact names; `n` finds the next match without changing selections. Enter opens the final path review. Reported space is an estimate; unmeasured artifacts and incomplete scans are identified explicitly.
+Use Page Up/Down or `h`/`l` to move a page, `[`/`]` to jump between projects, and `X` to skip a project and advance. `/` searches project paths and artifact names, `n` finds the next match without changing selections, and Enter opens the final path review. Reported space is an estimate; unmeasured artifacts and incomplete scans are identified explicitly.
 
 <details>
 <summary><strong>Purge example output</strong></summary>
@@ -374,7 +416,7 @@ When custom paths are configured, Mole scans only those directories. Otherwise, 
 
 ### Installer
 
-`mo installer` finds DMG, PKG, MPKG, ISO, XIP, and installer ZIP files in Downloads, Desktop, Homebrew caches, iCloud, Mail, Telegram, and other supported locations. Each item shows its size and source before removal. Use `mo installer --dry-run` to preview the plan.
+`mo installer` finds DMG, PKG, MPKG, ISO, XIP, and installer ZIP files in Downloads, Desktop, Homebrew caches, iCloud, Mail, Telegram, and other supported locations, and shows each item's size and source before removal. Discovery has a cumulative time limit: if a scan or metadata probe fails or times out, Mole discards the list and exits without selecting files. Corrupt and unreadable ZIP archives are skipped, symlinked scan roots are supported but symlinks beneath them are not followed, and selected files are checked again against their confirmed identity at the deletion boundary.
 
 <details>
 <summary><strong>Installer example output</strong></summary>
@@ -422,7 +464,7 @@ The launchers auto-detect Terminal, iTerm2, Alacritty, kitty, WezTerm, Ghostty, 
 
 </details>
 
-## Community Love
+## Community
 
 Thanks to everyone who helped build Mole. Go follow them. ❤️
 
@@ -435,20 +477,18 @@ Real feedback from users who shared Mole on X.
 
 <img src="./docs/img/mole-love.png" alt="Community feedback on Mole" width="1000" />
 
+Watch the [Mole tutorial video](https://www.youtube.com/watch?v=UEe9-w4CcQ0) by PAPAYA 電腦教室.
+
 ## Support
 
-- Getting [Mole for Mac](https://mole.fit) is the most direct way to support Mole's development.
-- If Mole helped you, give it a star, [share it](https://twitter.com/intent/tweet?url=https://github.com/tw93/Mole&text=Mole%20-%20Deep%20clean%20and%20optimize%20your%20Mac.), or open an issue or PR.
-- I have two cats, TangYuan and Coke. If you think Mole delights your life, you can feed them <a href="https://cats.tw93.fun?name=Mole" target="_blank">canned food 🥩</a>.
+- Getting [Mole for Mac](https://mole.fit) is the most direct way to support Mole's development
+- If Mole helped you, give it a star, [share it](https://twitter.com/intent/tweet?url=https://github.com/tw93/Mole&text=Mole%20-%20Deep%20clean%20and%20optimize%20your%20Mac.), or open an issue or PR
+- I have two cats, TangYuan and Coke, and if Mole makes your life a little easier, feel free to treat them to <a href="https://cats.tw93.fun?name=Mole" target="_blank">canned food 🥩</a>
 
-<details>
-<summary>These lovely people already did 🐱</summary>
-<br/>
-<a href="https://cats.tw93.fun?name=Mole"><img src="https://cdn.jsdelivr.net/gh/tw93/sponsors@main/assets/sponsors.svg" alt="Mole supporters" width="1000" loading="lazy" /></a>
-</details>
+These lovely people already did 🐱
+
+<a href="https://cats.tw93.fun?name=Mole"><img src="https://raw.githubusercontent.com/tw93/sponsors/main/assets/sponsors.svg" alt="Mole supporters" width="1000" loading="lazy" /></a>
 
 ## License
 
-Mole is open source under GPL-3.0; see [LICENSE](LICENSE). A version you modify and share stays under the same license. If you fork Mole into another product, please give it a different name and credit Mole as the source.
-
-[Mole for Mac](https://mole.fit) is a separate proprietary app. Mole is here for the long run.
+Mole is open source under GPL-3.0; see [LICENSE](LICENSE). Any modified version you share must remain under the same license. If you fork Mole, please use a distinct name and credit Mole as the upstream source. [Mole for Mac](https://mole.fit) is a separate proprietary app, and Mole is here for the long run.

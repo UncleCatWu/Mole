@@ -183,7 +183,7 @@ EOF
     [[ "$output" == *"PREVIEW:a"* && "$output" != *"SIZE:b"* ]] || return 1
     [[ "$output" == *"LATER_SECTION"* ]] || return 1
     [[ "$output" == *"Application Support logs/caches"*"at least"* ]] || return 1
-    [[ "$output" == *"Potential space:"*"At least"* ]] || return 1
+    [[ "$output" == *"Potential space:"*"2KB+"* ]] || return 1
 }
 
 @test "clean inventory partial state survives finalization and resets with new session" {

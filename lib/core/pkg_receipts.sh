@@ -17,7 +17,7 @@ pkg_receipt_nonstandard_app_paths() {
         return 0
     fi
     local cache_file="${MOLE_PKG_RECEIPT_CACHE_FILE:-$HOME/.cache/mole/pkg_receipt_apps_v2}"
-    local cache_ttl="${MOLE_PKG_RECEIPT_CACHE_TTL:-3600}"
+    local cache_ttl=3600
     local now_epoch=0
     if declare -f get_epoch_seconds > /dev/null 2>&1; then
         now_epoch=$(get_epoch_seconds)
@@ -63,15 +63,26 @@ pkg_receipt_nonstandard_app_paths() {
     fi
     if [[ $pkgs_rc -ne 0 ]]; then
         if [[ "$require_complete" == "1" ]]; then
-            [[ $pkgs_rc -eq 124 || $pkgs_rc -ge 128 ]] && return "$pkgs_rc"
+            mole_rc_timeout_or_signal "$pkgs_rc" && return "$pkgs_rc"
             return 2
         fi
         return 0
     fi
     [[ -n "$pkgs_output" ]] || return 0
 
+    # The list alone misses an upgrade or reinstall that keeps its package id,
+    # which can still add an app at a new path. The installer rewrites that
+    # receipt's plist every time, so its mtime joins the key. Only a key that
+    # covers both may outlive the short TTL.
+    local receipts_dir="${MOLE_PKG_RECEIPT_DB_DIR:-/var/db/receipts}"
+    local receipt_stamps=""
+    receipt_stamps=$(LC_ALL=C "$STAT_BSD" -f '%m %N' "$receipts_dir"/*.plist 2> /dev/null) || receipt_stamps=""
+    if [[ -n "$receipt_stamps" ]]; then
+        cache_ttl=604800
+    fi
+
     local receipts_fingerprint=""
-    receipts_fingerprint=$(printf '%s\n' "$pkgs_output" | LC_ALL=C cksum 2> /dev/null |
+    receipts_fingerprint=$(printf '%s\n%s\n' "$pkgs_output" "$receipt_stamps" | LC_ALL=C cksum 2> /dev/null |
         LC_ALL=C tr -cd '0-9 ' | LC_ALL=C tr ' ' '-') || receipts_fingerprint=""
     receipts_fingerprint="${receipts_fingerprint%-}"
 
@@ -83,7 +94,7 @@ pkg_receipt_nonstandard_app_paths() {
         if declare -f get_file_mtime > /dev/null 2>&1; then
             cache_mtime=$(get_file_mtime "$cache_file")
         else
-            cache_mtime=$(stat -f "%m" "$cache_file" 2> /dev/null || echo 0)
+            cache_mtime=$("$STAT_BSD" -f "%m" "$cache_file" 2> /dev/null || echo 0)
         fi
         if [[ "$cache_ttl" =~ ^[0-9]+$ && "$cache_mtime" =~ ^[0-9]+$ &&
             "$now_epoch" =~ ^[0-9]+$ && $cache_ttl -gt 0 &&
@@ -127,7 +138,7 @@ pkg_receipt_nonstandard_app_paths() {
                 pkg_files=$(pkgutil --files "$pkg_id" 2> /dev/null) || pkg_files_rc=$?
             fi
             if [[ $pkg_files_rc -ne 0 ]]; then
-                [[ $pkg_files_rc -eq 124 || $pkg_files_rc -ge 128 ]] && return "$pkg_files_rc"
+                mole_rc_timeout_or_signal "$pkg_files_rc" && return "$pkg_files_rc"
                 return 2
             fi
         else
@@ -180,7 +191,11 @@ pkg_receipt_nonstandard_app_paths() {
                 *) continue ;;
             esac
 
-            [[ -n "$app_path" && -d "$app_path" ]] || continue
+            # Record the path whether or not it exists now: the cache can
+            # outlive this scan, and an app that is briefly missing (in the
+            # Trash, mid self-update) must not disappear from a complete
+            # answer until its receipt changes. Existence is checked on output.
+            [[ -n "$app_path" ]] || continue
 
             duplicate=false
             local seen
@@ -199,7 +214,12 @@ pkg_receipt_nonstandard_app_paths() {
     done <<< "$pkgs_output"
 
     if [[ ${#seen_apps[@]} -gt 0 ]]; then
-        if ! printf '%s\n' "${seen_apps[@]}" | sort -u; then
+        local seen_app
+        if ! for seen_app in "${seen_apps[@]}"; do
+            if [[ -d "$seen_app" ]]; then
+                printf '%s\n' "$seen_app"
+            fi
+        done | sort -u; then
             [[ "$require_complete" == "1" ]] && return 2
         fi
     fi

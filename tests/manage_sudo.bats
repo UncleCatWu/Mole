@@ -1,8 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_project_root
 }
 
 setup() {
@@ -16,7 +17,7 @@ setup() {
 
     printf 'auth sufficient pam_tid.so\n' > "$pam_sudo"
     printf 'auth include pam_opendirectory.so\n' > "$pam_sudo_local"
-    export MOLE_PAM_SUDO_FILE="$pam_sudo"
+    export MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_sudo"
     export MOLE_PAM_SUDO_LOCAL_FILE="$pam_sudo_local"
 
     run check_touchid_support
@@ -26,6 +27,26 @@ setup() {
 
     run check_touchid_support
     [ "$status" -eq 1 ]
+}
+
+@test "PAM file overrides are honored only in test mode" {
+    run env MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 \
+        MOLE_PAM_SUDO_FILE="$BATS_TEST_TMPDIR/sudo" \
+        MOLE_PAM_SUDO_LOCAL_FILE="$BATS_TEST_TMPDIR/sudo_local" \
+        /bin/bash -c "source '$PROJECT_ROOT/lib/core/sudo.sh'; mole_pam_sudo_paths"
+    [ "$status" -eq 0 ]
+    [ "$output" = $'/etc/pam.d/sudo\n/etc/pam.d/sudo_local' ]
+
+    run env MOLE_TEST_MODE=1 \
+        MOLE_PAM_SUDO_FILE="$BATS_TEST_TMPDIR/sudo" \
+        /bin/bash -c "source '$PROJECT_ROOT/lib/core/sudo.sh'; mole_pam_sudo_paths"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$BATS_TEST_TMPDIR/sudo"$'\n'"$BATS_TEST_TMPDIR/sudo_local" ]
+}
+
+@test "sudo adoption authorizes commands only on a foreground terminal" {
+    run python3 "$PROJECT_ROOT/tests/sudo_adoption_pty.py"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
 @test "has_sudo_session returns 1 when no sudo session" {
@@ -73,6 +94,64 @@ setup() {
 
     run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; _stop_sudo_keepalive '99999'"
     [ "$status" -eq 0 ]
+}
+
+@test "stopping sudo keepalive reaps its sleeping child at every delay (#1694)" {
+    for phase in initial refresh retry; do
+        run env PROJECT_ROOT="$PROJECT_ROOT" PHASE="$phase" \
+            TRACE="$BATS_TEST_TMPDIR/keepalive-$phase" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/sudo.sh"
+sudo() {
+    echo REFRESH > "$TRACE"
+    [[ "$PHASE" == refresh ]]
+}
+# Observe the existing child assignment, keeping the native sleep, wait and
+# EXIT trap unchanged. A global process-table lookup is denied in the sandbox.
+declare -f _start_sudo_keepalive > "$TRACE.body"
+python3 - "$TRACE.body" <<'PY_KEEPALIVE' > "$TRACE.observed"
+from pathlib import Path
+import sys
+text = Path(sys.argv[1]).read_text()
+needle = "child_pid=$!;"
+assert text.count(needle) == 2
+print(text.replace(needle, needle + ' printf "%s %s\\n" "$child_pid" "$delay" > "$TRACE.child";', 1))
+PY_KEEPALIVE
+eval "$(cat "$TRACE.observed")"
+pid=$(_start_sudo_keepalive)
+child=""
+trap '[[ -z "$child" ]] || kill "$child" 2>/dev/null || :; _stop_sudo_keepalive "$pid"' EXIT
+for ((i=0; i<200; i++)); do
+    expected_delay=2
+    [[ "$PHASE" != refresh ]] || expected_delay=30
+    [[ "$PHASE" != retry ]] || expected_delay=5
+    if [[ -f "$TRACE.child" ]]; then
+        read -r observed_child observed_delay < "$TRACE.child" || :
+        if [[ "${observed_delay:-}" == "$expected_delay" && "${observed_child:-}" =~ ^[0-9]+$ ]] &&
+            kill -0 "$observed_child" 2>/dev/null; then
+            child="$observed_child"
+            break
+        fi
+    fi
+    /bin/sleep 0.02
+done
+[[ "$child" =~ ^[0-9]+$ ]] || exit 1
+kill -0 "$child" || exit 1
+_stop_sudo_keepalive "$pid"
+for ((i=0; i<50; i++)); do
+    if ! kill -0 "$child" 2>/dev/null; then
+        echo CHILD_REAPED
+        exit 0
+    fi
+    /bin/sleep 0.02
+done
+echo CHILD_SURVIVED
+exit 1
+EOF
+        [ "$status" -eq 0 ] || { echo "$phase: $output"; return 1; }
+        [[ "$output" == *"CHILD_REAPED"* ]] || return 1
+    done
 }
 
 
@@ -145,4 +224,42 @@ setup() {
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"CLEAR:3"* ]]
+}
+
+
+@test "the Touch ID wait hides typed input and restores echo, also after Ctrl-C" {
+    # People often type the password instead of touching the sensor; during
+    # the six-second wait that text used to echo on screen.
+    run python3 "$PROJECT_ROOT/tests/sudo_tty_pty.py"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local body
+    body=$(sed -n '/^request_sudo_access() {/,/^}/p' "$PROJECT_ROOT/lib/core/sudo.sh")
+    # shellcheck disable=SC2016  # Literal source text, not an expansion.
+    [[ "$body" == *'_mole_tty_quiet "$tty_path" _mole_touchid_poll "$sudo_pid"'* ]] || return 1
+    # shellcheck disable=SC2016  # Literal source text, not an expansion.
+    [[ "$body" == *'_mole_tty_quiet "$tty_path" sleep 1'* ]] || return 1
+}
+
+@test "check_touchid_support ignores a commented-out pam_tid line (#1815)" {
+    local pam_sudo="$BATS_TEST_TMPDIR/sudo"
+    local pam_sudo_local="$BATS_TEST_TMPDIR/sudo_local"
+    local probe="source '$PROJECT_ROOT/lib/core/sudo.sh'; check_touchid_support"
+
+    printf 'auth       include        sudo_local\n' > "$pam_sudo"
+    # The line macOS ships in /etc/pam.d/sudo_local.template.
+    printf '#auth       sufficient     pam_tid.so\n' > "$pam_sudo_local"
+    run env MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_sudo" \
+        MOLE_PAM_SUDO_LOCAL_FILE="$pam_sudo_local" /bin/bash -c "$probe"
+    [ "$status" -eq 1 ]
+
+    # Turned off by hand in the legacy file, or named only inside a comment.
+    printf '  # auth sufficient pam_tid.so\nauth sufficient pam_smartcard.so # pam_tid.so\n' > "$pam_sudo"
+    run env MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_sudo" \
+        MOLE_PAM_SUDO_LOCAL_FILE="$pam_sudo_local" /bin/bash -c "$probe"
+    [ "$status" -eq 1 ]
+
+    printf 'auth       sufficient     pam_tid.so # Touch ID\n' >> "$pam_sudo_local"
+    run env MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_sudo" \
+        MOLE_PAM_SUDO_LOCAL_FILE="$pam_sudo_local" /bin/bash -c "$probe"
+    [ "$status" -eq 0 ]
 }

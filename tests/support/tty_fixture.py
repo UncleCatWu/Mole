@@ -21,6 +21,10 @@ if mode in ('read', 'restore'):
         marker, reply = b'READY-AFTER', b'typed-after\n'
     else:
         marker, reply = b'READY', b'typed-value\n'
+elif mode == 'brew':
+    assert len(arguments) == 1
+    command = ['/bin/bash', project + '/tests/timeout_tty_read_fixture.sh', project, mode, *arguments]
+    marker, reply = b'READY', b'typed-value\n'
 elif mode == 'concurrent':
     command = ['/bin/bash', project + '/tests/timeout_tty_concurrent_fixture.sh', project]
     marker, reply = b'READY', b'typed-value\n'
@@ -36,8 +40,16 @@ elif mode == 'color':
 else:
     raise ValueError('unknown owned terminal fixture')
 
+# Keep the controlling session alive until the lease is restored and reaped.
+# The command still inherits the real owned terminal for all three streams.
+held_marker = b'__MOLE_BREW_FIXTURE_EXIT__=' if mode == 'brew' else None
+if held_marker is not None:
+    keeper = ('import subprocess,sys,time; p=subprocess.run(sys.argv[1:]); '
+              'print("__MOLE_BREW_FIXTURE_EXIT__="+str(p.returncode),flush=True); time.sleep(30)')
+    command = [sys.executable, '-B', '-c', keeper, *command]
 with OwnedPair() as pair:
     child = pair.spawn(command, env=env)
+    held_exit = None
     output = bytearray()
     sent = False
     until = time.monotonic() + 12
@@ -54,7 +66,12 @@ with OwnedPair() as pair:
             if marker and marker in output and not sent:
                 os.write(pair.master, reply)
                 sent = True
-    rc = child.wait(timeout=2)
+            if held_marker is not None and held_marker in output:
+                _, receipt = bytes(output).rsplit(held_marker, 1)
+                if b'\n' in receipt:
+                    held_exit = int(receipt.split(b'\n', 1)[0].strip())
+                    break
+    rc = held_exit if held_marker is not None else child.wait(timeout=2)
     sys.stdout.buffer.write(output)
     sys.stdout.buffer.flush()
     assert rc == 0, ('real fixture exit', rc)

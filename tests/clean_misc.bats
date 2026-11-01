@@ -1,14 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-clean-extras.XXXXXX")"
-    export HOME
+    mole_test_setup_home clean-extras
 
     # Prevent AppleScript permission dialogs during tests
     MOLE_TEST_MODE=1
@@ -18,12 +13,7 @@ setup_file() {
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 @test "clean_cloud_storage calls expected caches" {
@@ -50,6 +40,8 @@ EOF
 }
 
 @test "clean_virtualization_tools hits cache paths" {
+    mkdir -p "$HOME/Library/Caches/com.utmapp.UTM"
+    printf cache > "$HOME/Library/Caches/com.utmapp.UTM/blob"
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -60,6 +52,7 @@ safe_clean() { echo "$2|$1"; }
 clean_virtualization_tools
 EOF
 
+    rm -rf "$HOME/Library/Caches/com.utmapp.UTM"
     [ "$status" -eq 0 ]
     [[ "$output" == *"VMware Fusion cache"* ]] || return 1
     [[ "$output" == *"Parallels cache"* ]] || return 1
@@ -69,6 +62,8 @@ EOF
 }
 
 @test "clean_virtualization_tools skips UTM caches while UTM is running" {
+    mkdir -p "$HOME/Library/Caches/com.utmapp.UTM"
+    printf cache > "$HOME/Library/Caches/com.utmapp.UTM/blob"
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -82,6 +77,7 @@ safe_clean() { echo "$2"; }
 clean_virtualization_tools
 EOF
 
+    rm -rf "$HOME/Library/Caches/com.utmapp.UTM"
     [ "$status" -eq 0 ]
     [[ "$output" == *"VMware Fusion cache"* ]] || return 1
     [[ "$output" == *"Parallels cache"* ]] || return 1
@@ -145,6 +141,52 @@ EOF
     [ "$(< "$HOME/tart-args")" = "prune --entries caches --older-than 30" ] || return 1
     [[ "$output" == *"Tart caches · pruned"* ]] || return 1
     [[ "$output" != *"--entries vms"* ]] || return 1
+}
+
+@test "clean_tart_caches stops when the native prune is interrupted" {
+    # Ctrl-C while `tart prune` holds the terminal reaches only the child. A
+    # signal stops cleanup before the size recount; a plain failure or a
+    # timeout is a reported prune failure and cleanup continues.
+    local prune_status case_home
+    for prune_status in 130 143 1 124; do
+        case_home="$HOME/tart-prune-$prune_status"
+        mkdir -p "$case_home/.tart/cache/OCIs"
+        rm -f "$case_home/size-calls" # SAFE: test scratch file under the temporary HOME
+
+        run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
+            MOLE_CURRENT_COMMAND=clean MOLE_CLEAN_CANCEL_STATUS=0 PRUNE_STATUS="$prune_status" \
+            /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+pgrep() { return 1; }
+is_path_whitelisted() { return 1; }
+get_path_size_kb() { echo size >> "$HOME/size-calls"; echo 4096; }
+bytes_to_human() { echo "$1 bytes"; }
+run_with_timeout() { shift; "$@"; }
+tart() { return "$PRUNE_STATUS"; }
+rc=0
+clean_tart_caches || rc=$?
+size_calls=$(wc -l < "$HOME/size-calls" | tr -d ' ')
+printf 'RC=%s CANCEL=%s SIZE_CALLS=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS" "$size_calls"
+EOF
+
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        case "$prune_status" in
+            130 | 143)
+                [[ "$output" == *"RC=$prune_status CANCEL=$prune_status SIZE_CALLS=1"* ]] || { echo "$output"; return 1; }
+                [[ "$output" != *"prune failed"* ]] || { echo "$output"; return 1; }
+                ;;
+            *)
+                [[ "$output" == *"RC=0 CANCEL=0 SIZE_CALLS=1"* ]] || { echo "$output"; return 1; }
+                [[ "$output" == *"Tart caches · prune failed"* ]] || { echo "$output"; return 1; }
+                ;;
+        esac
+    done
 }
 
 @test "clean_tart_caches dry-run shows size, policy, and exact command without execution" {
@@ -385,7 +427,7 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"Blender cache"* ]] || return 1
-    [[ "$output" == *"Cinema 4D cache"* ]]
+    [[ "$output" == *"Cinema 4D cache"* ]] || return 1
     [[ "$output" == *"Autodesk cache"* ]] || return 1
 }
 

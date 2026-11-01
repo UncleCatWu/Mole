@@ -1,6 +1,6 @@
 ## Summary
 
-- Describe the change.
+Brief description of what this PR changes and why.
 
 ## Safety Review
 
@@ -10,8 +10,8 @@
 
 ## Tests
 
-- List the automated tests you ran.
-- List any manual checks for high-risk paths or destructive flows.
+- [ ] Automated checks (`./scripts/check.sh`, `./scripts/test.sh`)
+- [ ] Manual verification (especially for destructive operations or UI flows)
 
 ## Safety-related changes
 

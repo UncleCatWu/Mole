@@ -1,25 +1,13 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-dev-extended.XXXXXX")"
-    export HOME
-
-    mkdir -p "$HOME"
+    mole_test_setup_home dev-extended
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 @test "clean_dev_elixir cleans hex cache" {
@@ -107,14 +95,16 @@ EOF
 }
 
 @test "check_android_ndk reports multiple NDK versions" {
-    run /bin/bash -c 'HOME=$(mktemp -d) && mkdir -p "$HOME/Library/Android/sdk/ndk"/{21.0.1,22.0.0,20.0.0} && source "$0" && note_activity() { :; } && NC="" && GREEN="" && GRAY="" && YELLOW="" && ICON_REVIEW="⊙" && check_android_ndk' "$PROJECT_ROOT/lib/clean/dev.sh"
+    run /bin/bash -c 'HOME=$(mktemp -d) && mkdir -p "$HOME/Library/Android/sdk/ndk"/{21.0.1,22.0.0,20.0.0} && source "${0%/clean/dev.sh}/core/common.sh" && source "$0" && note_activity() { :; } && check_android_ndk' "$PROJECT_ROOT/lib/clean/dev.sh"
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Android NDK versions · 3 found"* ]]
+    local plain
+    plain=$(printf '%s' "$output" | sed $'s/\033\\[[0-9;]*m//g')
+    [[ "$plain" == *"Android NDK versions · 3 · 20.0.0 and 21.0.1 besides 22.0.0"* ]] || { echo "$plain"; return 1; }
 }
 
 @test "check_android_ndk silent when only one NDK" {
-    run /bin/bash -c 'HOME=$(mktemp -d) && mkdir -p "$HOME/Library/Android/sdk/ndk/22.0.0" && source "$0" && note_activity() { :; } && NC="" && GREEN="" && GRAY="" && YELLOW="" && ICON_REVIEW="⊙" && check_android_ndk' "$PROJECT_ROOT/lib/clean/dev.sh"
+    run /bin/bash -c 'HOME=$(mktemp -d) && mkdir -p "$HOME/Library/Android/sdk/ndk/22.0.0" && source "${0%/clean/dev.sh}/core/common.sh" && source "$0" && note_activity() { :; } && check_android_ndk' "$PROJECT_ROOT/lib/clean/dev.sh"
 
     [ "$status" -eq 0 ]
     [[ "$output" != *"NDK versions"* ]]
@@ -198,6 +188,7 @@ source "$PROJECT_ROOT/lib/clean/dev.sh"
 note_activity() { :; }
 pgrep() { return 1; }
 stat() { return 9; }
+STAT_BSD=stat
 safe_clean() { echo "UNEXPECTED_CLEAN:$*"; }
 clean_xcode_device_support "$HOME/UnreadableDeviceSupport" "iOS DeviceSupport"
 EOF
@@ -960,6 +951,100 @@ EOF
     [[ "$output" != *"UNEXPECTED_REMOVE"* ]]
 }
 
+@test "clean_xcode_documentation_cache keeps whitelisted indexes out of the skipped count" {
+    local doc_root mode
+    for mode in whitelist protect; do
+        doc_root="$HOME/DocumentationCacheSkipCount-$mode"
+        rm -rf "$doc_root"
+        mkdir -p "$doc_root"
+        touch "$doc_root/DeveloperDocumentation.index" "$doc_root/DeveloperDocumentation-16.0.index" "$doc_root/DeveloperDocumentation-15.0.index"
+        touch -t 202603010000 "$doc_root/DeveloperDocumentation.index"
+        touch -t 202602010000 "$doc_root/DeveloperDocumentation-16.0.index"
+        touch -t 202601010000 "$doc_root/DeveloperDocumentation-15.0.index"
+
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_XCODE_DOCUMENTATION_CACHE_DIR="$doc_root" MODE="$mode" \
+            /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+kept="$MOLE_XCODE_DOCUMENTATION_CACHE_DIR/DeveloperDocumentation-16.0.index"
+is_path_whitelisted() { [[ "$MODE" == whitelist && "$1" == "$kept" ]]; }
+should_protect_path() { [[ "$MODE" == protect && "$1" == "$kept" ]]; }
+has_sudo_session() { return 0; }
+_sim_runtime_size_kb() { echo 1; }
+_xcode_xctest_devices_process_running() { return 1; }
+safe_sudo_remove() { echo "REMOVE:$1"; }
+clean_xcode_documentation_cache
+EOF
+        [ "$status" -eq 0 ] || {
+            echo "$output"
+            return 1
+        }
+        [[ "$output" == *"Xcode documentation cache · removed 1 old indexes"* ]] || return 1
+        [[ "$output" == *"REMOVE:$doc_root/DeveloperDocumentation-15.0.index"* ]] || return 1
+        [[ "$output" != *"REMOVE:$doc_root/DeveloperDocumentation-16.0.index"* ]] || return 1
+        if [[ "$mode" == whitelist ]]; then
+            [[ "$output" != *"skipped"* ]] || return 1
+        else
+            [[ "$output" == *"Xcode documentation cache · skipped 1 protected items"* ]] || return 1
+        fi
+    done
+}
+
+@test "clean_xcode_system_coresimulator_caches keeps whitelisted entries out of the skipped count" {
+    local cache_root mode
+    for mode in whitelist protect; do
+        cache_root="$HOME/SystemCoreSimulatorSkipCount-$mode"
+        rm -rf "$cache_root"
+        mkdir -p "$cache_root/dyld" "$cache_root/metadata"
+
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR="$cache_root" MODE="$mode" \
+            /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+kept="$MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR/metadata"
+is_path_whitelisted() { [[ "$MODE" == whitelist && "$1" == "$kept" ]]; }
+should_protect_path() { [[ "$MODE" == protect && "$1" == "$kept" ]]; }
+_coresimulator_activity_state() { return 1; }
+has_sudo_session() { return 0; }
+get_path_size_kb() { echo 3; }
+safe_sudo_remove() { echo "REMOVE:$1"; }
+clean_xcode_system_coresimulator_caches
+EOF
+        [ "$status" -eq 0 ] || {
+            echo "$output"
+            return 1
+        }
+        [[ "$output" == *"REMOVE:$cache_root/dyld"* ]] || return 1
+        [[ "$output" != *"REMOVE:$cache_root/metadata"* ]] || return 1
+        if [[ "$mode" == whitelist ]]; then
+            [[ "$output" != *"skipped"* ]] || return 1
+        else
+            [[ "$output" == *"skipped 1 protected"* ]] || return 1
+        fi
+    done
+}
+
+@test "clean covers every DeviceSupport platform the Xcode uninstall sweep knows" {
+    local uninstall_platforms clean_platforms platform
+    # shellcheck disable=SC2016  # matches the literal $HOME in the source text
+    uninstall_platforms=$(sed -nE 's|.*"\$HOME/Library/Developer/Xcode/([A-Za-z]+) DeviceSupport".*|\1|p' \
+        "$PROJECT_ROOT/lib/core/app_protection.sh" | sort -u)
+    clean_platforms=$(sed -nE 's|^[[:space:]]*clean_xcode_device_support ~/Library/Developer/Xcode/([A-Za-z]+)\\ DeviceSupport .*|\1|p' \
+        "$PROJECT_ROOT/lib/clean/dev.sh" | sort -u)
+    [ -n "$uninstall_platforms" ] || return 1
+    [ -n "$clean_platforms" ] || return 1
+    for platform in $uninstall_platforms; do
+        if ! grep -qx "$platform" <<< "$clean_platforms"; then
+            echo "clean misses $platform DeviceSupport"
+            return 1
+        fi
+    done
+}
+
 @test "clean_xcode_device_support skips all deletion paths while build tooling owns it" {
     local ds_dir="$HOME/OwnedDeviceSupport"
     mkdir -p "$ds_dir/17.0/Symbols/System/Library/Caches" "$ds_dir/17.1" "$ds_dir/17.2"
@@ -970,7 +1055,7 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
 note_activity() { :; }
-pgrep() { [[ "$1" == "-x" && "$2" == "swift-frontend" ]]; }
+pgrep() { [[ "$1" == -*x && "|$2|" == *"|swift-frontend|"* ]]; }
 safe_remove() { echo "UNEXPECTED_SAFE_REMOVE:$1"; return 0; }
 safe_clean() { echo "UNEXPECTED_SAFE_CLEAN:$1"; return 0; }
 clean_xcode_device_support "$HOME/OwnedDeviceSupport" "iOS DeviceSupport"
@@ -1022,7 +1107,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
 note_activity() { :; }
 pgrep() {
-    [[ "$1" == "-x" && "$2" == "Simulator" ]]
+    [[ "$1" == -*x && "|$2|" == *"|Simulator|"* ]] && echo "101 Simulator"
 }
 debug_log() { echo "DEBUG:$*"; }
 safe_sudo_remove() { echo "UNEXPECTED_SAFE_SUDO_REMOVE"; }
@@ -1103,7 +1188,7 @@ EOF
 
     [ "$status" -eq 0 ] || return 1
     [[ "$output" == *"Xcode Simulator system cache · skipped (process state unknown)"* ]] || return 1
-    [[ "$output" == *"DEBUG:CoreSimulator process check failed: Xcode (exit=2)"* ]] || return 1
+    [[ "$output" == *"DEBUG:CoreSimulator process check failed (exit=2)"* ]] || return 1
     [[ "$output" != *"UNEXPECTED_SAFE_SUDO_REMOVE"* ]] || return 1
 }
 
@@ -1113,8 +1198,11 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
 debug_log() { :; }
+# One pgrep covers every name; Xcode stays running so a later name in the
+# probe order proves the first running one in that order is reported.
 pgrep() {
-    [[ "$1" == "$EXPECTED_MODE" && "$2" == "$EXPECTED_PATTERN" ]]
+    [[ "$1" == -*x && "|$2|" == *"|$EXPECTED_PATTERN|"* ]] || return 1
+    printf '7 %s\n' "$EXPECTED_PATTERN"
 }
 
 while IFS='|' read -r EXPECTED_MODE EXPECTED_PATTERN expected_label; do
@@ -1148,11 +1236,18 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
 note_activity() { :; }
+# Emulates one process table, so a probe that groups names still only sees
+# these persistent services and generic compilers.
 pgrep() {
-    case "$2" in
-        CoreSimulatorService | simdiskimaged | com.apple.CoreSimulator | XCBBuildService | swift-frontend) return 0 ;;
-        *) return 1 ;;
-    esac
+    local running=" CoreSimulatorService simdiskimaged com.apple.CoreSimulator XCBBuildService swift-frontend "
+    local name found=1 IFS='|'
+    for name in $2; do
+        if [[ "$running" == *" $name "* ]]; then
+            printf '9 %s\n' "$name"
+            found=0
+        fi
+    done
+    return "$found"
 }
 _coresimulator_booted_device_state() { return 1; }
 has_sudo_session() { return 0; }
@@ -1255,7 +1350,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
 debug_log() { :; }
 pgrep() {
-    [[ -e "$HOME/foreground-started" && "$1" == "-x" && "$2" == "xcodebuild" ]]
+    [[ -e "$HOME/foreground-started" && "$1" == -*x && "|$2|" == *"|xcodebuild|"* ]]
 }
 _coresimulator_booted_device_state() {
     touch "$HOME/foreground-started"
@@ -1520,7 +1615,8 @@ EOF
 @test "clean_xcode_xctest_devices dry-run keeps XCTestDevices directory" {
     local xctest_root="$HOME/Library/Developer/XCTestDevices"
     mkdir -p "$xctest_root"
-    touch "$xctest_root/test-device"
+    # A 0B target removes silently, so the preview row needs real bytes.
+    printf 'device' > "$xctest_root/test-device"
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -1586,14 +1682,16 @@ EOF
 }
 
 @test "check_rust_toolchains reports multiple toolchains" {
-    run /bin/bash -c 'HOME=$(mktemp -d) && mkdir -p "$HOME/.rustup/toolchains"/{stable,nightly,1.75.0}-aarch64-apple-darwin && source "$0" && note_activity() { :; } && NC="" && GREEN="" && GRAY="" && YELLOW="" && ICON_REVIEW="⊙" && rustup() { :; } && export -f rustup && check_rust_toolchains' "$PROJECT_ROOT/lib/clean/dev.sh"
+    run /bin/bash -c 'HOME=$(mktemp -d) && mkdir -p "$HOME/.rustup/toolchains"/{stable,nightly,1.75.0}-aarch64-apple-darwin && printf "default_toolchain = \"stable-aarch64-apple-darwin\"\n" > "$HOME/.rustup/settings.toml" && source "${0%/clean/dev.sh}/core/common.sh" && source "$0" && note_activity() { :; } && rustup() { :; } && export -f rustup && check_rust_toolchains' "$PROJECT_ROOT/lib/clean/dev.sh"
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Rust toolchains · 3 found"* ]]
+    local plain
+    plain=$(printf '%s' "$output" | sed $'s/\033\\[[0-9;]*m//g')
+    [[ "$plain" == *"Rust toolchains · 3 · 1.75.0 and nightly besides stable"* ]] || { echo "$plain"; return 1; }
 }
 
 @test "check_rust_toolchains silent when only one toolchain" {
-    run /bin/bash -c 'HOME=$(mktemp -d) && mkdir -p "$HOME/.rustup/toolchains/stable-aarch64-apple-darwin" && source "$0" && note_activity() { :; } && NC="" && GREEN="" && GRAY="" && YELLOW="" && ICON_REVIEW="⊙" && rustup() { :; } && export -f rustup && check_rust_toolchains' "$PROJECT_ROOT/lib/clean/dev.sh"
+    run /bin/bash -c 'HOME=$(mktemp -d) && mkdir -p "$HOME/.rustup/toolchains/stable-aarch64-apple-darwin" && source "${0%/clean/dev.sh}/core/common.sh" && source "$0" && note_activity() { :; } && rustup() { :; } && export -f rustup && check_rust_toolchains' "$PROJECT_ROOT/lib/clean/dev.sh"
 
     [ "$status" -eq 0 ]
     [[ "$output" != *"Rust toolchains"* ]]
@@ -1674,6 +1772,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+# Idle: these cases cover retention, not the open-file hold.
+_mole_container_cache_has_open_handle() { return 1; }
 note_activity() { :; }
 safe_clean() { echo "$1|$2"; }
 clean_dev_ai_agents
@@ -1688,6 +1788,87 @@ EOF
     [[ "$output" == *"/1.0.5|GitHub Copilot CLI old version"* ]] || return 1
     [[ "$output" == *"/1.0.32|GitHub Copilot CLI old version"* ]] || return 1
     [[ "$output" != *"/1.0.34|"* ]]
+}
+
+@test "clean_dev_ai_agents keeps an old release a running session still has open" {
+    # Claude Code keeps each session on the binary it started from; a session
+    # was found running 2.1.311 from the Trash after Mole removed it.
+    local claude_root="$HOME/.local/share/claude/versions"
+    rm -rf "$HOME/.local/share/claude" "$HOME/.local/share/cursor-agent" "$HOME/.copilot"
+    mkdir -p "$claude_root"
+    touch -t 202604160000 "$claude_root/2.1.110"
+    touch -t 202604170000 "$claude_root/2.1.111"
+    touch -t 202604180000 "$claude_root/2.1.112"
+    touch -t 202604190000 "$claude_root/2.1.113"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+note_activity() { :; }
+safe_clean() { echo "$1|$2"; }
+_mole_container_cache_has_open_handle() {
+    case "${1##*/}" in
+        2.1.111) return 0 ;; # a session runs it
+        2.1.110) return 2 ;; # lsof could not tell
+        *) return 1 ;;
+    esac
+}
+clean_dev_ai_agents
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    # The positive control: an idle old release still goes.
+    [[ "$output" == *"/2.1.112|Claude Code old version"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"/2.1.111|"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"/2.1.110|"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"/2.1.113|"* ]] || return 1
+    [[ "$output" != *"stopped"* ]]
+}
+
+@test "clean_dev_ai_agents keeps an open old release through the real safe_clean_guarded" {
+    # Production loads bin/clean.sh, so the guard runs inside _safe_clean_impl,
+    # not the standalone fallback loop above.
+    local claude_root="$HOME/.local/share/claude/versions"
+    rm -rf "$HOME/.local/share/claude" "$HOME/.local/share/cursor-agent" "$HOME/.copilot"
+    mkdir -p "$claude_root"
+    touch -t 202604160000 "$claude_root/2.1.110"
+    touch -t 202604170000 "$claude_root/2.1.111"
+    touch -t 202604180000 "$claude_root/2.1.112"
+    touch -t 202604190000 "$claude_root/2.1.113"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { :; }
+is_path_whitelisted() { return 1; }
+get_cleanup_path_size_kb() { echo 1; }
+safe_remove() { echo "REMOVE|$1"; return 0; }
+_mole_container_cache_has_open_handle() {
+    case "${1##*/}" in
+        2.1.111) return 0 ;;
+        2.1.110) return 2 ;;
+        *) return 1 ;;
+    esac
+}
+declare -f safe_clean_guarded > /dev/null || { echo "NO_GUARDED"; exit 1; }
+clean_dev_ai_agents
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"REMOVE|$claude_root/2.1.112"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"REMOVE|$claude_root/2.1.111"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"REMOVE|$claude_root/2.1.110"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"REMOVE|$claude_root/2.1.113"* ]]
 }
 
 @test "clean_dev_ai_agents protects the active version pointed at by ~/.local/bin/<agent>" {
@@ -1714,6 +1895,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+# Idle: these cases cover retention, not the open-file hold.
+_mole_container_cache_has_open_handle() { return 1; }
 note_activity() { :; }
 safe_clean() { echo "$1|$2"; }
 clean_dev_ai_agents
@@ -1744,6 +1927,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+debug_log() { echo "DEBUG:$*"; }
 note_activity() { :; }
 safe_clean() { echo "$1|$2"; }
 clean_dev_ai_agents
@@ -1751,7 +1935,8 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" != *"|Claude Code old version"* ]] || return 1
-    [[ "$output" == *"Claude Code old version · skipped (active symlink broken)"* ]] || return 1
+    [[ "$output" == *"DEBUG:Claude Code old version kept: active symlink broken"* ]] || return 1
+    [[ "$output" != *"skipped ("* ]] || return 1
 
     rm -f "$bin_dir/claude"
 }
@@ -1770,6 +1955,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+# Idle: these cases cover retention, not the open-file hold.
+_mole_container_cache_has_open_handle() { return 1; }
 note_activity() { :; }
 safe_clean() { echo "$1"; }
 MOLE_AI_AGENTS_KEEP=2 clean_dev_ai_agents
@@ -1832,6 +2019,7 @@ clean_dev_ocaml() { :; }
 clean_xcode_tools() { :; }
 clean_code_editors() { :; }
 clean_homebrew() { :; }
+clean_homebrew_service_logs() { :; }
 clean_developer_tools
 EOF
 
@@ -1882,6 +2070,44 @@ EOF
     [[ "$output" != *"$HOME/Library/Application Support/Claude/pending-uploads"* ]] || return 1
     [[ "$output" == *"$HOME/.cache/opencode"* ]] || return 1
     [[ "$output" != *"$HOME/.claude/shell-snapshots"* ]]
+}
+
+@test "developer cleanup stops after a Cursor log scan signal but not a timeout" {
+    for scan_rc in 0 1 124 130 143; do
+        run env HOME="$HOME/cursor-scan-$scan_rc" PROJECT_ROOT="$PROJECT_ROOT" SCAN_RC="$scan_rc" \
+            MOLE_TEST_NO_AUTH=1 MOLE_CURRENT_COMMAND=clean /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mkdir -p "$HOME/.local/share/cursor-agent"
+safe_clean() { :; }
+clean_antigravity_caches() { :; }
+clean_agent_browser_old_chrome() { :; }
+clean_codex_desktop_caches() { :; }
+clean_codex_runtimes() { :; }
+clean_codex_desktop_staging() { :; }
+clean_codex_daemon_releases() { :; }
+clean_codex_crashpad_pending() { :; }
+clean_codex_marketplace_staging() { :; }
+clean_codex_cli() { :; }
+safe_find_delete() { echo SCAN_REACHED; return "$SCAN_RC"; }
+clean_chrome_devtools_mcp_caches() { echo NEXT_CACHE; }
+rc=0; _run_developer_cleanup_step clean_dev_misc || rc=$?
+printf 'RC=%s STICKY=%s\n' "$rc" "${MOLE_CLEAN_CANCEL_STATUS:-0}"
+EOF
+        [ "$status" -eq 0 ] || return 1
+        [[ "$output" == *SCAN_REACHED* ]] || return 1
+        case "$scan_rc" in
+            130 | 143)
+                [[ "$output" == *"RC=$scan_rc STICKY=$scan_rc"* ]] || return 1
+                [[ "$output" != *NEXT_CACHE* ]] || return 1
+                ;;
+            *)
+                [[ "$output" == *"RC=0 STICKY=0"* ]] || return 1
+                [[ "$output" == *NEXT_CACHE* ]] || return 1
+                ;;
+        esac
+    done
 }
 
 @test "clean_dev_mobile leaves an idle section when no unavailable simulator exists" {
@@ -1974,6 +2200,66 @@ EOF
     }
 }
 
+@test "clean_dev_mobile keeps a spinner up through every simctl probe and clears it before rows" {
+    local event_log="$HOME/simctl-spinner-events.log"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true \
+        EVENT_LOG="$event_log" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+check_android_ndk() { :; }
+clean_xcode_documentation_cache() { :; }
+clean_xcode_system_coresimulator_caches() { :; }
+clean_xcode_xctest_devices() { :; }
+clean_xcode_device_support() { :; }
+_xcode_safe_clean_guarded() { :; }
+safe_clean() { :; }
+note_activity() { :; }
+debug_log() { :; }
+xcrun() { :; }
+start_section_spinner() { printf 'spin:%s\n' "$1" >> "$EVENT_LOG"; }
+stop_section_spinner() { printf 'stop\n' >> "$EVENT_LOG"; }
+_resolve_simctl_developer_dir() {
+    _MOLE_SIMCTL_RESOLUTION_STATUS="ready"
+    _MOLE_SIMCTL_DEVELOPER_DIR="$HOME/Xcode.app/Contents/Developer"
+}
+_run_simctl() {
+    shift
+    printf 'simctl:%s\n' "$*" >> "$EVENT_LOG"
+    [[ "$*" == "list devices -j" ]] && printf '{"devices":{}}\n'
+    return 0
+}
+_simctl_orphan_runtime_rows() { printf 'R1\tiOS\t18.0\t22A1\t100\n'; }
+
+clean_dev_mobile >> "$EVENT_LOG"
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    grep -q '^simctl:' "$event_log" || return 1
+    grep -q 'Orphaned simulator runtime' "$event_log" || {
+        cat "$event_log"
+        return 1
+    }
+    # A cold CoreSimulatorService takes seconds per probe; any probe outside a
+    # spinner leaves the previous row on screen as if the run had stopped.
+    run awk '
+        /^spin:/ { active = 1; next }
+        /^stop$/ { active = 0; next }
+        /^simctl:/ { if (!active) { print "probe without spinner: " $0; bad = 1 }; next }
+        /Orphaned simulator runtime/ { if (active) { print "row under spinner: " $0; bad = 1 }; next }
+        END { if (active) { print "spinner left running"; bad = 1 }; exit bad }
+    ' "$event_log"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        cat "$event_log"
+        return 1
+    }
+}
+
 @test "clean_dev_mobile continues cleanup when simctl is unavailable" {
     local tmp_bin
     tmp_bin="$HOME/simctl-unavailable-bin"
@@ -2019,6 +2305,7 @@ EOF
     [[ "$output" != *"ACTIVITY"* ]] || return 1
     [[ ! -e "$HOME/simctl-unavailable.log" ]] || return 1
     [[ "$output" == *"DEVICE_SUPPORT:iOS DeviceSupport"* ]] || return 1
+    [[ "$output" == *"DEVICE_SUPPORT:visionOS DeviceSupport"* ]] || return 1
     [[ "$output" == *"SAFE_CLEAN_GUARDED:_coresimulator_delete_guard_allows:Simulator runtime cache"* ]] || return 1
     [[ "$output" == *"SAFE_CLEAN_GUARDED:_xcode_delete_guard_allows:Xcode Interface Builder cache"* ]] || return 1
     [[ "$output" == *"SAFE_CLEAN:Android SDK cache"* ]] || return 1
@@ -2220,6 +2507,86 @@ EOF
     [[ "$output" == *"DEBUG:simctl probe statuses: first=7 retry=124"* ]] || return 1
     [[ "$output" == *"DEBUG:simctl probe first stderr: ~/Library/Developer/private [31mprobe failed[0m"* ]] || return 1
     [[ "$output" != *"$HOME/Library/Developer/private"* ]] || return 1
+}
+
+@test "simctl stays untouched while Xcode first-launch setup is unfinished" {
+    local tmp_bin developer_dir call_log
+    tmp_bin="$HOME/first-launch-bin"
+    developer_dir="$HOME/Applications/Xcode.app/Contents/Developer"
+    call_log="$HOME/first-launch-simctl.log"
+    mkdir -p "$tmp_bin" "$developer_dir/usr/bin"
+
+    # simctl on an unfinished Xcode asks macOS to install CoreSimulator behind
+    # an administrator prompt; a cleanup run must not be what triggers it.
+    cat > "$developer_dir/usr/bin/xcodebuild" << 'XEOF'
+#!/bin/bash
+[[ "$*" == "-checkFirstLaunchStatus" ]] || exit 2
+exit "$FIRST_LAUNCH_STATUS"
+XEOF
+    cat > "$tmp_bin/xcrun" << 'XEOF'
+#!/bin/bash
+[[ "$*" == "--find simctl" ]] && exit 0
+printf '%s\n' "$*" >> "$SIMCTL_CALL_LOG"
+[[ "$*" == "simctl list devices booted -j" ]] && printf '{"devices":{}}\n'
+exit 0
+XEOF
+    cat > "$tmp_bin/xcode-select" << XEOF
+#!/bin/bash
+printf '%s\n' "$developer_dir"
+XEOF
+    chmod +x "$developer_dir/usr/bin/xcodebuild" "$tmp_bin/xcrun" "$tmp_bin/xcode-select"
+
+    local first_launch_status
+    for first_launch_status in 1 0 130; do
+        rm -f "$call_log"
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$tmp_bin:$PATH" \
+            DRY_RUN=true FIRST_LAUNCH_STATUS="$first_launch_status" SIMCTL_CALL_LOG="$call_log" \
+            /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+unset DEVELOPER_DIR
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+check_android_ndk() { :; }
+clean_xcode_documentation_cache() { :; }
+clean_xcode_system_coresimulator_caches() { :; }
+clean_xcode_xctest_devices() { :; }
+clean_xcode_device_support() { :; }
+safe_clean() { :; }
+note_activity() { :; }
+debug_log() { :; }
+
+state=0
+_coresimulator_booted_device_state || state=$?
+echo "booted_state=$state"
+_MOLE_SIMCTL_RESOLUTION_STATUS=""
+mobile_rc=0
+clean_dev_mobile || mobile_rc=$?
+echo "mobile_rc=$mobile_rc"
+EOF
+        [ "$status" -eq 0 ] || {
+            echo "$output"
+            return 1
+        }
+        if [[ "$first_launch_status" == "130" ]]; then
+            # Ctrl-C during the check cancels instead of reading as unfinished.
+            [[ ! -e "$call_log" ]] || { cat "$call_log"; return 1; }
+            [[ "$output" == *"booted_state=130"* ]] || { echo "$output"; return 1; }
+            [[ "$output" == *"mobile_rc=130"* ]] || { echo "$output"; return 1; }
+        elif [[ "$first_launch_status" == "1" ]]; then
+            [[ ! -e "$call_log" ]] || {
+                echo "simctl ran while setup was unfinished:"
+                cat "$call_log"
+                return 1
+            }
+            [[ "$output" == *"booted_state=2"* ]] || return 1
+            [[ "$output" != *"simctl could not be resolved"* ]] || return 1
+            [[ "$output" == *"mobile_rc=0"* ]] || return 1
+        else
+            grep -q '^simctl list devices booted -j$' "$call_log" || return 1
+            grep -q '^simctl list devices unavailable$' "$call_log" || return 1
+            [[ "$output" == *"booted_state=1"* ]] || return 1
+        fi
+    done
 }
 
 @test "clean_dev_mobile uses the sole Xcode Beta candidate when CLT is selected (#1261)" {
@@ -2617,15 +2984,19 @@ EOF
     [[ "$output" != *"removed 1"* ]] || return 1
 }
 
-@test "clean_dev_mobile stops before simctl delete when unavailable-device sizing times out" {
-    local case_home="$HOME/simctl-size-timeout"
+@test "clean_dev_mobile deletes unavailable devices through a size timeout and stops on a signal" {
+    # Sizing only feeds the freed total (bugs reference, section 15): a timeout
+    # still reaches simctl delete with a partial total, a signal stops first.
     local udid="ABCDEF01-2345-6789-ABCD-EF0123456789"
-    mkdir -p "$case_home/Library/Developer/CoreSimulator/Devices/$udid"
+    local size_status case_home
+    for size_status in 124 130; do
+        case_home="$HOME/simctl-size-$size_status"
+        mkdir -p "$case_home/Library/Developer/CoreSimulator/Devices/$udid"
 
-    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
-        MOLE_CURRENT_COMMAND=clean MOLE_CLEAN_CANCEL_STATUS=0 \
-        SIMCTL_CALL_LOG="$case_home/simctl-calls.log" \
-        /bin/bash --noprofile --norc << 'EOF'
+        run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
+            MOLE_CURRENT_COMMAND=clean MOLE_CLEAN_CANCEL_STATUS=0 MOLE_CLEAN_SIZING_TIMEOUTS=0 \
+            SIMCTL_CALL_LOG="$case_home/simctl-calls.log" SIZE_STATUS="$size_status" \
+            /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
@@ -2654,22 +3025,153 @@ _run_simctl() {
     esac
     return 1
 }
-get_path_size_kb() { return 124; }
+get_path_size_kb() { return "$SIZE_STATUS"; }
 
-set +e
-clean_dev_mobile
-rc=$?
-set -e
-printf 'RC=%s CANCEL=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS"
-[[ $rc -eq 124 && $MOLE_CLEAN_CANCEL_STATUS -eq 124 ]]
+rc=0
+clean_dev_mobile || rc=$?
+printf 'RC=%s CANCEL=%s PARTIAL=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS" "$MOLE_CLEAN_SIZING_TIMEOUTS"
 EOF
 
-    [ "$status" -eq 0 ] || return 1
-    [[ "$output" == *"RC=124 CANCEL=124"* ]] || return 1
-    [[ -f "$case_home/simctl-calls.log" ]] || return 1
-    if grep -q '^delete unavailable$' "$case_home/simctl-calls.log"; then
-        return 1
-    fi
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        if [[ "$size_status" == 124 ]]; then
+            [[ "$output" == *"RC=0 CANCEL=0 PARTIAL=1"* ]] || { echo "$output"; return 1; }
+            grep -q '^delete unavailable$' "$case_home/simctl-calls.log" || return 1
+        else
+            [[ "$output" == *"RC=130 CANCEL=130"* ]] || { echo "$output"; return 1; }
+            if grep -q '^delete unavailable$' "$case_home/simctl-calls.log"; then
+                return 1
+            fi
+        fi
+    done
+}
+
+@test "clean_dev_mobile names a macOS privacy refusal from simctl delete unavailable" {
+    # On macOS 27 CoreSimulator cannot move a device's data folder and simctl
+    # says "You don't have permission" with an Operation not permitted cause.
+    # That is macOS refusing access, not a generic failure.
+    local udid="ABCDEF01-2345-6789-ABCD-EF0123456789"
+    local case_home="$HOME/simctl-delete-privacy"
+    mkdir -p "$case_home/Library/Developer/CoreSimulator/Devices/$udid"
+
+    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
+        MOLE_CURRENT_COMMAND=clean MOLE_CLEAN_CANCEL_STATUS=0 \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+check_android_ndk() { :; }
+clean_xcode_documentation_cache() { :; }
+clean_xcode_system_coresimulator_caches() { :; }
+clean_xcode_xctest_devices() { :; }
+clean_xcode_device_support() { :; }
+safe_clean() { :; }
+get_path_size_kb() { echo "1"; }
+note_activity() { :; }
+debug_log() { :; }
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+cleanup_result_color_kb() { printf '%s' "$GREEN"; }
+xcrun() { :; }
+_resolve_simctl_developer_dir() {
+    _MOLE_SIMCTL_DEVELOPER_DIR="$HOME/Xcode.app/Contents/Developer"
+    _MOLE_SIMCTL_RESOLUTION_STATUS="ready"
+}
+_run_simctl() {
+    shift
+    case "$*" in
+        "list devices unavailable")
+            printf '    iPhone 16 (ABCDEF01-2345-6789-ABCD-EF0123456789) (Shutdown) (unavailable)\n'
+            return 0
+            ;;
+        "delete unavailable")
+            printf '%s\n' 'An error was encountered processing the command (domain=NSCocoaErrorDomain, code=513):' \
+                'Errors encountered while deleting multiple devices.' "You don’t have permission." >&2
+            return 1
+            ;;
+    esac
+    return 1
+}
+clean_dev_mobile
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Xcode unavailable simulators cleanup failed (macOS denied access)"* ]] || { echo "$output"; return 1; }
+}
+
+@test "clean_dev_mobile stops when simctl delete unavailable is interrupted" {
+    # Ctrl-C while `simctl delete unavailable` holds the terminal reaches only
+    # the child. A signal stops cleanup before the recount and later caches;
+    # a plain failure or a timeout is a reported skip and cleanup continues.
+    local udid="ABCDEF01-2345-6789-ABCD-EF0123456789"
+    local delete_status case_home
+    for delete_status in 130 143 1 124; do
+        case_home="$HOME/simctl-delete-$delete_status"
+        mkdir -p "$case_home/Library/Developer/CoreSimulator/Devices/$udid"
+
+        run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
+            MOLE_CURRENT_COMMAND=clean MOLE_CLEAN_CANCEL_STATUS=0 \
+            SIMCTL_CALL_LOG="$case_home/simctl-calls.log" DELETE_STATUS="$delete_status" \
+            /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+check_android_ndk() { :; }
+clean_xcode_documentation_cache() { :; }
+clean_xcode_system_coresimulator_caches() { :; }
+clean_xcode_xctest_devices() { :; }
+clean_xcode_device_support() { echo "LATER_DEVICE_SUPPORT"; }
+safe_clean() { :; }
+get_path_size_kb() { echo "1"; }
+note_activity() { :; }
+debug_log() { :; }
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+cleanup_result_color_kb() { printf '%s' "$GREEN"; }
+xcrun() { :; }
+_resolve_simctl_developer_dir() {
+    _MOLE_SIMCTL_DEVELOPER_DIR="$HOME/Xcode.app/Contents/Developer"
+    _MOLE_SIMCTL_RESOLUTION_STATUS="ready"
+}
+_run_simctl() {
+    shift
+    printf '%s\n' "$*" >> "$SIMCTL_CALL_LOG"
+    case "$*" in
+        "list devices unavailable")
+            printf '    iPhone 12 (ABCDEF01-2345-6789-ABCD-EF0123456789) (Shutdown) (unavailable)\n'
+            return 0
+            ;;
+        "delete unavailable") return "$DELETE_STATUS" ;;
+    esac
+    return 1
+}
+
+rc=0
+clean_dev_mobile || rc=$?
+printf 'RC=%s CANCEL=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS"
+EOF
+
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        local list_calls
+        list_calls=$(grep -c '^list devices unavailable$' "$case_home/simctl-calls.log" || true)
+        case "$delete_status" in
+            130 | 143)
+                [[ "$output" == *"RC=$delete_status CANCEL=$delete_status"* ]] || { echo "$output"; return 1; }
+                [[ "$output" != *"cleanup failed"* ]] || { echo "$output"; return 1; }
+                [[ "$output" != *"LATER_DEVICE_SUPPORT"* ]] || { echo "$output"; return 1; }
+                [ "$list_calls" -eq 1 ] || { echo "recount ran after an interrupted delete"; return 1; }
+                ;;
+            1)
+                [[ "$output" == *"RC=0 CANCEL=0"* ]] || { echo "$output"; return 1; }
+                [[ "$output" == *"Xcode unavailable simulators cleanup failed"* ]] || { echo "$output"; return 1; }
+                [[ "$output" == *"LATER_DEVICE_SUPPORT"* ]] || { echo "$output"; return 1; }
+                ;;
+            124)
+                [[ "$output" == *"RC=0 CANCEL=0"* ]] || { echo "$output"; return 1; }
+                [[ "$output" == *"Xcode unavailable simulators · cleanup timed out"* ]] || { echo "$output"; return 1; }
+                [[ "$output" == *"LATER_DEVICE_SUPPORT"* ]] || { echo "$output"; return 1; }
+                ;;
+        esac
+    done
 }
 
 @test "clean_dev_ai_agents protects the copilot version pointed at by ~/.local/bin/copilot" {
@@ -2692,6 +3194,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+# Idle: these cases cover retention, not the open-file hold.
+_mole_container_cache_has_open_handle() { return 1; }
 note_activity() { :; }
 safe_clean() { echo "$1|$2"; }
 clean_dev_ai_agents
@@ -2701,6 +3205,42 @@ EOF
     [[ "$output" == *"/1.0.5|GitHub Copilot CLI old version"* ]] || return 1
     [[ "$output" != *"/1.0.32|"* ]] || return 1
     [[ "$output" != *"/1.0.34|"* ]]
+}
+
+@test "developer debug identifies the active step before it can stall" {
+    run env HOME="$HOME/developer-step-debug" PROJECT_ROOT="$PROJECT_ROOT" \
+        MO_DEBUG=1 MOLE_CURRENT_COMMAND=clean MOLE_CLEAN_CANCEL_STATUS=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+stalled_step() {
+    grep -qF 'Starting developer cleanup step: stalled_step' "$DEBUG_LOG_FILE" || return 9
+    return 130
+}
+rc=0
+_run_developer_cleanup_step --strict stalled_step || rc=$?
+printf 'RC=%s CANCEL=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Starting developer cleanup step: stalled_step"* ]] || return 1
+    [[ "$output" == *"RC=130 CANCEL=130"* ]] || return 1
+}
+
+@test "developer step start diagnostics stay quiet outside debug mode" {
+    run env HOME="$HOME/developer-step-quiet" PROJECT_ROOT="$PROJECT_ROOT" \
+        MO_DEBUG=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+quiet_step() { return 0; }
+_run_developer_cleanup_step quiet_step
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ -z "$output" ]] || return 1
 }
 
 @test "developer cleanup stops before later tools after agent inventory cancellation" {

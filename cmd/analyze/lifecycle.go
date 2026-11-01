@@ -4,8 +4,9 @@ package main
 
 import (
 	"context"
-	tea "github.com/charmbracelet/bubbletea"
 	"sync"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // Shared by every model generation. Register active mutation under the same
@@ -84,10 +85,11 @@ func (m model) trackWork(cmd tea.Cmd) tea.Cmd {
 }
 func (m model) trackDelete(cmd tea.Cmd) tea.Cmd { return m.trackWork(cmd) }
 
-func newScanRequestContext(parent context.Context) (context.Context, context.CancelFunc, *scanPublication) {
+func newScanRequestPublication(parent context.Context) *scanPublication {
 	ctx, cancel := context.WithCancel(parent)
 	publication := newScanPublication(ctx, cancel)
-	return context.WithValue(ctx, overviewPublicationKey{}, publication), cancel, publication
+	publication.ctx = context.WithValue(ctx, overviewPublicationKey{}, publication)
+	return publication
 }
 func overviewPublicationFromContext(ctx context.Context) *scanPublication {
 	if publication, ok := ctx.Value(overviewPublicationKey{}).(*scanPublication); ok {
@@ -96,20 +98,15 @@ func overviewPublicationFromContext(ctx context.Context) *scanPublication {
 	return newScanPublication(ctx, nil)
 }
 func (m model) stopForExit() {
-	// Revoke the parent first, then synchronize the publication boundaries.
 	if m.lifecycle != nil {
 		m.lifecycle.cancel()
-	}
-	if m.scanRequestPublication != nil {
-		m.scanRequestPublication.cancel()
-	}
-	if m.scanRequestCancel != nil {
-		m.scanRequestCancel()
 	}
 	if m.deleteCancel != nil {
 		m.deleteCancel()
 	}
-	m.stopLiveScan()
+	m.cancelLiveScan()
+	m.cancelOverviewScans(nil)
+	m.cancelBackgroundCacheWrites(nil)
 	m.lifecycle.stop()
 }
 

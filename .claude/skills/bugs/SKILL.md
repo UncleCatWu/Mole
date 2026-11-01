@@ -1,6 +1,8 @@
 ---
 name: bugs
 description: "Mole incident catalog for cleanup safety, bounded probes, cancellation, dry-run parity, and actionable gates. Use for a Mole safety-sensitive diff; not for docs, release notes, or generic review."
+metadata:
+  internal: true
 ---
 
 # Mole bug patterns
@@ -31,6 +33,8 @@ Choose only the reference families touched by the evidence. A whole-project audi
 | 16 | Async or cached data has no generation or freshness contract | Bind results to a request epoch and keep each sample's time, stale, and completeness fields together | [State, accounting, and progress](references/state-accounting-and-progress.md) |
 | 17 | Publication gate trusts ambiguous or pre-existing state | Require exact source/tag equality, one generated target, and an expected-absence ref lease | [Test validity and refusal diagnostics](references/test-validity-and-refusal-diagnostics.md) |
 | 18 | A sandbox well-known path is treated as app-private leftovers | Resolve Data/Downloads, Desktop, Pictures, Music, and Movies physically against $HOME | [Deletion evidence and final sink](references/deletion-evidence-and-final-sink.md) |
+
+AGENTS.md and the path-scoped `.claude/rules/` files keep each rule stated fully enough to obey plus its test anchor; the incident story lives in these references or in `release-flow`, and the rule bullet points to the section that holds it. Moving a story here is a merge, never the deletion of a rule that still constrains behavior.
 
 ## Trace the complete mutation lifecycle
 
@@ -75,7 +79,7 @@ Do not trade final-sink rebinding or fail-closed owner checks for speed. Optimiz
 
 ## Verification bar
 
-Use the hotspot commands in `AGENTS.md`; do not guess a narrower verifier. A typical Shell safety change finishes with:
+Use the hotspot commands in the matching `.claude/rules/` file (routed from `AGENTS.md`); do not guess a narrower verifier. A typical Shell safety change finishes with:
 
 ```bash
 ./scripts/check.sh --format

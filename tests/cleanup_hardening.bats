@@ -9,8 +9,8 @@ teardown() {
     rm -rf "$HOME" # SAFE: exact per-test mktemp fixture inside the private test snapshot
 }
 
-@test "owner cache timeout and signals reach developer orchestration and stop next step" {
-    for rc in 124 130 143; do
+@test "owner cache signals reach developer orchestration and stop next step" {
+    for rc in 130 143; do
         run env RC="$rc" /bin/bash << 'SH'
 : > "$TRACE"
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -20,9 +20,10 @@ MOLE_CURRENT_COMMAND=clean
 MOLE_CLEAN_CANCEL_STATUS=0
 is_path_whitelisted() { return 1; }
 note_activity() { :; }
+mkdir -p "$HOME/.cache/npm"
 owner() { echo OWNER >> "$TRACE"; return "$RC"; }
 later() { echo LATER >> "$TRACE"; }
-step() { clean_tool_cache cache "$HOME/cache" owner; echo INSIDE >> "$TRACE"; }
+step() { clean_tool_cache cache "$HOME/.cache/npm" owner; echo INSIDE >> "$TRACE"; }
 status=0
 _run_developer_cleanup_step step || status=$?
 if [[ $status -eq 0 ]]; then _run_developer_cleanup_step later || status=$?; fi
@@ -35,7 +36,7 @@ SH
     done
 }
 
-@test "owner cache ordinary failure is reported and returns failure" {
+@test "owner cache ordinary failure stays diagnostic and does not cancel cleanup" {
     run /bin/bash << 'SH'
 : > "$TRACE"
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -43,14 +44,16 @@ source "$PROJECT_ROOT/lib/clean/dev.sh"
 DRY_RUN=false
 is_path_whitelisted() { return 1; }
 note_activity() { :; }
+mkdir -p "$HOME/.cache/npm"
+MO_DEBUG=1
 owner() { echo OWNER >> "$TRACE"; return 7; }
 rc=0
-clean_tool_cache cache "$HOME/cache" owner || rc=$?
+clean_tool_cache cache "$HOME/.cache/npm" owner || rc=$?
 printf 'RC=%s\n' "$rc"
 cat "$TRACE"
 SH
     [ "$status" -eq 0 ] || return 1
-    [[ "$output" == *"RC=7"* && "$output" == *"OWNER"* && "$output" == *"failed"* ]]
+    [[ "$output" == *"RC=0"* && "$output" == *"OWNER"* && "$output" == *"owner command exited 7"* ]]
 }
 
 @test "developer cleanup preserves Prometheus WAL Git lock and Homebrew locks" {
@@ -164,7 +167,7 @@ first="$HOME/first.dmg"; second="$HOME/second.dmg"
 printf first > "$first"; printf second > "$second"
 INSTALLER_DELETE_PATHS=("$first" "$second")
 INSTALLER_DELETE_SIZES=(5 6)
-INSTALLER_DELETE_IDENTITIES=("$(mole_path_identity "$first")" "$(mole_path_identity "$second")")
+INSTALLER_DELETE_IDENTITIES=("$(mole_deletion_identity "$first")" "$(mole_deletion_identity "$second")")
 reset_installer_delete_results
 mole_delete() {
  printf 'SINK:%s\n' "$1" >> "$TRACE"
@@ -214,7 +217,7 @@ SH
 }
 
 @test "installer size cancellation stops before any sink and the otherwise eligible next probe" {
-    for rc in 124 130; do
+    for rc in 130 143; do
         run env RC="$rc" /bin/bash << 'SH'
 : > "$TRACE"
 export MOLE_TEST_MODE=1
@@ -223,7 +226,7 @@ first="$HOME/size-first.dmg"; second="$HOME/size-second.dmg"
 printf first > "$first"; printf second > "$second"
 INSTALLER_DELETE_PATHS=("$first" "$second")
 INSTALLER_DELETE_SIZES=(5 6)
-INSTALLER_DELETE_IDENTITIES=("$(mole_path_identity "$first")" "$(mole_path_identity "$second")")
+INSTALLER_DELETE_IDENTITIES=("$(mole_deletion_identity "$first")" "$(mole_deletion_identity "$second")")
 reset_installer_delete_results
 installer_file_size_bytes() {
  printf 'SIZE:%s\n' "$1" >> "$TRACE"

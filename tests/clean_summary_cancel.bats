@@ -1,18 +1,13 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 # Regression for #1342: when a cleanup scan/size check hits its internal
 # timeout (exit 124), `mo clean` must still print the final summary with an
 # explicit reason instead of exiting silently mid-run.
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-clean-summary-cancel.XXXXXX")"
-    export HOME
+    mole_test_setup_home clean-summary-cancel
 
     mkdir -p "$HOME/Library/Caches"
     mkdir -p "$HOME/.config/mole"
@@ -22,12 +17,7 @@ setup_file() {
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-clean-summary-cancel."* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 setup() {
@@ -101,16 +91,56 @@ EOF
     run_perform_cleanup_with 124
 
     [ "$status" -eq 124 ]
-    [[ "$output" == *"Cleanup cancelled"* ]]
-    [[ "$output" == *"timed out (exit 124)"* ]]
+    [[ "$output" == *"Cleanup cancelled"* ]] || return 1
+    [[ "$output" == *"timed out (exit 124)"* ]] || return 1
     [[ "$output" == *"Remaining cleanup was skipped"* ]]
+}
+
+@test "a timeout names the cancelled step in the summary and mole.log" {
+    run_perform_cleanup_with 124
+
+    [ "$status" -eq 124 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Cancelled: clean_user_essentials timed out (exit 124)."* ]] || return 1
+    grep -qF "WARNING: Cancelled: clean_user_essentials timed out (exit 124). Section: User essentials." \
+        "$HOME/Library/Logs/mole/mole.log"
+}
+
+@test "the innermost cancellation label wins over the step name" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+for fn in clean_user_essentials clean_finder_metadata clean_app_caches \
+    clean_browsers run_cloud_and_office_cleanup clean_developer_tools \
+    clean_user_gui_applications clean_virtualization_tools \
+    clean_application_support_logs clean_orphaned_app_data \
+    clean_orphaned_system_services clean_orphaned_container_stubs \
+    show_user_launch_agent_hint_notice \
+    clean_apple_silicon_caches clean_cached_device_firmware \
+    clean_time_machine_failed_backups check_large_file_candidates \
+    show_project_artifact_hint_notice; do
+    eval "$fn() { return 0; }"
+done
+clean_app_caches() {
+    MOLE_CURRENT_COMMAND=clean
+    _mole_record_clean_cancellation 124 "Slow owner cache"
+    return 124
+}
+perform_cleanup
+EOF
+
+    [ "$status" -eq 124 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Cancelled: Slow owner cache timed out (exit 124)."* ]] || return 1
+    [[ "$output" != *"clean_app_caches timed out"* ]] || return 1
+    grep -qF "WARNING: Cancelled: Slow owner cache timed out (exit 124). Section: App caches." \
+        "$HOME/Library/Logs/mole/mole.log"
 }
 
 @test "interrupted section (>=128) prints an interrupted summary" {
     run_perform_cleanup_with 130
 
     [ "$status" -eq 130 ]
-    [[ "$output" == *"Cleanup interrupted"* ]]
+    [[ "$output" == *"Cleanup interrupted"* ]] || return 1
     [[ "$output" == *"was interrupted (exit 130)"* ]]
 }
 
@@ -238,12 +268,13 @@ EOF
     done
 }
 
-@test "protected Finder metadata skips its scan and preserves later cleanup" {
+@test "protected Finder metadata skips both external scans" {
     run_external_finder_scan_with 124 false true
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
-    [[ "$output" == *"RC=0 CANCEL=0 FILES=1"* ]] || return 1
-    [[ "$output" == *"REMOVE:"*"/External/._later"* ]] || return 1
+    [[ "$output" == *"RC=0 CANCEL=0 FILES=0"* ]] || return 1
+    [[ "$output" != *"REMOVE:"* && "$output" != *"PREVIEW:"* ]] || return 1
     [[ "$output" != *"/External/.DS_Store"* ]] || return 1
+    [[ "$output" != *"/External/._later"* ]] || return 1
 }
 
 @test "cloud safety cancellation crosses the timeout worker and stops later sections" {
@@ -286,8 +317,38 @@ EOF
     run_perform_cleanup_with 0
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Cleanup complete"* ]]
+    [[ "$output" == *"Cleanup complete"* ]] || return 1
     [[ "$output" != *"Cleanup cancelled"* ]]
+}
+
+@test "real-run summary colors the tracked cleanup size by unit" {
+    # MOLE_TEST_MODE would stop perform_cleanup before the summary;
+    # MOLE_TEST_NO_AUTH alone keeps ANSI colors on without a terminal.
+    run env -u NO_COLOR -u MOLE_TEST_MODE HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+for fn in clean_user_essentials clean_finder_metadata clean_app_caches \
+    clean_browsers run_cloud_and_office_cleanup clean_developer_tools \
+    clean_user_gui_applications clean_virtualization_tools \
+    clean_application_support_logs clean_orphaned_app_data \
+    clean_orphaned_system_services clean_orphaned_container_stubs \
+    show_user_launch_agent_hint_notice \
+    clean_apple_silicon_caches clean_cached_device_firmware \
+    clean_time_machine_failed_backups check_large_file_candidates \
+    show_project_artifact_hint_notice; do
+    eval "$fn() { return 0; }"
+done
+clean_user_essentials() {
+    total_size_cleaned=10485760
+    files_cleaned=42
+    total_items=9
+}
+perform_cleanup
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *$'Removed: \033[0;31m10.74GB\033[0m'* ]]
 }
 
 @test "partial cleanup keeps routine timeouts out of the default summary" {
@@ -323,7 +384,7 @@ EOF
     local plain_output
     plain_output=$(printf '%s' "$output" | sed -E $'s/\033\\[[0-9;]*m//g')
     [[ "$output" == *"Cleanup complete"* ]] || return 1
-    [[ "$plain_output" == *"Tracked cleanup: At least 10.74GB | Items cleaned: 42"* ]] || return 1
+    [[ "$plain_output" == *"Removed: 10.74GB+ · 42 items"* ]] || return 1
     [[ "$output" == *"RECORDED=1/2"* ]] || return 1
     [[ "$output" == *"Free space:"* ]] || return 1
     [[ "$output" != *"size-check budget"* && "$output" != *"removal budget"* ]] || return 1
@@ -408,8 +469,44 @@ EOF
     [[ "$output" != *"Cleanup cancelled"* ]] || return 1
     local plain_output
     plain_output=$(printf '%s' "$output" | sed -E $'s/\033\\[[0-9;]*m//g')
-    [[ "$plain_output" == *"Tracked cleanup: Partially measured"* ]] || return 1
+    [[ "$plain_output" == *"Removed: Partially measured"* ]] || return 1
     [[ "$output" != *"size-check budget"* ]] || return 1
     [[ "$output" != *"System was already clean"* ]] || return 1
     [[ ! -e "$HOME/Library/Caches/cache1374" ]]
+}
+
+@test "dry-run summary shows loading while it writes the detailed list" {
+    if ! /usr/bin/script -q /dev/null /usr/bin/true < /dev/null > /dev/null 2>&1; then
+        skip "script cannot allocate a TTY in this environment"
+    fi
+    local raw="$HOME/summary-loading.raw"
+
+    # shellcheck disable=SC2016  # inner bash expands these from its environment
+    PROJECT_ROOT="$PROJECT_ROOT" HOME="$HOME" TERM=xterm-256color MOLE_DRY_RUN=1 MOLE_TEST_NO_AUTH=1 \
+        /usr/bin/script -q -F "$raw" /bin/bash --noprofile --norc -c '
+            set -euo pipefail
+            source "$PROJECT_ROOT/bin/clean.sh"
+            for fn in clean_user_essentials clean_finder_metadata clean_app_caches \
+                clean_browsers run_cloud_and_office_cleanup clean_developer_tools \
+                clean_user_gui_applications clean_virtualization_tools \
+                clean_application_support_logs clean_orphaned_app_data \
+                clean_orphaned_system_services clean_orphaned_container_stubs \
+                show_user_launch_agent_hint_notice \
+                clean_apple_silicon_caches clean_cached_device_firmware \
+                clean_time_machine_failed_backups check_large_file_candidates \
+                show_project_artifact_hint_notice; do
+                eval "$fn() { return 0; }"
+            done
+            spinning=""
+            start_section_spinner() { spinning="$1"; }
+            stop_section_spinner() { spinning=""; }
+            render_clean_preview_from_ledger() { echo "RENDER_WHILE:${spinning:-none}"; }
+            print_summary_block() { echo "SUMMARY_WHILE:${spinning:-none}"; }
+            perform_cleanup
+        ' < /dev/null > /dev/null 2>&1 || true
+
+    local content
+    content=$(tr -d '\r' < "$raw")
+    [[ "$content" == *"RENDER_WHILE:Preparing summary..."* ]] || { echo "$content"; return 1; }
+    [[ "$content" == *"SUMMARY_WHILE:none"* ]] || { echo "$content"; return 1; }
 }

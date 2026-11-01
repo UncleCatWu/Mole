@@ -1,27 +1,33 @@
 ---
-name: Feature Request
-about: Suggest an idea for Mole
+name: CLI Feature Request
+about: Suggest an improvement for the Mole command-line tool
 title: '[FEATURE] '
 labels: enhancement
 assignees: ''
 ---
 
-## Feature description
+## Before submitting
 
-A clear and concise description of the feature you'd like to see. We suggest using English for better global understanding.
+Run `mo update` to install the latest stable version, then check `mo --version`. Check whether the requested feature is already available.
 
-## Use case
+- [ ] I updated to the latest stable version and checked that this feature is still missing.
 
-Describe the problem this feature would solve or the benefit it would provide.
+## Description
 
-## Proposed solution
+What feature would you like to see? English is preferred so more contributors can help discuss.
 
-How do you envision this feature working?
+## Problem or Use Case
 
-## Alternatives considered
+What problem does this solve, or what workflow would it improve?
 
-Have you considered any alternative solutions or workarounds?
+## Proposed Solution
 
-## Additional context
+How should this work in Mole? (Commands, flags, or expected behavior)
 
-Add any other context, mockups, or examples about the feature request here.
+## Alternatives Considered
+
+Any workarounds or other tools you currently use?
+
+## Additional Context
+
+Mockups, screenshots, or extra context (optional).

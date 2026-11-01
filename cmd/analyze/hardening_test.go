@@ -25,7 +25,7 @@ func TestHardeningDeleteReceiptBindsOperationAndParent(t *testing.T) {
 	m.cache[origin], m.cache[current] = historyEntry{}, historyEntry{}
 	m.entriesAll = []dirEntry{{Name: "unrelated", Path: filepath.Join(current, "unrelated"), Size: 5}}
 	m.entries, m.totalSize = m.entriesAll, 5
-	m.scanRequestID = 20
+	m.liveScanID = 20
 	for _, receipt := range []deleteProgressMsg{
 		{done: true, operationID: 7, parentPath: origin, path: removed},
 		{done: true, operationID: 8, parentPath: current, path: removed},
@@ -38,7 +38,7 @@ func TestHardeningDeleteReceiptBindsOperationAndParent(t *testing.T) {
 	}
 	updated, cmd := m.Update(deleteProgressMsg{done: true, operationID: 8, parentPath: origin, path: removed, count: 1})
 	m = updated.(model)
-	if m.deleting || cmd != nil || m.totalSize != 5 || m.scanRequestID != 20 || m.cache[current].NeedsRefresh {
+	if m.deleting || cmd != nil || m.totalSize != 5 || m.liveScanID != 20 || m.cache[current].NeedsRefresh {
 		t.Fatal("matching origin receipt altered the unrelated current view")
 	}
 	if !m.cache[origin].NeedsRefresh {
@@ -110,7 +110,7 @@ func TestHardeningTerminalTrashOutcomeStopsFallbackAndBatch(t *testing.T) {
 			}
 			trashFilesystemRunner = func(string, ...context.Context) error { fallbackCalls++; return nil }
 			trashFinderRunner = func(context.Context, string) ([]byte, error) { fallbackCalls++; return nil, nil }
-			receipt := deleteMultiplePathsCmd([]string{first, second}, nil, deleteRequest{ctx: ctx})().(deleteProgressMsg)
+			receipt := deleteMultiplePathsCmd([]string{first, second}, nil, nil, deleteRequest{ctx: ctx})().(deleteProgressMsg)
 			if binaryCalls != 1 || fallbackCalls != 0 || receipt.count != 0 || !isTerminalDeleteError(receipt.err) {
 				t.Fatalf("terminal outcome did not stop later sinks: binary=%d fallback=%d receipt=%+v", binaryCalls, fallbackCalls, receipt)
 			}
@@ -154,13 +154,13 @@ func TestHardeningDefaultExternalDeleteSeamsAreBlocked(t *testing.T) {
 
 func TestHardeningCacheResultRequiresCurrentRequest(t *testing.T) {
 	m := hardeningModel(t.TempDir())
-	m.scanRequestID, m.scanning, m.totalSize = 2, true, 10
-	updated, cmd := m.Update(scanResultMsg{requestID: 1, path: m.path, result: scanResult{TotalSize: 999}})
+	m.liveScanID, m.scanning, m.totalSize = 2, true, 10
+	updated, cmd := m.Update(scanResultMsg{id: 1, path: m.path, result: scanResult{TotalSize: 999}})
 	m = updated.(model)
 	if cmd != nil || !m.scanning || m.totalSize != 10 {
 		t.Fatal("older cache return prematurely completed the current scan")
 	}
-	updated, _ = m.Update(scanResultMsg{requestID: 2, path: m.path, result: scanResult{TotalSize: 20}})
+	updated, _ = m.Update(scanResultMsg{id: 2, path: m.path, result: scanResult{TotalSize: 20}})
 	if got := updated.(model); got.scanning || got.totalSize != 20 {
 		t.Fatal("positive control: matching cache return was not applied")
 	}
@@ -202,14 +202,14 @@ func TestHardeningCanceledOverviewProbeCannotPublishSnapshot(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	stopped := scanOverviewPathCmd(downloads, 0, 1, ctx)().(overviewSizeMsg)
+	stopped := scanOverviewPathCmd(downloads, 0, newScanPublication(ctx, nil))().(overviewSizeMsg)
 	if !errors.Is(stopped.Err, context.Canceled) {
 		t.Fatal("canceled overview probe was treated as a measurement")
 	}
 	if _, err := loadStoredOverviewSize(downloads); err == nil {
 		t.Fatal("canceled overview probe populated persistent derived data")
 	}
-	live := scanOverviewPathCmd(downloads, 0, 2, context.Background())().(overviewSizeMsg)
+	live := scanOverviewPathCmd(downloads, 0, newScanPublication(context.Background(), nil))().(overviewSizeMsg)
 	if live.Err != nil || live.Size != 3 {
 		t.Fatal("positive control: matching live probe did not measure the fixture")
 	}
@@ -217,25 +217,29 @@ func TestHardeningCanceledOverviewProbeCannotPublishSnapshot(t *testing.T) {
 
 func TestHardeningOverviewEpochAndRemainingSlots(t *testing.T) {
 	m := hardeningModel("/")
-	m.isOverview, m.scanRequestID = true, 2
-	m.overviewRequestIDs = make(map[string]int64)
+	m.isOverview = true
 	for i := range maxConcurrentOverview + 5 {
 		path := filepath.Join("/fixture", strings.Repeat("x", i+1))
 		m.entries = append(m.entries, dirEntry{Path: path, Size: -1})
 		if i < maxConcurrentOverview-1 {
-			m.overviewScanningSet[path], m.overviewRequestIDs[path] = true, 1
+			m.overviewScanningSet[path] = newScanRequestPublication(m.lifetimeContext())
 		}
 	}
+	defer m.cancelOverviewScans(nil)
 	if cmd := m.scheduleOverviewScans(); cmd == nil || len(m.overviewScanningSet) != maxConcurrentOverview {
 		t.Fatal("one remaining slot did not schedule exactly one probe")
 	}
 	first := m.entries[0].Path
-	updated, _ := m.Update(overviewSizeMsg{RequestID: 1, Path: first, Size: 999})
+	old := m.overviewScanningSet[first]
+	old.cancel()
+	current := newScanRequestPublication(m.lifetimeContext())
+	m.overviewScanningSet[first] = current
+	updated, _ := m.Update(overviewSizeMsg{publication: old, Path: first, Size: 999})
 	m = updated.(model)
-	if m.entries[0].Size != -1 || len(m.overviewScanningSet) != maxConcurrentOverview || m.overviewRequestIDs[first] != 2 {
+	if m.entries[0].Size != -1 || len(m.overviewScanningSet) != maxConcurrentOverview || m.overviewScanningSet[first] != current {
 		t.Fatal("old overview result changed the measurement or exceeded the probe budget")
 	}
-	updated, _ = m.Update(overviewSizeMsg{RequestID: 2, Path: first, Size: 50})
+	updated, _ = m.Update(overviewSizeMsg{publication: current, Path: first, Size: 50})
 	m = updated.(model)
 	if m.entries[0].Size != 50 || len(m.overviewScanningSet) != maxConcurrentOverview {
 		t.Fatal("matching overview result was not applied with bounded refill")
@@ -287,14 +291,14 @@ func TestHardeningOverviewCacheNeverFallsBackToDirectoryScope(t *testing.T) {
 	if err := saveCacheToDisk(downloads, scanResult{TotalSize: 999}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadOverviewCachedSize(downloads); err == nil {
+	if _, _, err := loadOverviewCachedMeasurement(downloads); err == nil {
 		t.Fatal("full Downloads cache was accepted as a 90-day overview measurement")
 	}
-	size, err := measureInsightSize(downloads)
+	size, err := measureInsightSize(context.Background(), downloads)
 	if err != nil || size != 3 {
 		t.Fatalf("old Downloads measurement=%d err=%v", size, err)
 	}
-	if cached, err := loadOverviewCachedSize(downloads); err != nil || cached != 3 {
+	if cached, _, err := loadOverviewCachedMeasurement(downloads); err != nil || cached != 3 {
 		t.Fatal("positive control: scoped overview measurement was not cached")
 	}
 }

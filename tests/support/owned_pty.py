@@ -25,28 +25,52 @@ def write_record(path, value):
     pending.replace(path)
 
 
-def stop_child(child):
+def stop_child(child, drain_fd=None):
+    def wait_reaped(timeout):
+        deadline = time.monotonic() + timeout
+        while child.poll() is None:
+            # Darwin can hold an exiting terminal leader until its echoed
+            # input/output drains. Consume only this lease's exact master;
+            # discarding cleanup output must never turn into an unbounded read.
+            if drain_fd is not None and select.select([drain_fd], [], [], 0)[0]:
+                try:
+                    os.read(drain_fd, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(child.args, timeout)
+            time.sleep(.02)
+        return child.wait(timeout=timeout)
+
     # Descendants may still occupy this owned group after its leader exits.
     try:
         os.killpg(child.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     try:
-        child.wait(timeout=2)
+        wait_reaped(2)
     except subprocess.TimeoutExpired:
         os.killpg(child.pid, signal.SIGKILL)
-        child.wait(timeout=2)
+        wait_reaped(2)
     until = time.monotonic() + 2
     escalated = False
     while True:
+        unknown = False
         try:
             os.killpg(child.pid, 0)
         except ProcessLookupError:
             return child.returncode
+        except PermissionError:
+            # Darwin can temporarily deny a probe while orphaned members are
+            # being reaped. That is unknown, not gone: retain the lease until
+            # ESRCH proves the group ended, or poison it at the deadline.
+            unknown = True
         if time.monotonic() >= until:
             if escalated:
                 raise RuntimeError('owned child group did not terminate; lease cannot be reused')
-            os.killpg(child.pid, signal.SIGKILL)
+            if not unknown:
+                os.killpg(child.pid, signal.SIGKILL)
             escalated = True
             until = time.monotonic() + 2
         time.sleep(.05)
@@ -120,16 +144,19 @@ class OwnedPair:
         # token, so the next lease refuses rather than trusting missing cleanup.
         write_record(self.busy_path, self.receipt)
 
-    def spawn(self, command, env=None, background=False):
+    def spawn(self, command, env=None, background=False, stdin=None, stdout=None, stderr=None):
         assert self.child is None, 'one child per owned PTY lease'
         slave = self.slave
         def terminal_session():
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(signum, signal.SIG_DFL)
             os.setsid()
             fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
         if background:
             command = [sys.executable, '-B', __file__, 'background-wrapper', *command]
-        self.child = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
-                                      env=env, preexec_fn=terminal_session,
+        self.child = subprocess.Popen(command, stdin=slave if stdin is None else stdin,
+                                      stdout=slave if stdout is None else stdout,
+                                      stderr=slave if stderr is None else stderr, env=env, preexec_fn=terminal_session,
                                       pass_fds=(slave,))
         self.receipt['child_pid'] = self.child.pid
         write_record(self.receipt_path, self.receipt)
@@ -141,7 +168,7 @@ class OwnedPair:
             signal.signal(signum, signal.SIG_IGN)
         try:
             if self.child is not None:
-                stop_child(self.child)
+                stop_child(self.child, self.master)
             # Restore through a fresh identity-bound descriptor after revoke.
             restore_fd = os.open(self.record['slave_path'], os.O_RDWR | os.O_NOCTTY)
             try:
@@ -158,6 +185,13 @@ class OwnedPair:
                     self.busy_path.unlink()
                 except OSError as exc:
                     error = exc
+            if self.child is not None:
+                for stream in (self.child.stdin, self.child.stdout, self.child.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError as exc:
+                            error = error or exc
             for fd in (self.slave, self.master, self.lock):
                 try:
                     os.close(fd)
@@ -177,6 +211,39 @@ class OwnedPair:
 
     def __exit__(self, *_):
         self.close()
+
+
+def capture_held(pair, command, timeout=5):
+    """Capture a command but hold its controlling session for termios checks."""
+    marker = b"__MOLE_HELD_EXIT__="
+    keeper = ('import subprocess,sys,time; '
+              'result=subprocess.run(sys.argv[1:]); '
+              'print("__MOLE_HELD_EXIT__="+str(result.returncode),flush=True); '
+              'time.sleep(30)')
+    child = pair.spawn([sys.executable, '-B', '-c', keeper, *command],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output, errors = bytearray(), bytearray()
+    deadline = time.monotonic() + timeout
+    while marker not in output or not output.endswith(b"\n"):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(('held terminal command exceeded deadline', bytes(output), bytes(errors)))
+        ready = select.select([child.stdout, child.stderr], [], [], .02)[0]
+        for stream in ready:
+            chunk = os.read(stream.fileno(), 65536)
+            if not chunk:
+                raise RuntimeError('held terminal keeper exited before receipt')
+            (output if stream is child.stdout else errors).extend(chunk)
+        if len(output) + len(errors) > 1024 * 1024:
+            raise RuntimeError('held terminal capture exceeded 1 MiB')
+    stdout, receipt = bytes(output).rsplit(marker, 1)
+    # The command exited before the keeper printed its receipt, so its error
+    # pipe is complete even when stdout became readable first.
+    while select.select([child.stderr], [], [], 0)[0]:
+        chunk = os.read(child.stderr.fileno(), 65536)
+        if not chunk:
+            break
+        errors.extend(chunk)
+    return stdout, bytes(errors), int(receipt.strip())
 
 
 def capture(pair, command, background=False, deadline=20):

@@ -1,8 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-	export PROJECT_ROOT
+	mole_test_setup_project_root
 
 	TEST_HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-optimize-probes.XXXXXX")"
 	export TEST_HOME
@@ -12,26 +13,6 @@ teardown_file() {
 	if [[ "$TEST_HOME" == "${BATS_TEST_DIRNAME}/tmp-optimize-probes."* ]]; then
 		rm -rf "$TEST_HOME"
 	fi
-}
-
-@test "system maintenance reports a failed Spotlight probe" {
-	run env HOME="$TEST_HOME/system" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
-set -euo pipefail
-source "$PROJECT_ROOT/lib/core/common.sh"
-source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE
-flush_dns_cache() { return 0; }
-mkdir -p "$HOME/bin"
-printf '#!/bin/bash\nexit 7\n' > "$HOME/bin/mdutil"
-chmod +x "$HOME/bin/mdutil"
-PATH="$HOME/bin:$PATH"
-
-execute_optimization system_maintenance
-[[ "$(optimize_outcome_count failed)" == "1" ]] || exit 1
-EOF
-
-	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-	[[ "$output" == *"Failed to verify Spotlight index"* ]] || return 1
 }
 
 @test "Spotlight optimization reports a failed status probe" {
@@ -266,11 +247,21 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE
+mkdir -p "$HOME"
+: > "$HOME/audit.trace"
+# This outcome test needs a completed inventory, not the host's installed apps.
+_login_item_build_app_inventory() {
+    [[ $# -eq 2 && -f "$1" && "$2" =~ ^[0-9]+$ ]] || return 99
+    : > "$1"
+    printf 'inventory\n' >> "$HOME/audit.trace"
+}
+run_with_timeout() { printf 'unexpected probe:%s\n' "$*" >> "$HOME/audit.trace"; return 99; }
 
 _login_items_snapshot() {
     printf 'Confirmed Missing\t\nUnknown Item\t\n'
 }
 _login_item_app_exists() {
+    printf 'resolver:%s\n' "$1" >> "$HOME/audit.trace"
     case "$1" in
         "Confirmed Missing") return 1 ;;
         *) return 124 ;;
@@ -278,14 +269,16 @@ _login_item_app_exists() {
 }
 
 execute_optimization login_items_audit
-printf 'FAILED=%s ATTENTION=%s\n' \
-    "$(optimize_outcome_count failed)" "$(optimize_outcome_count attention)"
+[[ "$(cat "$HOME/audit.trace")" == $'inventory\nresolver:Confirmed Missing\nresolver:Unknown Item' ]] || { cat "$HOME/audit.trace"; exit 1; }
+printf 'FAILED=%s ATTENTION=%s UNAVAILABLE=%s\n' \
+    "$(optimize_outcome_count failed)" "$(optimize_outcome_count attention)" \
+    "$(optimize_outcome_count unavailable)"
 EOF
 
 	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-	[[ "$output" == *"Login items audit incomplete"* ]] || return 1
-	[[ "$output" == *"FAILED=1 ATTENTION=0"* ]] || return 1
-	[[ "$output" != *"Broken login item"* ]] || return 1
+	[[ "$output" == *"Login items audit incomplete"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"FAILED=0 ATTENTION=0 UNAVAILABLE=1"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"Broken login item"* ]] || { echo "$output"; return 1; }
 }
 
 @test "login item audit still reports conclusively absent items" {
@@ -294,18 +287,31 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE
+mkdir -p "$HOME"
+: > "$HOME/audit.trace"
+# This outcome test needs a completed inventory, not the host's installed apps.
+_login_item_build_app_inventory() {
+    [[ $# -eq 2 && -f "$1" && "$2" =~ ^[0-9]+$ ]] || return 99
+    : > "$1"
+    printf 'inventory\n' >> "$HOME/audit.trace"
+}
+run_with_timeout() { printf 'unexpected probe:%s\n' "$*" >> "$HOME/audit.trace"; return 99; }
 
 _login_items_snapshot() { printf 'Confirmed Missing\t\n'; }
-_login_item_app_exists() { return 1; }
+_login_item_app_exists() {
+    printf 'resolver:%s\n' "$1" >> "$HOME/audit.trace"
+    return 1
+}
 
 execute_optimization login_items_audit
+[[ "$(cat "$HOME/audit.trace")" == $'inventory\nresolver:Confirmed Missing' ]] || { cat "$HOME/audit.trace"; exit 1; }
 printf 'FAILED=%s ATTENTION=%s\n' \
     "$(optimize_outcome_count failed)" "$(optimize_outcome_count attention)"
 EOF
 
 	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-	[[ "$output" == *"Broken login item: Confirmed Missing"* ]] || return 1
-	[[ "$output" == *"FAILED=0 ATTENTION=1"* ]] || return 1
+	[[ "$output" == *"Broken login item: Confirmed Missing"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"FAILED=0 ATTENTION=1"* ]] || { echo "$output"; return 1; }
 }
 
 @test "login item audit reuses one fallback app inventory" {
@@ -387,9 +393,8 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 mdutil() { echo "UNEXPECTED_MDUTIL"; return 0; }
 
-execute_optimization system_maintenance
 execute_optimization network_optimization
-[[ "$(optimize_outcome_count skipped)" == "2" ]] || exit 1
+[[ "$(optimize_outcome_count skipped)" == "1" ]] || exit 1
 [[ "$(optimize_outcome_count failed)" == "0" ]] || exit 1
 EOF
 
@@ -478,7 +483,7 @@ EOF
 set -euo pipefail
 tasks_file="$PROJECT_ROOT/lib/optimize/tasks.sh"
 
-system_body=$(sed -n '/^opt_system_maintenance() {/,/^}/p' "$tasks_file")
+spotlight_body=$(sed -n '/^opt_spotlight_index_optimize() {/,/^}/p' "$tasks_file")
 saved_body=$(sed -n '/^opt_saved_state_cleanup() {/,/^}/p' "$tasks_file")
 network_body=$(sed -n '/^opt_network_stack_optimize() {/,/^}/p' "$tasks_file")
 vpn_body=$(sed -n '/^has_active_vpn_interface() {/,/^}/p' "$tasks_file")
@@ -488,7 +493,7 @@ login_resolver_body=$(sed -n '/^_login_item_app_exists() {/,/^}/p' "$tasks_file"
 login_metadata_body=$(sed -n '/^_login_item_build_metadata_inventory() {/,/^}/p' "$tasks_file")
 login_inventory_body=$(sed -n '/^_login_item_build_app_inventory() {/,/^}/p' "$tasks_file")
 
-[[ "$system_body" == *'run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" mdutil -s /'* ]] || exit 1
+[[ "$spotlight_body" == *'run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" mdutil -s /'* ]] || exit 1
 [[ "$saved_body" == *'run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" find'* ]] || exit 1
 [[ "$network_body" == *'run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" route -n get default'* ]] || exit 1
 [[ "$network_body" == *'run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" dscacheutil -q host'* ]] || exit 1
@@ -576,13 +581,14 @@ exit 1
 STUB
 chmod +x "$HOME/bin/find"
 PATH="$HOME/bin:$PATH"
+FIND_BSD=find # Bind the bounded permission probe to its exact fixture.
 safe_remove() { printf 'UNEXPECTED_REMOVE\n'; return 0; }
 execute_optimization shared_file_list_repair
-[[ "$(optimize_outcome_count skipped)" == "1" ]] || exit 1
+[[ "$(optimize_outcome_count unavailable)" == "1" ]] || exit 1
 [[ -f "$sfl_dir/partial.sfl3" && -f "$HOME/find-reached" ]] || exit 1
 EOF
     [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-    [[ "$output" == *"Shared file lists skipped (access denied; files kept)"* ]] || return 1
+    [[ "$output" == *"Shared file lists not readable"*"Full Disk Access"* ]] || return 1
     [[ "$output" != *"all healthy"* ]] || return 1
     [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
 }

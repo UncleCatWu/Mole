@@ -1,10 +1,12 @@
 #!/usr/bin/env bats
+
+load helpers/common
+
 # Verify color detection: NO_COLOR per https://no-color.org, TERM=dumb, and
 # stdout that is not a terminal.
 
 setup_file() {
-	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-	export PROJECT_ROOT
+	mole_test_setup_project_root
 }
 
 setup() {

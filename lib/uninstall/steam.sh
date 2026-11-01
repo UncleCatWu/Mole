@@ -20,6 +20,27 @@ uninstall_steam_launcher_appid() {
     local app_path="${1:-}"
     [[ -n "$app_path" && -d "$app_path" ]] || return 1
 
+    # Every launcher is a "#!" script. The selector asks this for each app, so
+    # rule out bundles whose Contents/MacOS holds no such file with builtins
+    # before forking PlistBuddy, wc and awk. A subdirectory may hold the
+    # executable, so it leaves the decision to the full check below.
+    local macos_dir="$app_path/Contents/MacOS" candidate="" head="" may_be_script=false
+    [[ -d "$macos_dir" ]] || return 1
+    for candidate in "$macos_dir"/* "$macos_dir"/.[!.]* "$macos_dir"/..?*; do
+        if [[ -d "$candidate" ]]; then
+            may_be_script=true
+            break
+        fi
+        [[ -f "$candidate" ]] || continue
+        head=""
+        IFS= read -r -n 2 head 2> /dev/null < "$candidate" || true
+        if [[ "$head" == "#!" ]]; then
+            may_be_script=true
+            break
+        fi
+    done
+    [[ "$may_be_script" == true ]] || return 1
+
     local exec_name=""
     local plist="$app_path/Contents/Info.plist"
     if [[ -f "$plist" ]]; then

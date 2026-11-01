@@ -13,11 +13,6 @@ export PATH="$HOME/observer-bin:$PATH"
 # Existing production timeout bounds are shortened only in this test shell.
 export MOLE_TIMEOUT_HINT_SCAN_SEC=15 MOLE_PROJECT_CACHE_SCAN_TIMEOUT=2
 [[ "$NATIVE_CASE" != app_scan ]] || export MOLE_TIMEOUT_HINT_SCAN_SEC=2
-# Observer startup is part of the timed command in both completion and stall
-# controls; it must not consume the production-sized 0.4s fixture budget.
-case "$NATIVE_CASE" in
-    app_complete | app_du) export MOLE_APP_SUPPORT_ITEM_SIZE_TIMEOUT_SEC=2 ;;
-esac
 export MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=1
 source "$PWD/bin/clean.sh"
 # Pin the backend actually used on this Mac. No replacement of run_with_timeout.
@@ -61,7 +56,14 @@ clean_orphaned_app_data() { echo LATER_SECTION; }
 eval "$(declare -f app_support_item_size_bytes | sed '1s/app_support_item_size_bytes/native_size_helper/')"
 app_support_item_size_bytes() {
     printf 'SIZE:%s\n' "${1##*/}" >> "$HOME/action-trace"
-    native_size_helper "$@"
+    # Observer startup is part of the native command. Give healthy controls
+    # their fixture budget through the existing size-helper argument, without
+    # restoring an undocumented production setting. The cumulative deadline
+    # and the real recursive producer remain unchanged.
+    case "$NATIVE_CASE" in
+        app_complete | app_du) native_size_helper "$1" 2 ;;
+        *) native_size_helper "$@" ;;
+    esac
 }
 eval "$(declare -f record_dry_run_cleanup_target | sed '1s/record_dry_run_cleanup_target/native_preview_helper/')"
 record_dry_run_cleanup_target() {
@@ -93,6 +95,7 @@ else:
     (r/'b').write_bytes(b'x'*2048)
 PY
 if [[ "$NATIVE_CASE" == project_* ]]; then
+    FIND_BSD="find" # Route the native BSD producer through the audited observer.
     project="$HOME/Documents/fixture"
     python3 -I -B - "$project" << 'PY'
 from pathlib import Path

@@ -74,24 +74,31 @@ unset mole_color
 #   mole_pgrep_any -x Xcode -f com.apple.dt.XCTest
 # Returns 0 when any pattern matches, 1 only when every probe reports no match,
 # and 2 when no pattern matches but at least one probe could not be completed.
+# pgrep reads each pattern as an extended regex, so the patterns of one
+# selector join with | into a single probe; -x still anchors the whole name.
+# A pgrep per pattern cost about 16ms each in per-item delete guards.
 mole_pgrep_any() {
     if [[ $# -eq 0 || $(($# % 2)) -ne 0 ]] || ! command -v pgrep > /dev/null 2>&1; then
         return 2
     fi
 
-    local aggregate_rc=1
-    local selector pattern probe_rc
+    local exact="" full="" selector pattern probe_rc aggregate_rc=1
     while [[ $# -gt 0 ]]; do
-        selector="$1"
-        pattern="$2"
+        case "$1" in
+            -x) exact="${exact:+$exact|}$2" ;;
+            -f) full="${full:+$full|}$2" ;;
+            *) return 2 ;;
+        esac
         shift 2
+    done
 
+    for selector in -x -f; do
+        pattern="$exact"
+        [[ "$selector" == "-x" ]] || pattern="$full"
+        [[ -n "$pattern" ]] || continue
         probe_rc=0
-        if pgrep "$selector" "$pattern" > /dev/null 2>&1; then
-            return 0
-        else
-            probe_rc=$?
-        fi
+        pgrep "$selector" "$pattern" > /dev/null 2>&1 || probe_rc=$?
+        [[ $probe_rc -ne 0 ]] || return 0
         [[ $probe_rc -eq 1 ]] || aggregate_rc=2
     done
 
@@ -111,11 +118,10 @@ readonly ICON_SOLID="●"
 readonly ICON_LIST="•"
 readonly ICON_SUBLIST="↳"
 readonly ICON_ARROW="➤"
-readonly ICON_DRY_RUN="→"
+readonly ICON_DRY_RUN="○"
 readonly ICON_REVIEW="⊙"
 readonly ICON_NAV_UP="↑"
 readonly ICON_NAV_DOWN="↓"
-readonly ICON_INFO="ℹ"
 
 # ============================================================================
 # LaunchServices Utility
@@ -152,7 +158,6 @@ get_lsregister_path() {
 # ============================================================================
 readonly MOLE_TEMP_FILE_AGE_DAYS=7       # Temp file retention (days)
 readonly MOLE_ORPHAN_AGE_DAYS=30         # Orphaned data retention (days)
-readonly MOLE_DOTDIR_ORPHAN_AGE_DAYS=60  # Orphan dotfile hint threshold (days)
 readonly MOLE_MAX_PARALLEL_JOBS=15       # Parallel job limit
 readonly MOLE_MAIL_DOWNLOADS_MIN_KB=5120 # Mail attachment size threshold
 readonly MOLE_MAIL_AGE_DAYS=30           # Mail attachment retention (days)
@@ -163,7 +168,6 @@ readonly MOLE_GPU_CACHE_AGE_DAYS=1       # Rebuildable GPU cache retention (days
 readonly MOLE_TM_BACKUP_SAFE_HOURS=48    # TM backup safety window (hours)
 readonly MOLE_MAX_DS_STORE_FILES=500     # Max .DS_Store files to clean per scan
 readonly MOLE_MAX_ORPHAN_ITERATIONS=100  # Max iterations for orphaned app data scan
-readonly MOLE_ONE_GIB_KB=$((1024 * 1024))
 readonly MOLE_ONE_GB_BYTES=1000000000
 
 # ============================================================================
@@ -202,12 +206,29 @@ declare -a SAFETY_WHITELIST_PATTERNS=(
     # moment a user saves one custom entry. Removing them breaks macOS search,
     # font rendering and iCloud sync rather than costing a rebuild, and
     # pypoetry/virtualenvs holds live interpreters every Poetry project points
-    # at, not cached downloads. Hard safety, so they merge unconditionally.
+    # at, not cached downloads. The renv cache is the same shape: renv
+    # installs packages there and, by default, symlinks them into project
+    # libraries, so removing it leaves those libraries dangling. Its entry is
+    # spelled exactly like the old default row so saved files that still
+    # carry that line read it as this mandatory rule. pnpm installs every
+    # `pnpm dlx` package under its cache dir, so a running command loses its
+    # modules when the sweep takes it, the shape of the npx loss in #1870.
+    # Hard safety, so they merge unconditionally.
     "$HOME/Library/Caches/com.apple.FontRegistry*"
     "$HOME/Library/Caches/com.apple.spotlight*"
     "$HOME/Library/Caches/com.apple.Spotlight*"
     "$HOME/Library/Caches/CloudKit*"
+    # Kitty keeps a live graphics-protocol cache here; removing it from a
+    # running session makes subsequent image transfers fail until the
+    # directory is recreated.
+    "$HOME/Library/Caches/kitty"
     "$HOME/Library/Caches/pypoetry/virtualenvs*"
+    "$HOME/Library/Caches/org.R-project.R/R/renv/*"
+    "$HOME/Library/Caches/pnpm/dlx*"
+    # llama.cpp downloads `-hf` model weights (multi-GB GGUF files) into its
+    # default LLAMA_CACHE here; they are user-chosen models, not a cache that
+    # rebuilds on its own. Mole Mac blocks the same folder (2026-10-29).
+    "$HOME/Library/Caches/llama.cpp"
 )
 
 # Resolve the cache root used by GitHub CLI without following filesystem
@@ -358,6 +379,90 @@ ensure_safety_whitelist_patterns() {
     done
 }
 
+# 0 when the file can be opened for reading. Existing is not enough: a list the
+# user wrote but this process cannot open (mode 000, a privacy denial) is
+# unknown protection, and reading it as empty would clean what it protects.
+mole_file_openable() {
+    { : < "$1"; } 2> /dev/null
+}
+
+# One factual cause and one next action for an exclusion list that cannot be read.
+mole_report_unreadable_whitelist() {
+    local file="$1" label="${2:-whitelist}" reason="${3:-file}"
+    case "$reason" in
+        directory)
+            printf 'Cannot access your %s directory: %s\n' "$label" "${file//[[:cntrl:]]/?}" >&2
+            printf '  Mole stops so nothing you protected is cleaned by mistake. Run: chmod u+rx %q\n' "$file" >&2
+            ;;
+        invalid)
+            printf 'Cannot read your %s: invalid path or broken link: %s\n' "$label" "${file//[[:cntrl:]]/?}" >&2
+            printf '  Mole stops so nothing you protected is cleaned by mistake. Restore this path or its link target before retrying.\n' >&2
+            ;;
+        unknown)
+            printf 'Cannot inspect your %s path: %s\n' "$label" "${file//[[:cntrl:]]/?}" >&2
+            printf '  Mole stops because absence could not be verified. Check access to this path before retrying.\n' >&2
+            ;;
+        *)
+            printf 'Cannot read your %s: %s\n' "$label" "${file//[[:cntrl:]]/?}" >&2
+            printf '  Mole stops so nothing you protected is cleaned by mistake. Run: chmod u+r %q\n' "$file" >&2
+            ;;
+    esac
+}
+
+# 0 = readable file, 1 = confirmed ENOENT, 2 = unknown/invalid. Shell test -f
+# cannot distinguish absence from EACCES or I/O failure. System Perl exposes
+# errno without adding a dependency beyond the existing macOS runtime probes.
+# Inspect parents first so an inaccessible directory names the right repair,
+# and a broken symlink never authorizes defaults or a legacy-list fallback.
+mole_whitelist_file_state() {
+    local file="$1" label="${2:-whitelist}" problem="" probe_rc=0
+    if [[ ! -x /usr/bin/perl ]]; then
+        printf 'Cannot inspect your %s: the system Perl runtime is unavailable.\n' "$label" >&2
+        printf '  Mole stops so nothing you protected is cleaned by mistake. Restore /usr/bin/perl before retrying.\n' >&2
+        return 2
+    fi
+    problem=$(/usr/bin/perl -e '
+        use strict;
+        use warnings;
+        use Errno qw(ENOENT);
+        use Fcntl qw(S_ISDIR S_ISREG S_ISLNK);
+        my $file = shift;
+        sub stop { my ($status, $path) = @_; print $path, "."; exit $status; }
+        $file =~ m{^/} or stop(5, $file);
+        my @parts = grep { length } split m{/}, $file;
+        my $path = "";
+        for my $i (0 .. $#parts) {
+            $path .= "/" . $parts[$i];
+            my @meta = lstat($path);
+            if (!@meta) { stop($! == ENOENT ? 1 : 5, $path); }
+            if (S_ISLNK($meta[2])) {
+                @meta = stat($path);
+                if (!@meta) { stop($! == ENOENT ? 3 : 5, $path); }
+            }
+            if ($i < $#parts) {
+                S_ISDIR($meta[2]) or stop(3, $path);
+                -x $path or stop(2, $path);
+            } else {
+                S_ISREG($meta[2]) or stop(3, $path);
+            }
+        }
+        exit 0;
+    ' -- "$file" 2> /dev/null) || probe_rc=$?
+    # Preserve trailing newlines in a path across command substitution.
+    problem="${problem%.}"
+    case "$probe_rc" in
+        0)
+            mole_file_openable "$file" && return 0
+            mole_report_unreadable_whitelist "$file" "$label"
+            ;;
+        1) return 1 ;;
+        2) mole_report_unreadable_whitelist "$problem" "$label" directory ;;
+        3) mole_report_unreadable_whitelist "$problem" "$label" invalid ;;
+        *) mole_report_unreadable_whitelist "${problem:-$file}" "$label" unknown ;;
+    esac
+    return 2
+}
+
 # Load and validate the invoking user's clean whitelist. Both `clean` and
 # `purge` use safe_remove as their final deletion sink, so they must share the
 # same source of WHITELIST_PATTERNS before either command starts scanning.
@@ -376,9 +481,12 @@ load_mole_whitelist() {
     WHITELIST_WARNINGS=()
 
     local whitelist_file="$MOLE_USER_HOME/.config/mole/whitelist"
-    if [[ -f "$whitelist_file" ]]; then
+    local whitelist_state=0
+    mole_whitelist_file_state "$whitelist_file" || whitelist_state=$?
+    [[ $whitelist_state -ne 2 ]] || return 1
+    if [[ $whitelist_state -eq 0 ]]; then
         local line duplicate existing
-        while IFS= read -r line; do
+        while IFS= read -r line || [[ -n "$line" ]]; do
             # shellcheck disable=SC2295
             line="${line#"${line%%[![:space:]]*}"}"
             # shellcheck disable=SC2295
@@ -452,7 +560,47 @@ load_mole_whitelist() {
 # ============================================================================
 # BSD Stat Compatibility
 # ============================================================================
-readonly STAT_BSD="/usr/bin/stat"
+# Every stat call names this path: a PATH stat can be GNU coreutils, whose
+# `-f` prints file-system text that reads as a value (#1196, #1752). Assigned
+# unconditionally on load, so the environment cannot redirect it; not readonly
+# so a test can rebind it to a fixture stub after sourcing.
+STAT_BSD="/usr/bin/stat"
+# Scans whose result depends on BSD find's error format or its handling of
+# File Provider mounts use this path too; GNU findutils earlier in PATH quotes
+# paths in its errors and fails on mounts BSD find walks past.
+FIND_BSD="/usr/bin/find"
+# sysctl lives in /usr/sbin, which a shell PATH may leave out; the PATH lookup
+# then fails and callers silently use their fallback values (#1804).
+SYSCTL_CMD="/usr/sbin/sysctl"
+# diskutil, lsof, pkgutil, ioreg and the other system tools Mole runs by name
+# live there too. Without them a probe reads as "nothing found": diskutil's
+# empty answer skipped the internal-volume refusal of --external. Appending
+# keeps the user's own order ahead of them.
+case ":${PATH:-}:" in *:/usr/sbin:*) ;; *) PATH="${PATH:+$PATH:}/usr/sbin" ;; esac
+case ":$PATH:" in *:/sbin:*) ;; *) PATH="$PATH:/sbin" ;; esac
+export PATH
+
+# Only complete generated completion lines are owned by Mole. A quoted mention
+# or a mixed command may carry unrelated user settings and must remain intact.
+# Include the previous eval/source forms when normalizing or removing them.
+# shellcheck disable=SC2016 # Match literal shell substitutions in rc files.
+MOLE_COMPLETION_LINE_PATTERN='^[[:space:]]*(# Mole shell completion|if output="\$\((mole|mo) completion (bash|zsh) 2>/dev/null\)"; then eval "\$output"; fi|eval "\$\((mole|mo) completion (bash|zsh)\)"|source <\((mole|mo) completion (bash|zsh)\)|set -l output \((mole|mo) completion fish 2>/dev/null\); and echo "\$output" \| source|(mole|mo) completion fish \| source)[[:space:]]*$'
+
+# Print the final file a symlink chain points at. Renaming a rewritten rc file
+# over this target keeps every link in a dotfile chain; renaming over the first
+# link replaced it with a plain file. Fails on an unreadable link or a cycle.
+mole_resolve_link_chain() {
+    local target="$1"
+    local link hops=0
+    while [[ -L "$target" ]]; do
+        link=$(readlink "$target") || return 1
+        [[ "$link" == /* ]] || link="$(dirname "$target")/$link"
+        target="$link"
+        hops=$((hops + 1))
+        [[ $hops -le 40 ]] || return 1
+    done
+    printf '%s\n' "$target"
+}
 
 # Get file size in bytes
 get_file_size() {
@@ -531,13 +679,15 @@ get_free_space_target() {
     printf '%s\n' "$target"
 }
 
-# Get free disk space on root volume in 1K blocks.
+# Get free disk space in 1K blocks. An omitted path selects the system volume.
 get_free_space_kb() {
-    local target
-    target=$(get_free_space_target)
+    local target="${1:-}"
+    [[ -n "$target" ]] || target=$(get_free_space_target)
 
     local available_kb
-    available_kb=$(command df -Pk "$target" 2> /dev/null | awk 'NR==2 {print $4}' || true)
+    if ! available_kb=$(command df -Pk "$target" 2> /dev/null | awk 'NR==2 {print $4}'); then
+        return 1
+    fi
     if [[ "$available_kb" =~ ^[0-9]+$ ]]; then
         printf '%s\n' "$available_kb"
         return 0
@@ -568,11 +718,147 @@ get_free_space() {
     echo "Unknown"
 }
 
+# Keep literal parent paths once without interpreting glob metacharacters.
+# Callers with newline-bearing paths handle those outside this line format.
+mole_filter_nested_paths() {
+    [[ $# -gt 0 ]] || return 0
+    local -a paths=("${@}")
+    local path normalized existing skip
+    local -a kept=()
+    if [[ ${#paths[@]} -le 50 ]]; then
+        for path in "${paths[@]}"; do
+            normalized="${path%/}"
+            [[ -n "$normalized" ]] || normalized="$path"
+            skip=false
+            local -a remaining=()
+            for existing in "${kept[@]+"${kept[@]}"}"; do
+                if [[ "$normalized" == "$existing" || "$normalized" == "$existing"/* || "$existing" == / ]]; then
+                    skip=true
+                    break
+                fi
+                [[ "$existing" == "$normalized"/* || "$normalized" == / ]] || remaining+=("$existing")
+            done
+            if [[ "$skip" == false ]]; then
+                kept=("${remaining[@]+"${remaining[@]}"}" "$normalized")
+            fi
+        done
+        printf '%s\n' "${kept[@]}"
+        return
+    fi
+    # A prefix sibling can sort between a parent and its child. Remember all
+    # kept ancestors, rather than only the last row, and publish a complete pass.
+    local filtered=""
+    filtered=$(printf '%s\n' "${paths[@]}" | LC_ALL=C awk '{if ($0 != "/") sub(/\/$/, ""); print}' |
+        LC_ALL=C sort -u | LC_ALL=C awk '
+        {
+            if (seen["/"]) next
+            parent=$0; skip=0
+            while (parent != "") {
+                if (seen[parent]) {skip=1; break}
+                if (!sub(/\/[^\/]*$/, "", parent)) break
+            }
+            if (!skip) {seen[$0]=1; print}
+        }') || return $?
+    [[ -z "$filtered" ]] || printf '%s\n' "$filtered"
+    return 0
+}
+
+# Lowercase ASCII letters into the variable named by $1, the same bytes
+# `LC_ALL=C tr '[:upper:]' '[:lower:]'` produces in the C and UTF-8 locales,
+# without a subprocess: hot loops call this once per candidate, and each tr
+# cost a fork. Bash 3.2 expansion skips some letters after high bytes in
+# legacy multibyte locales (GBK, SJIS, Big5), so keep callers under the
+# LC_ALL=C that bin/clean.sh exports.
+mole_ascii_lowercase() {
+    local _lowercase_value="${2:-}"
+    _lowercase_value=${_lowercase_value//A/a}
+    _lowercase_value=${_lowercase_value//B/b}
+    _lowercase_value=${_lowercase_value//C/c}
+    _lowercase_value=${_lowercase_value//D/d}
+    _lowercase_value=${_lowercase_value//E/e}
+    _lowercase_value=${_lowercase_value//F/f}
+    _lowercase_value=${_lowercase_value//G/g}
+    _lowercase_value=${_lowercase_value//H/h}
+    _lowercase_value=${_lowercase_value//I/i}
+    _lowercase_value=${_lowercase_value//J/j}
+    _lowercase_value=${_lowercase_value//K/k}
+    _lowercase_value=${_lowercase_value//L/l}
+    _lowercase_value=${_lowercase_value//M/m}
+    _lowercase_value=${_lowercase_value//N/n}
+    _lowercase_value=${_lowercase_value//O/o}
+    _lowercase_value=${_lowercase_value//P/p}
+    _lowercase_value=${_lowercase_value//Q/q}
+    _lowercase_value=${_lowercase_value//R/r}
+    _lowercase_value=${_lowercase_value//S/s}
+    _lowercase_value=${_lowercase_value//T/t}
+    _lowercase_value=${_lowercase_value//U/u}
+    _lowercase_value=${_lowercase_value//V/v}
+    _lowercase_value=${_lowercase_value//W/w}
+    _lowercase_value=${_lowercase_value//X/x}
+    _lowercase_value=${_lowercase_value//Y/y}
+    _lowercase_value=${_lowercase_value//Z/z}
+    printf -v "$1" '%s' "$_lowercase_value"
+}
+
+# Escape operation records and deletion-log fields at their write boundaries.
+# Control bytes must never create audit records or terminal controls, so each
+# one is written as \n, \r, \t or \xHH. Backslashes stay literal: a name with
+# one reads back exactly as it is on disk, as it did before this escaping.
+# Only the logged copy changes, never the action path. mo history applies it
+# again when printing text, which leaves V1.59.0 rows untouched and escapes
+# the raw control bytes older logs may still hold.
+_mole_escape_log_value() {
+    local _output="$1" _value="$2" _escaped="" _char _code _index
+    local LC_ALL=C
+    if [[ "$_value" =~ [[:cntrl:]] ]]; then
+        for ((_index = 0; _index < ${#_value}; _index++)); do
+            _char="${_value:_index:1}"
+            case "$_char" in
+                $'\n') _escaped+='\n' ;;
+                $'\r') _escaped+='\r' ;;
+                $'\t') _escaped+='\t' ;;
+                *)
+                    if [[ "$_char" =~ [[:cntrl:]] ]]; then
+                        printf -v _code '\\x%02x' "'$_char"
+                        _escaped+="$_code"
+                    else
+                        _escaped+="$_char"
+                    fi
+                    ;;
+            esac
+        done
+        _value="$_escaped"
+    fi
+    printf -v "$_output" '%s' "$_value"
+}
+
+# Wait in the owning shell so Bash 3.2 can reap any completed scan worker.
+# The first argument names a caller variable receiving the completed PID;
+# the return status belongs to that worker, or to an interrupted polling sleep.
+mole_wait_for_any_worker() {
+    local _wait_output_name="$1"
+    shift
+    local _wait_pid _wait_status
+    while [[ $# -gt 0 ]]; do
+        for _wait_pid in "$@"; do
+            if kill -0 "$_wait_pid" 2> /dev/null; then
+                continue
+            fi
+            printf -v "$_wait_output_name" '%s' "$_wait_pid"
+            _wait_status=0
+            wait "$_wait_pid" 2> /dev/null || _wait_status=$?
+            return "$_wait_status"
+        done
+        sleep 0.02 || return $?
+    done
+    return 1
+}
+
 # Get optimal parallel jobs for operation type (scan|io|compute|default)
 get_optimal_parallel_jobs() {
     local operation_type="${1:-default}"
     if [[ -z "${MOLE_CPU_CORES_CACHE:-}" ]]; then
-        export MOLE_CPU_CORES_CACHE=$(sysctl -n hw.ncpu 2> /dev/null || echo 4)
+        export MOLE_CPU_CORES_CACHE=$("$SYSCTL_CMD" -n hw.ncpu 2> /dev/null || echo 4)
     fi
     local cpu_cores="$MOLE_CPU_CORES_CACHE"
     case "$operation_type" in
@@ -592,8 +878,10 @@ get_optimal_parallel_jobs() {
 # User Context Utilities
 # ============================================================================
 
+# EUID answers the same question as id -u without a subprocess; clean asks
+# it for many targets.
 is_root_user() {
-    [[ "$(id -u)" == "0" ]]
+    [[ "${EUID:-$(id -u)}" == "0" ]]
 }
 
 get_invoking_uid() {
@@ -799,6 +1087,16 @@ bytes_to_human() {
 # Convert kilobytes to human-readable format
 # Args: $1 - size in KB
 # Returns: formatted string
+# "1 item", "3 items": a count with its noun, singular for exactly one.
+mole_count_label() {
+    local count="${1:-0}" noun="$2"
+    if [[ "$count" == "1" ]]; then
+        printf '%s %s' "$count" "$noun"
+    else
+        printf '%s %ss' "$count" "$noun"
+    fi
+}
+
 bytes_to_human_kb() {
     bytes_to_human "$((${1:-0} * 1024))"
 }
@@ -826,6 +1124,14 @@ mole_is_reverse_dns_bundle_id() {
     [[ "$bundle_id" =~ ^[A-Za-z0-9][-A-Za-z0-9]*(\.[A-Za-z0-9][-A-Za-z0-9]*)+$ ]]
 }
 
+# An executable name a runtime gives every app that does not rename it, so it
+# names no single app: an unrenamed Electron binary is `Electron` everywhere.
+mole_is_shared_runtime_executable() {
+    local lowered=""
+    mole_ascii_lowercase lowered "${1:-}"
+    [[ "$lowered" == "electron" ]]
+}
+
 mole_name_starts_with_bundle_id_boundary() {
     local name="${1##*/}"
     local bundle_id="${2:-}"
@@ -848,9 +1154,11 @@ mole_name_has_bundle_id_boundary() {
 # Colorize an already-formatted human size string by unit.
 colorize_human_size() {
     local size_human="$1"
+    # A lower-bound total ("3.27GB+") takes its unit's color.
+    local size_unit="${size_human%+}"
 
     local size_color=""
-    case "$size_human" in
+    case "$size_unit" in
         *GB) size_color="$RED" ;;
         *MB) size_color="$YELLOW" ;;
         *KB) size_color="$GREEN" ;;
@@ -895,6 +1203,8 @@ percent_encode_path() {
 # Print a path as an OSC 8 file:// hyperlink so terminals keep it clickable
 # even when it contains spaces (auto-detection breaks on whitespace). Shows
 # the ~-abbreviated path; piped output and non-ANSI terminals get plain text.
+# An optional $2 replaces the visible text inside the link only: without a
+# link to carry the full path, plain text always shows the whole path.
 format_path_link() {
     local path="$1"
     local display="${path/#$HOME/~}"
@@ -902,10 +1212,52 @@ format_path_link() {
         printf '%s' "$display"
         return 0
     fi
+    if [[ -n "${2:-}" ]]; then
+        display="$2"
+    fi
     # ESC-backslash is the OSC 8 string terminator; kept in a variable since
     # a single-quoted printf format ending in \\ trips ShellCheck SC1003.
     local st=$'\033\\'
     printf '\033]8;;file://%s%s%s\033]8;;%s' "$(percent_encode_path "$path")" "$st" "$display" "$st"
+}
+
+# One review row: "⊙ label · value · fact". On a terminal the label itself
+# links to the path, so the row needs no command or path field; plain output
+# has no links and keeps the path as the last field. path, value and fact
+# may each be empty.
+mole_review_row() {
+    local label="$1" path="${2:-}" value="${3:-}" fact="${4:-}"
+    local shown="$label" tail=""
+    if [[ -n "$path" ]]; then
+        # Settle the check here: inside $(...) stdout is a pipe.
+        if is_ansi_supported 2> /dev/null; then
+            shown=$(format_path_link "$path" "$label")
+        else
+            tail=" · $(format_path_link "$path")"
+        fi
+    fi
+    local line="  ${YELLOW}${ICON_REVIEW}${NC} ${shown}"
+    [[ -n "$value" ]] && line+=" · ${GREEN}${value}${NC}"
+    [[ -n "$fact" ]] && line+=" · ${GRAY}${fact}${NC}"
+    echo -e "${line}${tail}"
+}
+
+# "a", "a and b", "a, b and c", then "a, b, c and 2 more".
+mole_join_names() {
+    local count=$#
+    [[ $count -gt 0 ]] || return 0
+    if [[ $count -gt 4 ]]; then
+        printf '%s, %s, %s and %s more' "$1" "$2" "$3" "$((count - 3))"
+        return 0
+    fi
+    local out="$1"
+    shift
+    while [[ $# -gt 1 ]]; do
+        out+=", $1"
+        shift
+    done
+    [[ $# -eq 1 ]] && out+=" and $1"
+    printf '%s' "$out"
 }
 
 # ============================================================================
@@ -993,6 +1345,123 @@ prune_stale_mole_temp_files() {
         rmdir "$stale_dir" 2> /dev/null || true
     done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -name '.mole-spinner.*' \
         -mmin "+$max_age_minutes" -print0 2> /dev/null)
+}
+
+_mole_darwin_user_temp_dir() {
+    /usr/bin/getconf DARWIN_USER_TEMP_DIR 2> /dev/null
+}
+
+# A run killed before its exit trap leaves its registry and tracked temp
+# entries in TMPDIR, and macOS does not expire the per-user Darwin temp root
+# (2026-10-27: 25,412 Mole entries there, the oldest from July). Take only the
+# two names Mole creates, after the same one-day grace: `mole.registry.<pid>`
+# whose pid is gone, and `mole.` plus six letters or digits that is a regular
+# file with one link or an empty folder. Only the Darwin temp root qualifies,
+# never /tmp or a TMPDIR pointed at a user folder. Mole Mac's
+# TemporaryRootLeftoverPolicy applies the same contract.
+prune_stale_mole_tmpdir_leftovers() {
+    local root="${1:-}"
+    local max_age_minutes="${MOLE_TEMP_STALE_MINUTES:-1440}"
+    local darwin_temp="" resolved_root=""
+
+    [[ "$max_age_minutes" =~ ^[0-9]+$ ]] || max_age_minutes=1440
+    is_root_user && return 0
+    [[ -n "$root" && -d "$root" && ! -L "$root" && -O "$root" ]] || return 0
+
+    darwin_temp=$(_mole_darwin_user_temp_dir) || return 0
+    [[ -n "$darwin_temp" ]] || return 0
+    darwin_temp=$(cd -P "$darwin_temp" 2> /dev/null && pwd) || return 0
+    resolved_root=$(cd -P "$root" 2> /dev/null && pwd) || return 0
+    [[ "$resolved_root" == "$darwin_temp" ]] || return 0
+
+    # One process listing and set differences instead of a probe per entry:
+    # the first run on a long-lived temp root can meet tens of thousands of
+    # entries. No listing means every owner is unknown, so nothing goes.
+    local live_pids uid
+    live_pids=$(ps -axo pid= 2> /dev/null | tr -d ' ') || return 0
+    [[ "$live_pids" =~ [0-9] ]] || return 0
+    uid=$(id -u 2> /dev/null) || return 0
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 0
+
+    # Names stay relative to the root so no path is rebuilt from text. Each
+    # list holds one name per line: the token and digit-only patterns leave no
+    # room for a crafted name to add a line. "/" is a pattern no name can
+    # equal, so an empty keep list still filters correctly. Every pipeline ends
+    # in `|| true` because callers run under errexit and pipefail, where a
+    # grep that matches nothing would otherwise end the pass early.
+    (
+        cd "$resolved_root" 2> /dev/null || exit 0
+
+        # What it takes is a day old, so one complete pass a day finds all of
+        # it. Listing this root is the cost: about half a second per listing
+        # on a long-lived Mac (126,196 entries on 2026-10-31), paid by every
+        # mo command before its first line, four listings per run before this.
+        local stamp="mole.prune-stamp"
+        if [[ -f "$stamp" && ! -L "$stamp" ]] &&
+            [[ -n "$(find "$stamp" -maxdepth 0 -mmin "-$max_age_minutes" -print 2> /dev/null)" ]]; then
+            exit 0
+        fi
+
+        # One listing of the root that also answers every attribute question,
+        # tagged per line: O an old one-link file, D an old empty folder, A any
+        # other regular file. Names never go back onto a command line, where
+        # tens of thousands of them exceed the argument limit. Any failure,
+        # including one exec batch, ends the pass with nothing removed and no
+        # stamp. The tag and "./" anchor every match, so a name holding a
+        # newline cannot turn its tail into an untagged candidate.
+        local listing
+        listing=$("$FIND_BSD" . -mindepth 1 -maxdepth 1 -name 'mole.*' -user "$uid" \( \
+            \( -type f -links 1 -mmin "+$max_age_minutes" -exec printf 'O%s\n' {} + \) -o \
+            \( -type f -exec printf 'A%s\n' {} + \) -o \
+            \( -type d -empty -mmin "+$max_age_minutes" -exec printf 'D%s\n' {} + \) \
+            \) 2> /dev/null) || exit 0
+
+        local old_files old_dirs registries old_registries
+        old_files=$(printf '%s\n' "$listing" |
+            sed -n -E 's#^O\./(mole\.[A-Za-z0-9]{6})$#\1#p') || exit 0
+        old_dirs=$(printf '%s\n' "$listing" |
+            sed -n -E 's#^D\./(mole\.[A-Za-z0-9]{6})$#\1#p') || exit 0
+        registries=$(printf '%s\n' "$listing" |
+            sed -n -E 's#^[OA]\./mole\.registry\.([1-9][0-9]*)$#\1#p') || exit 0
+        old_registries=$(printf '%s\n' "$listing" |
+            sed -n -E 's#^O\./mole\.registry\.([1-9][0-9]*)$#\1#p') || exit 0
+
+        local live_registries="" keep="/" registry_contents
+        if [[ -n "$registries" ]]; then
+            live_registries=$(printf '%s\n' "$registries" |
+                grep -xF -f <(printf '%s\n' "$live_pids") 2> /dev/null) || live_registries=""
+        fi
+
+        # A Mole run that has been open for more than a day still owns the
+        # entries its registry lists, however old they are.
+        if [[ -n "$live_registries" ]]; then
+            # A partial read cannot prove any old entry is unowned. Separate
+            # read success from the valid case where filtering finds no names.
+            registry_contents=$(printf '%s\n' "$live_registries" | sed 's#^#mole.registry.#' |
+                tr '\n' '\0' | xargs -0 cat -- 2> /dev/null) || exit 0
+            keep+=$'\n'$(printf '%s\n' "$registry_contents" | sed 's#^.*/##' |
+                grep -xE 'mole\.[A-Za-z0-9]{6}' 2> /dev/null) || true
+        fi
+
+        if [[ -n "$old_files" ]]; then
+            printf '%s\n' "$old_files" | grep -vxF -f <(printf '%s\n' "$keep") 2> /dev/null |
+                tr '\n' '\0' | xargs -0 rm -f -- 2> /dev/null || true # SAFE: unowned Mole temp names in the Darwin temp root only
+        fi
+        if [[ -n "$old_dirs" ]]; then
+            # rmdir refuses a folder that gained content since the scan.
+            printf '%s\n' "$old_dirs" | grep -vxF -f <(printf '%s\n' "$keep") 2> /dev/null |
+                tr '\n' '\0' | xargs -0 rmdir -- 2> /dev/null || true
+        fi
+        if [[ -n "$old_registries" ]]; then
+            printf '%s\n' "$old_registries" |
+                grep -vxF -f <(printf '%s\n' "$live_pids") 2> /dev/null |
+                sed 's#^#mole.registry.#' | tr '\n' '\0' |
+                xargs -0 rm -f -- 2> /dev/null || true # SAFE: dead-owner Mole registries in the Darwin temp root only
+        fi
+
+        [[ -L "$stamp" ]] || touch "$stamp" 2> /dev/null || true
+        exit 0
+    ) || true
 }
 
 initialize_mole_temp_registry_path() {
@@ -1090,6 +1559,7 @@ ensure_mole_temp_root() {
     export MOLE_RESOLVED_TMPDIR
     initialize_mole_temp_registry_path || true
     prune_stale_mole_temp_files "$MOLE_RESOLVED_TMPDIR"
+    prune_stale_mole_tmpdir_leftovers "$MOLE_RESOLVED_TMPDIR"
 }
 
 prepare_mole_tmpdir() {
@@ -1317,7 +1787,7 @@ safe_clear_line() {
 }
 
 # Update progress spinner if enough time has elapsed
-# Usage: update_progress_if_needed <completed> <total> <last_update_time_var> [interval]
+# Usage: update_progress_if_needed <completed> <total> <last_update_time_var> [interval] [label]
 # Example: update_progress_if_needed "$completed" "$total" last_progress_update 2
 # Returns: 0 if updated, 1 if skipped
 update_progress_if_needed() {
@@ -1325,10 +1795,15 @@ update_progress_if_needed() {
     local total="$2"
     local last_update_var="$3" # Name of variable holding last update time
     local interval="${4:-2}"   # Default: update every 2 seconds
+    local label="${5:-}"       # What is being scanned, named in the spinner
 
-    # Get current time
-    local current_time
-    current_time=$(get_epoch_seconds)
+    # Get current time. Callers tick once per item, so anchor $SECONDS to the
+    # epoch once per shell instead of forking date on every call; the sum is
+    # the same epoch that callers seed the last update time with.
+    if [[ ! "${_MOLE_PROGRESS_EPOCH_BASE:-}" =~ ^[0-9]+$ ]]; then
+        _MOLE_PROGRESS_EPOCH_BASE=$(($(get_epoch_seconds) - SECONDS))
+    fi
+    local current_time=$((_MOLE_PROGRESS_EPOCH_BASE + SECONDS))
 
     # Get last update time from variable
     local last_time
@@ -1340,7 +1815,11 @@ update_progress_if_needed() {
     if [[ $((current_time - last_time)) -ge $interval ]]; then
         # Update the spinner text in place; restarting it here blinked the
         # line on every progress tick.
-        start_section_spinner "Scanning items... $completed/$total"
+        if [[ -n "$label" ]]; then
+            start_section_spinner "Scanning ${label}, $completed/$total..."
+        else
+            start_section_spinner "Scanning items... $completed/$total"
+        fi
 
         # Update the last_update_time variable
         # eval: indirect write by name; bash 3.2 has no nameref
@@ -1459,6 +1938,110 @@ mole_clean_process_guard() {
     _MOLE_CLEAN_GUARD_REASON="$busy_reason"
     [[ $process_state -eq 2 ]] && _MOLE_CLEAN_GUARD_REASON="$unknown_reason"
     return 1
+}
+
+# Named Electron caches do not carry a reverse-DNS owner in their path.
+# Callers supply the exact app name, not an executable such as Electron that
+# unrelated apps share. Escape it before both process-name and bundle probes.
+_mole_named_app_cache_running() {
+    mole_pgrep_any -x "$_MOLE_NAMED_APP_CACHE_PATTERN" \
+        -f "/${_MOLE_NAMED_APP_CACHE_PATTERN}[.]app/"
+}
+
+_dev_process_delete_guard_allows() {
+    # Bind ordinary leaves before probing. Compound probes can supply their
+    # own narrower binding; the final callback never refreshes this evidence.
+    local _MOLE_DEV_GUARDED_PATH="${1:-}"
+    local leaf_parent="" leaf_parent_id="" leaf_target_id=""
+    if [[ -n "$_MOLE_DEV_GUARDED_PATH" &&
+        "${_MOLE_SAFE_CLEAN_BOUND_PATH:-}" != "$_MOLE_DEV_GUARDED_PATH" ]]; then
+        if ! _mole_snapshot_path_identity "$_MOLE_DEV_GUARDED_PATH"; then
+            _MOLE_CLEAN_GUARD_REASON="${_MOLE_DEV_PROCESS_GUARD_UNKNOWN_REASON:-process state unknown}"
+            return 1
+        fi
+        leaf_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+        leaf_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+        leaf_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+    fi
+    mole_clean_process_guard \
+        "$_MOLE_DEV_PROCESS_GUARD_PROBE" \
+        "$_MOLE_DEV_PROCESS_GUARD_FAMILY started" \
+        "${_MOLE_DEV_PROCESS_GUARD_UNKNOWN_REASON:-process state unknown}" || return $?
+
+    if [[ -n "$leaf_parent" &&
+        "${_MOLE_SAFE_CLEAN_BOUND_PATH:-}" != "$_MOLE_DEV_GUARDED_PATH" ]]; then
+        _MOLE_SAFE_CLEAN_BOUND_PATH="$_MOLE_DEV_GUARDED_PATH"
+        _MOLE_SAFE_CLEAN_EXPECTED_PARENT="$leaf_parent"
+        _MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID="$leaf_parent_id"
+        _MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID="$leaf_target_id"
+    fi
+    return 0
+}
+
+_dev_report_process_guard_stop() {
+    local display_name="$1"
+    local family="$2"
+    local reason="$3"
+
+    if [[ "$reason" == "process state unknown" || "$reason" == "process or cache path state unknown" ]]; then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} ${display_name} · stopped (${reason})"
+        note_activity
+    else
+        mole_defer_cleanup_family "$family"
+    fi
+}
+
+# Preserve a caller's final exclusion before repeating the owner probe. The
+# outer callback may itself do slow work, so owner evidence must come last.
+_dev_final_process_delete_guard_allows() {
+    if [[ -n "$_MOLE_DEV_OUTER_FINAL_GUARD" ]]; then
+        "$_MOLE_DEV_OUTER_FINAL_GUARD" "$@" || return $?
+    fi
+    _dev_process_delete_guard_allows "$@"
+}
+
+# Bind a tri-state process probe after sizing and at safe_remove's final sink.
+# Guard state is intentionally dynamic so Bash 3.2 callbacks can read it.
+_dev_safe_clean_process_guarded() {
+    local pending_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
+    if mole_rc_timeout_or_signal "$pending_cancel"; then return "$pending_cancel"; fi
+    local probe="$1"
+    local family="$2"
+    local display_name="$3"
+    shift 3
+    local _MOLE_DEV_PROCESS_GUARD_PROBE="$probe"
+    local _MOLE_DEV_PROCESS_GUARD_FAMILY="$family"
+    local _MOLE_CLEAN_GUARD_REASON="${family} started"
+    local _MOLE_DEV_OUTER_FINAL_GUARD="${_MOLE_SAFE_REMOVE_FINAL_GUARD:-}"
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD=_dev_final_process_delete_guard_allows
+
+    if ! declare -f safe_clean_guarded > /dev/null 2>&1; then
+        if ! _dev_process_delete_guard_allows; then
+            _dev_report_process_guard_stop "$display_name" "$family" "$_MOLE_CLEAN_GUARD_REASON"
+            return 1
+        fi
+        safe_clean "$@"
+        return $?
+    fi
+
+    local guarded_rc=0
+    safe_clean_guarded _dev_process_delete_guard_allows "$@" || guarded_rc=$?
+    if [[ $guarded_rc -eq 75 ]]; then
+        _dev_report_process_guard_stop "$display_name" "$family" "$_MOLE_CLEAN_GUARD_REASON"
+        return 1
+    fi
+    return "$guarded_rc"
+}
+
+mole_safe_clean_app_cache() {
+    local owner="$1"
+    shift
+    local _MOLE_NAMED_APP_CACHE_PATTERN
+    _MOLE_NAMED_APP_CACHE_PATTERN=$(_mole_regex_escape "$owner")
+    local rc=0
+    _dev_safe_clean_process_guarded _mole_named_app_cache_running "$owner" "${*: -1}" "$@" || rc=$?
+    [[ $rc -gt 1 ]] || return 0
+    return "$rc"
 }
 
 # Report a guard refusal. An unknown process state is the user's problem to see

@@ -5,6 +5,7 @@ package main
 import "time"
 
 const (
+	// Bound cached and recursive summaries, not the browsed directory listing.
 	maxEntries    = 30
 	maxLargeFiles = 20
 	barWidth      = 24
@@ -21,8 +22,6 @@ const (
 	mdlsTimeout            = 5 * time.Second
 	maxConcurrentOverview  = 8
 	batchUpdateSize        = 100
-	cacheModTimeGrace      = 30 * time.Minute
-	cacheReuseWindow       = 24 * time.Hour
 	staleCacheTTL          = 3 * 24 * time.Hour
 
 	// Analyzer cache admission and eviction budget. A subtree is only worth a
@@ -61,7 +60,6 @@ const (
 	minWorkers         = 2
 	maxWorkers         = 12
 	cpuMultiplier      = 1
-	maxDirWorkers      = 6
 	openCommandTimeout = 10 * time.Second
 	scanSendTimeout    = 100 * time.Millisecond
 	uiTickInterval     = 100 * time.Millisecond
@@ -292,7 +290,8 @@ var skipExtensions = map[string]bool{
 	".hx":     true,
 }
 
-var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+// Match the shell spinner's centered 2x2 shape in lib/core/ui.sh.
+var spinnerFrames = []string{"⠖", "⠲", "⠴", "⠦"}
 
 const (
 	colorPurple     = "\033[0;35m"

@@ -78,16 +78,30 @@ assert proc.stderr.read() == b''
 assert not (Path(os.environ['HOME']) / 'status-provider-unsupported').exists()
 print('REAL_CLI_JSON=fixture-fields; WATCH=advancing-timestamps; SIGTERM=reaped')
 PY
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [[ "$output" == *"REAL_CLI_JSON=fixture-fields; WATCH=advancing-timestamps; SIGTERM=reaped"* ]] || return 1
 }
 
-@test "status fixture provider failure reaches real CLI error handling" {
+@test "status fixture provider failure retains partial JSON and reports the actual cause" {
     printf failure > "$HOME/status-provider-failure"
-    run "$MOLE_TEST_STATUS_BIN" --json
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"error collecting metrics: intentional status fixture ps failure"* ]] || return 1
-    [[ "$output" != *'"host"'* ]] || return 1
+    run python3 - "$MOLE_TEST_STATUS_BIN" <<'PY_STATUS'
+import json
+import subprocess
+import sys
+result = subprocess.run([sys.argv[1], "--json"], capture_output=True, text=True, timeout=5)
+assert result.returncode == 0, (result.returncode, result.stderr)
+assert "status: collect failed: intentional status fixture ps failure" in result.stderr, result.stderr
+snapshot = json.loads(result.stdout)
+assert snapshot["host"] == "mole-private-cli-fixture"
+assert snapshot["memory"]["total"] == 1 << 30
+assert snapshot.get("process_collected_at") is None
+assert snapshot.get("process_stale") is None
+assert snapshot.get("zombie_count") is None
+assert not snapshot.get("top_processes")
+print("PARTIAL_JSON=retained; PROCESS_SAMPLE=unmeasured; CAUSE=reported")
+PY_STATUS
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"PARTIAL_JSON=retained; PROCESS_SAMPLE=unmeasured; CAUSE=reported"* ]] || return 1
     [[ ! -e "$HOME/status-provider-unsupported" ]] || return 1
 }
 

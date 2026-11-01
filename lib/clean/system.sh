@@ -104,7 +104,7 @@ report_system_cleanup_incomplete() {
     local label="$1"
     local status="${2:-1}"
 
-    if [[ "$status" -eq 124 ]]; then
+    if mole_rc_timeout "$status"; then
         echo -e "  ${YELLOW}${ICON_WARNING}${NC} ${label} · ${GRAY}timed out, cleanup may be partial${NC}"
         if declare -F note_activity > /dev/null 2>&1; then
             note_activity
@@ -347,9 +347,9 @@ clean_deep_system() {
         elif [[ $third_party_rc -ne 0 && $third_party_logs_status -eq 0 ]]; then
             third_party_logs_status=$third_party_rc
         fi
-        [[ $third_party_rc -eq 124 ]] && break
+        mole_rc_timeout "$third_party_rc" && break
     done
-    if [[ $third_party_logs_status -eq 124 ]] || system_cleanup_budget_reached "$system_cleanup_deadline"; then
+    if mole_rc_timeout "$third_party_logs_status" || system_cleanup_budget_reached "$system_cleanup_deadline"; then
         if [[ $third_party_logs_status -eq 0 ]]; then
             third_party_logs_status=124
         fi
@@ -427,7 +427,7 @@ clean_deep_system() {
         local installer_identity_rc=0
         installer_identity=$(macos_installer_candidate_identity "$installer_app" \
             "$system_cleanup_deadline") || installer_identity_rc=$?
-        if [[ $installer_identity_rc -eq 124 ]]; then
+        if mole_rc_timeout "$installer_identity_rc"; then
             installer_status=124
             break
         elif [[ $installer_identity_rc -ge 128 ]]; then
@@ -439,7 +439,7 @@ clean_deep_system() {
         local installer_eligibility_rc=0
         macos_installer_candidate_still_eligible "$installer_app" "$installer_identity" \
             "$current_macos_version" "$system_cleanup_deadline" || installer_eligibility_rc=$?
-        if [[ $installer_eligibility_rc -eq 124 ]]; then
+        if mole_rc_timeout "$installer_eligibility_rc"; then
             installer_status=124
             break
         elif [[ $installer_eligibility_rc -ge 128 ]]; then
@@ -461,7 +461,7 @@ clean_deep_system() {
         local installer_size_rc=0
         size_kb=$(get_path_size_kb "$installer_app" \
             "$installer_size_timeout") || installer_size_rc=$?
-        if [[ $installer_size_rc -eq 124 ]]; then
+        if mole_rc_timeout "$installer_size_rc"; then
             installer_status=124
             break
         elif [[ $installer_size_rc -ge 128 ]]; then
@@ -474,7 +474,7 @@ clean_deep_system() {
             installer_eligibility_rc=0
             macos_installer_candidate_still_eligible "$installer_app" "$installer_identity" \
                 "$current_macos_version" "$system_cleanup_deadline" || installer_eligibility_rc=$?
-            if [[ $installer_eligibility_rc -eq 124 ]]; then
+            if mole_rc_timeout "$installer_eligibility_rc"; then
                 installer_status=124
                 break
             elif [[ $installer_eligibility_rc -ge 128 ]]; then
@@ -490,7 +490,7 @@ clean_deep_system() {
             local installer_remove_rc=0
             safe_sudo_remove "$installer_app" "$size_kb" \
                 "$system_cleanup_deadline" || installer_remove_rc=$?
-            if [[ $installer_remove_rc -eq 124 ]]; then
+            if mole_rc_timeout "$installer_remove_rc"; then
                 installer_status=124
                 break
             fi
@@ -517,47 +517,8 @@ clean_deep_system() {
     fi
     start_section_spinner "Scanning browser code signature caches..."
     local code_sign_cleaned=0
-    local code_sign_scan_file=""
     local code_sign_scan_rc=0
-    if code_sign_scan_file=$(create_temp_file 2> /dev/null); then
-        local code_sign_scan_timeout=""
-        code_sign_scan_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" \
-            "$system_cleanup_deadline") || code_sign_scan_rc=$?
-        if [[ $code_sign_scan_rc -eq 0 ]]; then
-            # -path is a test, not a prune: without the container-level prune
-            # find still walks every C/ and T/ tree even though only X/ can
-            # match. Depth 3 is the /var/folders/<xx>/<hash>/<container> level.
-            materialize_completed_system_scan "$code_sign_scan_file" \
-                "$code_sign_scan_timeout" /usr/bin/find /private/var/folders \
-                -maxdepth 5 -type d \( -depth 3 ! -name X \) -prune \
-                -o -type d -name "*.code_sign_clone" -path "*/X/*" -print0 || code_sign_scan_rc=$?
-        fi
-        if [[ $code_sign_scan_rc -eq 0 ]]; then
-            while IFS= read -r -d '' cache_dir; do
-                if system_cleanup_budget_reached "$system_cleanup_deadline"; then
-                    code_sign_scan_rc=124
-                    break
-                fi
-                # Never delete an EDR agent's code-signature clone -- same
-                # sensor-tamper risk as its caches below. Browsers are the target.
-                if is_endpoint_security_cache_path "$cache_dir"; then
-                    continue
-                fi
-                local code_sign_remove_rc=0
-                safe_sudo_remove "$cache_dir" "" "$system_cleanup_deadline" || code_sign_remove_rc=$?
-                if [[ $code_sign_remove_rc -eq 124 || $code_sign_remove_rc -ge 128 ]]; then
-                    code_sign_scan_rc=$code_sign_remove_rc
-                    break
-                fi
-                if [[ $code_sign_remove_rc -eq 0 ]]; then
-                    code_sign_cleaned=$((code_sign_cleaned + 1))
-                fi
-            done < "$code_sign_scan_file"
-        fi
-        rm -f -- "$code_sign_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
-    else
-        code_sign_scan_rc=1
-    fi
+    clean_browser_code_sign_clones "$system_cleanup_deadline" || code_sign_scan_rc=$?
     stop_section_spinner
     if [[ $code_sign_scan_rc -ne 0 ]]; then
         if [[ $code_sign_scan_rc -ge 128 ]]; then
@@ -592,7 +553,7 @@ clean_deep_system() {
             _mole_bounded_sudo "$rebuildable_probe_timeout" \
                 -n test -e "$rebuildable_cache_dir" < /dev/null 2> /dev/null || rebuildable_exists_rc=$?
         fi
-        if [[ $rebuildable_exists_rc -eq 124 ]]; then
+        if mole_rc_timeout "$rebuildable_exists_rc"; then
             rebuildable_cache_status=124
             break
         fi
@@ -603,7 +564,7 @@ clean_deep_system() {
         [[ $rebuildable_exists_rc -eq 0 ]] || continue
         local rebuildable_remove_rc=0
         safe_sudo_remove "$rebuildable_cache_dir" "" "$system_cleanup_deadline" || rebuildable_remove_rc=$?
-        if [[ $rebuildable_remove_rc -eq 124 ]]; then
+        if mole_rc_timeout "$rebuildable_remove_rc"; then
             rebuildable_cache_status=124
             break
         fi
@@ -667,7 +628,7 @@ clean_deep_system() {
                 fi
                 local gpu_stale_rc=0
                 gpu_cache_dir_is_stale "$gpu_cache_dir" "$MOLE_GPU_CACHE_AGE_DAYS" || gpu_stale_rc=$?
-                if [[ $gpu_stale_rc -eq 124 ]]; then
+                if mole_rc_timeout "$gpu_stale_rc"; then
                     gpu_scan_rc=124
                     break
                 elif [[ $gpu_stale_rc -ge 128 ]]; then
@@ -677,7 +638,7 @@ clean_deep_system() {
                 [[ $gpu_stale_rc -eq 0 ]] || continue
                 local gpu_remove_rc=0
                 safe_sudo_remove "$gpu_cache_dir" "" "$system_cleanup_deadline" || gpu_remove_rc=$?
-                if [[ $gpu_remove_rc -eq 124 || $gpu_remove_rc -ge 128 ]]; then
+                if mole_rc_timeout_or_signal "$gpu_remove_rc"; then
                     gpu_scan_rc=$gpu_remove_rc
                     break
                 fi
@@ -862,7 +823,7 @@ clean_deep_system() {
             "$system_cleanup_deadline") || stats_rc=$?
         if [[ $stats_rc -eq 0 ]]; then
             stats_out=$(_mole_bounded_sudo_find "$stats_timeout" \
-                "$mem_reports_dir" -maxdepth 5 -type f -mtime +30 -exec stat -f "%z" {} + 2> /dev/null |
+                "$mem_reports_dir" -maxdepth 5 -type f -mtime +30 -exec "$STAT_BSD" -f "%z" {} + 2> /dev/null |
                 awk '{c++; s+=$1} END {print c+0, s+0}') || stats_rc=$?
         fi
     fi
@@ -905,7 +866,7 @@ clean_deep_system() {
         fi
     elif [[ $mem_rc -ne 0 ]]; then
         report_system_cleanup_incomplete "Memory exception reports" "$mem_rc"
-    elif [[ $stats_rc -eq 124 ]]; then
+    elif mole_rc_timeout "$stats_rc"; then
         report_system_cleanup_incomplete "Memory exception report sizing" "$stats_rc"
     fi
     stop_section_spinner
@@ -990,7 +951,7 @@ clean_time_machine_failed_backups() {
         stop_section_spinner
         return "$tm_info_rc"
     fi
-    if [[ $tm_info_rc -eq 124 ]]; then
+    if mole_rc_timeout "$tm_info_rc"; then
         stop_section_spinner
         echo -e "  ${YELLOW}!${NC} Time Machine cleanup · skipped (configuration check timed out)"
         note_activity
@@ -1021,11 +982,11 @@ clean_time_machine_failed_backups() {
         stop_section_spinner
         return "$rc_tm_running"
     fi
-    if [[ $rc_tm_running -eq 0 || $rc_tm_running -eq 2 || $rc_tm_running -eq 124 ]]; then
+    if [[ $rc_tm_running -eq 0 || $rc_tm_running -eq 2 ]] || mole_rc_timeout "$rc_tm_running"; then
         if [[ "$spinner_active" == "true" ]]; then
             stop_section_spinner
         fi
-        if [[ $rc_tm_running -eq 2 || $rc_tm_running -eq 124 ]]; then
+        if [[ $rc_tm_running -eq 2 ]] || mole_rc_timeout "$rc_tm_running"; then
             echo -e "  ${YELLOW}!${NC} Time Machine cleanup · skipped (status unknown)"
             note_activity
         else
@@ -1080,7 +1041,7 @@ clean_time_machine_failed_backups() {
         if [[ $fs_probe_rc -ge 128 ]]; then
             tm_interrupt_rc=$fs_probe_rc
             break
-        elif [[ $fs_probe_rc -eq 124 ]]; then
+        elif mole_rc_timeout "$fs_probe_rc"; then
             tm_scan_incomplete=true
             tm_scan_timed_out=true
             break
@@ -1107,7 +1068,7 @@ clean_time_machine_failed_backups() {
             if [[ $backupdb_scan_rc -ne 0 ]]; then
                 debug_log "Skipping incomplete backups in $backupdb_dir: scan status $backupdb_scan_rc"
                 tm_scan_incomplete=true
-                [[ $backupdb_scan_rc -eq 124 ]] && tm_scan_timed_out=true
+                mole_rc_timeout "$backupdb_scan_rc" && tm_scan_timed_out=true
                 continue
             fi
             while IFS= read -r -d '' inprogress_file; do
@@ -1121,7 +1082,7 @@ clean_time_machine_failed_backups() {
                 if [[ $candidate_identity_rc -ge 128 ]]; then
                     tm_interrupt_rc=$candidate_identity_rc
                     break
-                elif [[ $candidate_identity_rc -eq 124 ]]; then
+                elif mole_rc_timeout "$candidate_identity_rc"; then
                     tm_scan_timed_out=true
                     break
                 elif [[ $candidate_identity_rc -ne 0 ]]; then
@@ -1147,7 +1108,7 @@ clean_time_machine_failed_backups() {
                 }
                 local size_rc=0
                 size_kb=$(get_path_size_kb "$inprogress_file" "$size_timeout") || size_rc=$?
-                if [[ $size_rc -eq 124 ]]; then
+                if mole_rc_timeout "$size_rc"; then
                     tm_scan_timed_out=true
                     break
                 elif [[ $size_rc -ge 128 ]]; then
@@ -1185,7 +1146,7 @@ clean_time_machine_failed_backups() {
                 if [[ $eligibility_rc -ge 128 ]]; then
                     tm_interrupt_rc=$eligibility_rc
                     break
-                elif [[ $eligibility_rc -eq 124 ]]; then
+                elif mole_rc_timeout "$eligibility_rc"; then
                     tm_scan_timed_out=true
                     break
                 elif [[ $eligibility_rc -ne 0 ]]; then
@@ -1202,11 +1163,9 @@ clean_time_machine_failed_backups() {
                 if [[ $tm_delete_rc -eq 0 ]]; then
                     local line_color
                     line_color=$(cleanup_result_color_kb "$size_kb")
-                    echo -e "  ${line_color}${ICON_SUCCESS}${NC} Incomplete backup: $backup_name${NC} · ${line_color}$size_human${NC}"
+                    echo -e "  ${line_color}${ICON_SUCCESS}${NC} Incomplete backup: $backup_name${NC} · $(colorize_human_size "${size_human}")"
                     tm_cleaned=$((tm_cleaned + 1))
-                    files_cleaned=$((files_cleaned + 1))
-                    total_size_cleaned=$((total_size_cleaned + size_kb))
-                    total_items=$((total_items + 1))
+                    mole_add_cleaned_row 1 "$size_kb"
                     note_activity
                 else
                     echo -e "  ${YELLOW}!${NC} Could not delete: $backup_name · try manually with sudo"
@@ -1216,7 +1175,7 @@ clean_time_machine_failed_backups() {
                     if [[ $tm_delete_rc -ge 128 ]]; then
                         tm_interrupt_rc=$tm_delete_rc
                         break
-                    elif [[ $tm_delete_rc -eq 124 ]]; then
+                    elif mole_rc_timeout "$tm_delete_rc"; then
                         tm_scan_timed_out=true
                         break
                     fi
@@ -1243,7 +1202,7 @@ clean_time_machine_failed_backups() {
             if [[ $hdiutil_rc -ge 128 ]]; then
                 tm_interrupt_rc=$hdiutil_rc
                 break
-            elif [[ $hdiutil_rc -eq 124 ]]; then
+            elif mole_rc_timeout "$hdiutil_rc"; then
                 tm_scan_incomplete=true
                 tm_scan_timed_out=true
                 break
@@ -1266,7 +1225,7 @@ clean_time_machine_failed_backups() {
                 if [[ $mounted_scan_rc -ne 0 ]]; then
                     debug_log "Skipping incomplete backups in $mounted_path: scan status $mounted_scan_rc"
                     tm_scan_incomplete=true
-                    [[ $mounted_scan_rc -eq 124 ]] && tm_scan_timed_out=true
+                    mole_rc_timeout "$mounted_scan_rc" && tm_scan_timed_out=true
                     continue
                 fi
                 while IFS= read -r -d '' inprogress_file; do
@@ -1279,7 +1238,7 @@ clean_time_machine_failed_backups() {
                     if [[ $candidate_identity_rc -ge 128 ]]; then
                         tm_interrupt_rc=$candidate_identity_rc
                         break
-                    elif [[ $candidate_identity_rc -eq 124 ]]; then
+                    elif mole_rc_timeout "$candidate_identity_rc"; then
                         tm_scan_timed_out=true
                         break
                     elif [[ $candidate_identity_rc -ne 0 ]]; then
@@ -1303,7 +1262,7 @@ clean_time_machine_failed_backups() {
                     }
                     local size_rc=0
                     size_kb=$(get_path_size_kb "$inprogress_file" "$size_timeout") || size_rc=$?
-                    if [[ $size_rc -eq 124 ]]; then
+                    if mole_rc_timeout "$size_rc"; then
                         tm_scan_timed_out=true
                         break
                     elif [[ $size_rc -ge 128 ]]; then
@@ -1339,7 +1298,7 @@ clean_time_machine_failed_backups() {
                     if [[ $eligibility_rc -ge 128 ]]; then
                         tm_interrupt_rc=$eligibility_rc
                         break
-                    elif [[ $eligibility_rc -eq 124 ]]; then
+                    elif mole_rc_timeout "$eligibility_rc"; then
                         tm_scan_timed_out=true
                         break
                     elif [[ $eligibility_rc -ne 0 ]]; then
@@ -1356,11 +1315,9 @@ clean_time_machine_failed_backups() {
                     if [[ $tm_delete_rc -eq 0 ]]; then
                         local line_color
                         line_color=$(cleanup_result_color_kb "$size_kb")
-                        echo -e "  ${line_color}${ICON_SUCCESS}${NC} Incomplete APFS backup in $bundle_name: $backup_name${NC} · ${line_color}$size_human${NC}"
+                        echo -e "  ${line_color}${ICON_SUCCESS}${NC} Incomplete APFS backup in $bundle_name: $backup_name${NC} · $(colorize_human_size "${size_human}")"
                         tm_cleaned=$((tm_cleaned + 1))
-                        files_cleaned=$((files_cleaned + 1))
-                        total_size_cleaned=$((total_size_cleaned + size_kb))
-                        total_items=$((total_items + 1))
+                        mole_add_cleaned_row 1 "$size_kb"
                         note_activity
                     else
                         echo -e "  ${YELLOW}!${NC} Could not delete from bundle: $backup_name"
@@ -1369,7 +1326,7 @@ clean_time_machine_failed_backups() {
                         if [[ $tm_delete_rc -ge 128 ]]; then
                             tm_interrupt_rc=$tm_delete_rc
                             break
-                        elif [[ $tm_delete_rc -eq 124 ]]; then
+                        elif mole_rc_timeout "$tm_delete_rc"; then
                             tm_scan_timed_out=true
                             break
                         fi
@@ -1472,7 +1429,7 @@ clean_local_snapshots() {
     local snapshot_count
     snapshot_count=$(echo "$snapshot_list" | { grep -Eo 'com\.apple\.TimeMachine\.[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}' || true; } | wc -l | awk '{print $1}')
     if [[ "$snapshot_count" =~ ^[0-9]+$ && "$snapshot_count" -gt 0 ]]; then
-        echo -e "  ${YELLOW}${ICON_REVIEW}${NC} Time Machine local snapshots · ${GREEN}${snapshot_count}${NC} ${GRAY}(review: tmutil listlocalsnapshots /)${NC}"
+        mole_review_row "Time Machine local snapshots" "" "$snapshot_count" "macOS removes them when space runs low"
         note_activity
     fi
 }

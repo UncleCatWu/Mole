@@ -18,7 +18,7 @@ func hardeningModel(root string) model {
 	current.Store("")
 	return model{path: root, cache: map[string]historyEntry{}, multiSelected: map[string]bool{},
 		largeMultiSelected: map[string]bool{}, overviewSizeCache: map[string]int64{},
-		overviewScanningSet: map[string]bool{}, filesScanned: &files, dirsScanned: &dirs,
+		overviewScanningSet: map[string]*scanPublication{}, filesScanned: &files, dirsScanned: &dirs,
 		bytesScanned: &bytes, currentPath: current, width: 100, height: 30}
 }
 

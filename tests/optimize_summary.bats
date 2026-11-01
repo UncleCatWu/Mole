@@ -1,8 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-	export PROJECT_ROOT
+	mole_test_setup_project_root
 
 	TEST_HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-optimize-summary.XXXXXX")"
 	export TEST_HOME
@@ -28,6 +29,14 @@ case "$*" in
  esac
 EOF
     chmod +x "$fixture_home/bin/pgrep"
+}
+
+setup() {
+    mole_test_fake_command mdfind
+    # shellcheck disable=SC2016 # The fixture command reads its own arguments.
+    mole_test_fake_command defaults '[[ "${1:-}" == read ]] && exit 1
+printf "UNEXPECTED defaults %s\n" "$*" >&2
+exit 97'
 }
 
 @test "optimize dry-run summary reports outcomes instead of catalog size" {
@@ -135,6 +144,43 @@ EOF
 	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
 	[[ "$output" == *"optimize|TASK_FAILED|session|exit status 1"* ]] || return 1
 	[[ "$output" == *"optimize|TASK_FAILED|interrupted|exit status 130"* ]]
+}
+
+@test "optimize cleanup records each applied task, and none for a preview" {
+	run env HOME="$TEST_HOME/cleanup-applied" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/outcomes.sh"
+eval "$(sed -n '/^cleanup_all() {/,/^}/p' "$PROJECT_ROOT/bin/optimize.sh")"
+
+stop_inline_spinner() { :; }
+stop_sudo_session() { :; }
+cleanup_temp_files() { :; }
+log_operation_session_end() { :; }
+log_operation() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4"; }
+
+record() {
+	optimize_task_start
+	optimize_task_result "$2"
+	optimize_task_finish "$1"
+}
+optimize_outcomes_reset
+record quarantine_cleanup applied
+record dns_flush unchanged
+record spotlight_rules applied
+record disk_verify failed
+cleanup_all 0
+echo "---"
+MOLE_DRY_RUN=1 cleanup_all 0
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	local real="${output%%---*}" preview="${output#*---}"
+	[[ "$real" == *"optimize|REBUILT|quarantine_cleanup|task outcome"* ]] || return 1
+	[[ "$real" == *"optimize|REBUILT|spotlight_rules|task outcome"* ]] || return 1
+	[[ "$real" == *"optimize|TASK_FAILED|disk_verify|task outcome"* ]] || return 1
+	[[ "$real" != *"dns_flush"* ]] || return 1
+	[[ "$preview" != *"REBUILT"* ]] || return 1
 }
 
 @test "optimize EXIT trap forwards the terminal status to cleanup" {

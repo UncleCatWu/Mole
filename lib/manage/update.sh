@@ -496,6 +496,8 @@ _update_verify_installed_generation() {
 _update_print_verified_success() {
     local update_ref="$1"
     local success_label="$2"
+    log_operation "update" "REBUILT" "${mole_path:-mole}" \
+        "updated to ${_MOLE_UPDATE_VERIFIED_VERSION:-${_MOLE_UPDATE_VERIFIED_COMMIT:-$update_ref}}"
     if [[ "$update_ref" == "main" && -n "$_MOLE_UPDATE_VERIFIED_COMMIT" ]]; then
         printf '\n%s\n\n' "${GREEN}${ICON_SUCCESS}${NC} Updated to ${success_label}, ${_MOLE_UPDATE_VERIFIED_COMMIT}"
     elif [[ "$update_ref" == "main" ]]; then
@@ -583,24 +585,129 @@ _update_print_manual_reinstall() {
 # grep finding no match) would kill the whole command before the caller's own
 # fallback and error message could run. `mo update` exited 1 with no output at
 # all that way. The trailing `|| true` is what keeps the failure recoverable.
+# curl reads only proxy environment variables, never the macOS system proxy,
+# so a user who turned on a proxy app's system proxy mode and cannot reach
+# GitHub directly never saw an update notice. Background notices read that
+# proxy when the environment names none. Foreground `mo update` keeps the
+# environment as it is, since its downloads and install.sh would not follow.
+MOLE_SCUTIL_BIN="/usr/sbin/scutil"
+
+mole_system_proxy_url() {
+    [[ -x "$MOLE_SCUTIL_BIN" ]] || return 0
+    local key value https_host="" https_port="" http_host="" http_port=""
+    local socks_host="" socks_port="" https_on=0 http_on=0 socks_on=0
+    while IFS=' :' read -r key value; do
+        case "$key" in
+            HTTPSEnable) https_on="$value" ;;
+            HTTPSProxy) https_host="$value" ;;
+            HTTPSPort) https_port="$value" ;;
+            HTTPEnable) http_on="$value" ;;
+            HTTPProxy) http_host="$value" ;;
+            HTTPPort) http_port="$value" ;;
+            SOCKSEnable) socks_on="$value" ;;
+            SOCKSProxy) socks_host="$value" ;;
+            SOCKSPort) socks_port="$value" ;;
+        esac
+    done < <("$MOLE_SCUTIL_BIN" --proxy 2> /dev/null || true)
+    local scheme="" host="" port=""
+    if [[ "$https_on" == 1 ]]; then
+        scheme=http host="$https_host" port="$https_port"
+    elif [[ "$http_on" == 1 ]]; then
+        scheme=http host="$http_host" port="$http_port"
+    elif [[ "$socks_on" == 1 ]]; then
+        scheme=socks5h host="$socks_host" port="$socks_port"
+    fi
+    [[ "$host" =~ ^[A-Za-z0-9._-]+$ && "$port" =~ ^[0-9]{1,5}$ ]] || return 0
+    printf '%s://%s:%s\n' "$scheme" "$host" "$port"
+}
+
+mole_use_system_proxy_if_unset() {
+    [[ -n "${https_proxy:-}${HTTPS_PROXY:-}${all_proxy:-}${ALL_PROXY:-}" ]] && return 0
+    local proxy
+    proxy=$(mole_system_proxy_url)
+    [[ -n "$proxy" ]] || return 0
+    export https_proxy="$proxy"
+}
+
 get_latest_version() {
-    curl -fsSL --connect-timeout 2 --max-time 3 -H "Cache-Control: no-cache" \
-        "https://raw.githubusercontent.com/tw93/mole/main/mole" 2> /dev/null |
-        grep '^VERSION=' | head -1 | sed 's/VERSION="\(.*\)"/\1/' || true
+    local location version
+    location=$(curl -fsSLI --connect-timeout "${MOLE_LOOKUP_CONNECT_TIMEOUT:-2}" --max-time "${MOLE_LOOKUP_MAX_TIME:-3}" -o /dev/null -w '%{url_effective}' \
+        "https://github.com/tw93/Mole/releases/latest" 2> /dev/null || true)
+    case "$location" in
+        https://github.com/tw93/[Mm]ole/releases/tag/[Vv]*) version="${location##*/}" ;;
+        *) return 0 ;;
+    esac
+    version="${version#[Vv]}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf '%s\n' "$version"
+    return 0
 }
 
 get_latest_version_from_github() {
     local version
-    version=$(curl -fsSL --connect-timeout 2 --max-time 3 \
+    version=$(curl -fsSL --connect-timeout "${MOLE_LOOKUP_CONNECT_TIMEOUT:-2}" --max-time "${MOLE_LOOKUP_MAX_TIME:-3}" \
         "https://api.github.com/repos/tw93/mole/releases/latest" 2> /dev/null |
-        grep '"tag_name"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
-    version="${version#v}"
-    version="${version#V}"
-    echo "$version"
+        /usr/bin/plutil -extract tag_name raw -o - - 2> /dev/null || true)
+    version="${version#[Vv]}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf '%s\n' "$version"
+    return 0
+}
+
+# /usr/bin/git is a stub until the Command Line Tools are installed, and
+# running it opens their installer. Plain assignments so a test can point both
+# at fixtures after sourcing.
+MOLE_SYSTEM_GIT_STUB="/usr/bin/git"
+MOLE_XCODE_SELECT_BIN="/usr/bin/xcode-select"
+
+# Succeeds when a git lookup cannot pop up the Command Line Tools installer.
+mole_git_runs_quietly() {
+    local git_bin
+    git_bin=$(command -v git 2> /dev/null) || return 1
+    [[ "$git_bin" == "$MOLE_SYSTEM_GIT_STUB" ]] || return 0
+    "$MOLE_XCODE_SELECT_BIN" -p > /dev/null 2>&1
+}
+
+get_latest_version_from_git() {
+    if ! mole_git_runs_quietly; then
+        return 0
+    fi
+    local response tag version=""
+    if response=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" \
+        /usr/bin/env \
+        -u GIT_CONFIG_PARAMETERS \
+        -u GIT_EXEC_PATH \
+        -u GIT_DIR \
+        -u GIT_WORK_TREE \
+        -u GIT_COMMON_DIR \
+        -u GIT_CONFIG \
+        -u GIT_PROXY_COMMAND \
+        -u GIT_SSH \
+        -u GIT_SSH_COMMAND \
+        -u GIT_SSL_NO_VERIFY \
+        GIT_TERMINAL_PROMPT=0 \
+        GIT_ASKPASS=/usr/bin/false \
+        SSH_ASKPASS=/usr/bin/false \
+        GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_CONFIG_COUNT=0 \
+        LC_ALL=C \
+        git -c credential.helper= -c core.askPass=/usr/bin/false \
+        -c protocol.allow=never -c protocol.https.allow=always \
+        -c http.sslVerify=true -C / \
+        ls-remote --tags --refs https://github.com/tw93/mole.git \
+        2> /dev/null); then
+        tag=$(printf '%s\n' "$response" |
+            awk -F/ '{print $NF}' |
+            grep -E '^V[0-9]+\.[0-9]+\.[0-9]+$' |
+            sort -V |
+            tail -n 1)
+        version="${tag#[Vv]}"
+    fi
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf '%s\n' "$version"
+    return 0
 }
 
 # Foreground `mo update` version discovery. The single-shot helpers above stay
-# fast because the update-available banner calls them on every command; an
+# fast because background notices must not delay commands; an
 # explicit update is worth a bounded retry instead, since the same proxy reset
 # that breaks the installer download also breaks this request.
 resolve_latest_stable_version() {
@@ -611,6 +718,7 @@ resolve_latest_stable_version() {
     while true; do
         candidate=$(get_latest_version_from_github)
         [[ -z "$candidate" ]] && candidate=$(get_latest_version)
+        [[ -z "$candidate" ]] && candidate=$(get_latest_version_from_git)
         if [[ -n "$candidate" ]]; then
             printf '%s\n' "$candidate"
             return 0
@@ -633,39 +741,20 @@ run_brew_detect() {
     run_brew_command "${MOLE_HOMEBREW_DETECT_TIMEOUT:-2}" "$@"
 }
 
-run_brew_query() {
-    run_brew_command "${MOLE_HOMEBREW_QUERY_TIMEOUT:-5}" "$@"
-}
-
 brew_mole_formula_installed() {
     local brew_cmd="${1:-brew}"
     run_brew_detect "$brew_cmd" list mole > /dev/null 2>&1
 }
 
 get_homebrew_latest_version() {
-    command -v brew > /dev/null 2>&1 || return 1
-
-    local line candidate=""
-
-    # Prefer local tap outdated info to avoid notifying before formula is available.
-    line=$(run_brew_query brew outdated --formula --verbose mole 2> /dev/null | head -1 || true)
-    if [[ "$line" == *"< "* ]]; then
-        candidate="${line##*< }"
-        candidate="${candidate%% *}"
-    fi
-
-    # Fallback for environments where outdated output is unavailable.
-    if [[ -z "$candidate" ]]; then
-        line=$(run_brew_query brew info mole 2> /dev/null | awk 'NR==1 { print; exit }' || true)
-        line="${line#==> }"
-        line="${line#*: }"
-        if [[ "$line" == stable* ]]; then
-            candidate=$(printf '%s\n' "$line" | awk '{print $2}')
-        fi
-    fi
-
-    [[ -n "$candidate" ]] && printf '%s\n' "$candidate"
+    local version
+    version=$(curl -fsSL --connect-timeout "${MOLE_LOOKUP_CONNECT_TIMEOUT:-2}" --max-time "${MOLE_LOOKUP_MAX_TIME:-3}" \
+        "https://formulae.brew.sh/api/formula/mole.json" 2> /dev/null |
+        /usr/bin/plutil -extract versions.stable raw -o - - 2> /dev/null || true)
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf '%s\n' "$version"
+    return 0
 }
+
 resolve_mole_source_path() {
     # MOLE_ENTRY_SCRIPT is set by the `mole` entrypoint before this file is
     # sourced. Do NOT fall back to BASH_SOURCE[0] first: in here it names this
@@ -757,11 +846,20 @@ is_homebrew_install() {
     is_homebrew_mole_path "$mole_path" "$has_brew"
 }
 
+# SCRIPT_DIR is resolved by the launcher before these helpers are loaded.
+# Match the store root, not a coincidental directory named nix/store in HOME.
+is_nix_install() {
+    [[ "${SCRIPT_DIR:-}" == /nix/store/* ]]
+}
+
 get_install_channel() {
-    # Try user config dir first (matches install.sh behavior), fallback to SCRIPT_DIR
-    local channel_file="${MOLE_CONFIG_DIR:-$HOME/.config/mole}/install_channel"
+    # This install's own receipt wins. install.sh --config can move the config
+    # dir, and the launcher records where it went in SCRIPT_DIR, so reading the
+    # default path first let a receipt left by an earlier default install decide
+    # which channel a relocated install updates from (tw93/Mole#1589).
+    local channel_file="${MOLE_CONFIG_DIR:-${SCRIPT_DIR:-}}/install_channel"
     if [[ ! -f "$channel_file" ]]; then
-        channel_file="$SCRIPT_DIR/install_channel"
+        channel_file="$HOME/.config/mole/install_channel"
     fi
     local channel="stable"
     if [[ -f "$channel_file" ]]; then
@@ -774,12 +872,12 @@ get_install_channel() {
 }
 
 # Read one field out of the install channel receipt, empty when absent.
-# User config dir first (matches install.sh), then the install directory.
+# Same precedence as get_install_channel: this install's own receipt first.
 _read_install_channel_field() {
     local key="$1"
-    local channel_file="${MOLE_CONFIG_DIR:-$HOME/.config/mole}/install_channel"
+    local channel_file="${MOLE_CONFIG_DIR:-${SCRIPT_DIR:-}}/install_channel"
     if [[ ! -f "$channel_file" ]]; then
-        channel_file="$SCRIPT_DIR/install_channel"
+        channel_file="$HOME/.config/mole/install_channel"
     fi
     if [[ -f "$channel_file" ]]; then
         sed -n "s/^${key}=\(.*\)$/\1/p" "$channel_file" | head -1
@@ -799,10 +897,10 @@ get_latest_commit_from_github() {
     local response=""
     local sha=""
     if command -v curl > /dev/null 2>&1; then
-        response=$(curl -fsSL --connect-timeout 2 --max-time 3 \
+        response=$(curl -fsSL --connect-timeout "${MOLE_LOOKUP_CONNECT_TIMEOUT:-2}" --max-time "${MOLE_LOOKUP_MAX_TIME:-3}" \
             "https://api.github.com/repos/tw93/mole/commits/main" 2> /dev/null || true)
     elif command -v wget > /dev/null 2>&1; then
-        response=$(wget --timeout=3 --tries=1 -qO- \
+        response=$(wget --timeout="${MOLE_LOOKUP_MAX_TIME:-3}" --tries=1 -qO- \
             "https://api.github.com/repos/tw93/mole/commits/main" 2> /dev/null || true)
     fi
     sha=$(printf '%s\n' "$response" |
@@ -821,7 +919,7 @@ get_latest_commit_from_github() {
 
     # The unauthenticated API can be rate-limited even while ordinary GitHub
     # access works. Keep the fallback bounded and accept only main's exact SHA.
-    if command -v git > /dev/null 2>&1; then
+    if mole_git_runs_quietly; then
         # Ignore ambient credential helpers and URL rewrites: this public,
         # read-only probe must resolve the literal GitHub remote or fail.
         if response=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" \
@@ -879,77 +977,204 @@ mole_update_message_cache_is_current() {
     return 0
 }
 
-read_update_message_cache() {
-    local msg_cache="$1"
-    if mole_update_message_cache_is_current "$msg_cache"; then
-        cat "$msg_cache" 2> /dev/null || echo ""
-    else
-        : > "$msg_cache" 2> /dev/null || true
-        echo ""
-    fi
+# A notice that offers this install's own version, or an older one, is already
+# satisfied. Package managers keep file mtimes across an upgrade, so a notice
+# left behind by the previous release passes the mtime check above and would
+# otherwise tell the user to update to the version they are running.
+mole_update_message_is_stale() {
+    local message="$1" pattern='Update ([0-9]+\.[0-9]+\.[0-9]+) available' offered
+    [[ -n "${VERSION:-}" && "$message" =~ $pattern ]] || return 1
+    offered="${BASH_REMATCH[1]}"
+    [[ "$offered" == "$VERSION" ]] && return 0
+    [[ "$(printf '%s\n' "$VERSION" "$offered" | sort -V | head -1)" != "$VERSION" ]]
 }
 
-# Background update notice
-check_for_updates() {
-    local msg_cache="$HOME/.cache/mole/update_message"
-    ensure_user_dir "$(dirname "$msg_cache")"
-    ensure_user_file "$msg_cache"
+read_update_message_cache() {
+    local msg_cache="$1" message=""
+    is_nix_install && return 0
+    if mole_update_message_cache_is_current "$msg_cache"; then
+        message=$(cat "$msg_cache" 2> /dev/null) || message=""
+        if mole_update_message_is_stale "$message"; then
+            message=""
+        fi
+    fi
+    printf '%s\n' "$message"
+}
 
+# Cache writes are atomic so the menu never reads a partially written notice.
+_mole_write_update_cache() {
+    local path="$1" value="$2" scratch
+    # An unwritable cache must stay as quiet as the lookup, so every probe here
+    # keeps its diagnostics off the terminal.
+    scratch=$(umask 077 && mktemp "${path}.XXXXXX" 2> /dev/null) || return 1
+    if printf '%s' "$value" > "$scratch" 2> /dev/null && mv -f "$scratch" "$path" 2> /dev/null; then
+        return 0
+    fi
+    rm -f "$scratch" # SAFE: exact mktemp-created update cache scratch file
+    return 1
+}
+
+# One successful lookup per day; unknown results retry after an hour.
+# Bind the throttle to the install version, channel, commit and install
+# directory. The invoked name (mo, mole, a symlink) is not part of the key, so
+# every way of starting one install shares a single lookup and notice.
+check_for_updates() {
+    local cache_dir="$HOME/.cache/mole" channel key now saved_key="" checked=0 interval=0
+    is_nix_install && return 0
+    ensure_user_dir "$cache_dir" || return 0
+    # The receipt probes run in the foreground now, so an unreadable receipt
+    # must not print sed's diagnostic before the user's command.
+    channel=$(get_install_channel 2> /dev/null)
+    key=$(printf '%s\n' "$VERSION" "$channel" "$(get_install_commit 2> /dev/null)" "${SCRIPT_DIR:-}" | cksum | awk '{print $1}')
+    now=$(date +%s)
+    if [[ -f "$cache_dir/version_check" ]]; then
+        { read -r saved_key checked interval < "$cache_dir/version_check"; } 2> /dev/null || true
+        if [[ "$saved_key" == "$key" && "$checked" =~ ^[0-9]{1,12}$ && "$interval" =~ ^(3600|86400)$ ]] &&
+            ((now >= 10#$checked && now - 10#$checked < interval)); then
+            return 0
+        fi
+        if [[ -n "$saved_key" && "$saved_key" != "$key" ]]; then
+            _mole_write_update_cache "$cache_dir/update_message" "" || return 0
+        fi
+    fi
+    _mole_write_update_cache "$cache_dir/version_check" "$key $now 3600"$'\n' || return 0
     (
         (
-            local channel
-            channel=$(get_install_channel)
-
-            if [[ "$channel" == "nightly" ]]; then
-                # Nightly: compare commit hashes instead of version numbers
-                local installed_commit latest_commit
-                installed_commit=$(get_install_commit)
-                latest_commit=$(get_latest_commit_from_github api-only)
-
-                if [[ -n "$installed_commit" && -n "$latest_commit" && "${installed_commit:0:7}" != "${latest_commit:0:7}" ]]; then
-                    printf "\nNew nightly commit %s available, run %smo update --nightly%s\n\n" "${latest_commit:0:7}" "$GREEN" "$NC" > "$msg_cache"
-                else
-                    echo -n > "$msg_cache"
+            local latest="" installed="${VERSION}" message=""
+            # Nothing waits on this lookup, so slow networks get a longer
+            # window than the foreground default.
+            local MOLE_LOOKUP_CONNECT_TIMEOUT=4 MOLE_LOOKUP_MAX_TIME=6
+            mole_use_system_proxy_if_unset
+            if [[ "$channel" == nightly ]]; then
+                installed=$(get_install_commit)
+                latest=$(get_latest_commit_from_github api-only)
+                [[ -n "$installed" && -n "$latest" ]] || exit 0
+                if [[ "${installed:0:7}" != "${latest:0:7}" ]]; then
+                    message="New nightly commit ${latest:0:7} available, run mo update --nightly"
                 fi
             else
-                local latest
-
-                latest=$(get_latest_version_from_github)
-                if [[ -z "$latest" ]]; then
-                    latest=$(get_latest_version)
-                fi
-
-                if [[ -n "$latest" && "$VERSION" != "$latest" && "$(printf '%s\n' "$VERSION" "$latest" | sort -V | head -1)" == "$VERSION" ]]; then
-                    if is_homebrew_install; then
-                        # For Homebrew, only notify if the brew tap has the new version available locally
-                        local brew_latest
-                        brew_latest=$(get_homebrew_latest_version || true)
-                        if [[ -n "$brew_latest" && "$brew_latest" != "$VERSION" && "$(printf '%s\n' "$VERSION" "$brew_latest" | sort -V | head -1)" == "$VERSION" ]]; then
-                            printf "\nUpdate %s available, run %smo update%s\n\n" "$brew_latest" "$GREEN" "$NC" > "$msg_cache"
-                        else
-                            echo -n > "$msg_cache"
-                        fi
-                    else
-                        printf "\nUpdate %s available, run %smo update%s\n\n" "$latest" "$GREEN" "$NC" > "$msg_cache"
-                    fi
+                if is_homebrew_install; then
+                    latest=$(get_homebrew_latest_version)
                 else
-                    echo -n > "$msg_cache"
+                    latest=$(get_latest_version_from_github)
+                    [[ -n "$latest" ]] || latest=$(get_latest_version)
+                fi
+                [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 0
+                if [[ "$installed" != "$latest" && "$(printf '%s\n' "$installed" "$latest" | sort -V | head -1)" == "$installed" ]]; then
+                    message="Update $latest available, run mo update"
                 fi
             fi
+            _mole_write_update_cache "$cache_dir/update_message" "$message" || exit 0
+            _mole_write_update_cache "$cache_dir/version_check" "$key $now 86400"$'\n' || true
         ) > /dev/null 2>&1 < /dev/null &
     )
+    return 0
+}
+
+# Only human-facing interactive commands get notices. Keep exec semantics for
+# automation, JSON, help and redirected output, and never wait for the network.
+run_mole_command() {
+    local arg rc=0
+    if [[ ! -t 0 || ! -t 1 || ! -t 2 ]]; then
+        exec "$@"
+    fi
+    for arg in "$@"; do
+        case "$arg" in
+            --json | -json | --json=* | -json=* | --ndjson | --watch | -watch | --watch=* | -watch=* | --help | -h | --version | -V | --list | --list=*) exec "$@" ;;
+        esac
+    done
+    # Without perl, or with a target bash cannot launch (missing, not
+    # executable, or a #! line naming a missing interpreter), run the plain
+    # exec: bash then prints its own error and returns its own status, exactly
+    # as a redirected run does, and only the notice is lost.
+    [[ -x /usr/bin/perl && -f "$1" && -x "$1" ]] || exec "$@"
+    local shebang=""
+    { IFS= read -r shebang < "$1"; } 2> /dev/null || true
+    if [[ "$shebang" == '#!'* ]]; then
+        shebang=${shebang#'#!'}
+        shebang=${shebang# }
+        shebang=${shebang%% *}
+        [[ -x "$shebang" ]] || exec "$@"
+    fi
+    check_for_updates
+    local command_pid="" pending_signal="" command_ready=false interrupted=0 signal_generation=0 observed_generation=0
+    # Install handlers before launch, but forward only after Perl restores the
+    # signal disposition that Bash disables for asynchronous jobs.
+    _mole_forward_pending_signal() {
+        [[ "$command_ready" == "true" && -n "$command_pid" && -n "$pending_signal" ]] || return 0
+        local queued_signal
+        queued_signal="$pending_signal" pending_signal=""
+        kill -"$queued_signal" "$command_pid" 2> /dev/null || true
+    }
+    # Terminal Ctrl-C and nested shell traps can deliver a signal repeatedly.
+    # Child handlers must tolerate repeats while completing their cleanup.
+    trap 'signal_generation=$((signal_generation + 1)); [[ "$interrupted" -ne 0 ]] || interrupted=129; pending_signal=HUP; _mole_forward_pending_signal' HUP
+    trap 'signal_generation=$((signal_generation + 1)); [[ "$interrupted" -ne 0 ]] || interrupted=130; pending_signal=INT; _mole_forward_pending_signal' INT
+    trap 'signal_generation=$((signal_generation + 1)); [[ "$interrupted" -ne 0 ]] || interrupted=143; pending_signal=TERM; _mole_forward_pending_signal' TERM
+    trap 'signal_generation=$((signal_generation + 1)); command_ready=true; _mole_forward_pending_signal' USR1
+    if [[ "$interrupted" -ne 0 ]]; then
+        trap - HUP INT TERM USR1
+        exit "$interrupted"
+    fi
+    # Bash ignores SIGINT in asynchronous jobs. Restore the normal disposition
+    # and unblock TERM inherited from terminal daemons before exec: otherwise
+    # uninstall waits forever for a spinner that cannot receive its stop signal.
+    # The checks above leave no known reason for the exec to fail; if one
+    # appears anyway the cause is reported and the status is 1, like the plain
+    # exec.
+    # Bash prints a signalled background child ("Killed: 9 ... perl ...") from
+    # whichever command finishes first after the child dies. The launcher is
+    # that child when its command kills itself or crashes, so nothing between
+    # the launch and the end of the wait may write the shell's own stderr to
+    # the terminal. The command keeps the real stderr through fd 9.
+    exec 9>&2
+    {
+        /usr/bin/perl -MPOSIX -e '$SIG{INT}="DEFAULT"; $SIG{QUIT}="DEFAULT"; POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), POSIX::SigSet->new(POSIX::SIGTERM())) or die "Cannot unblock SIGTERM: $!\n"; kill "USR1", getppid(); exec {$ARGV[0]} @ARGV; warn "$ARGV[0]: $!\n"; exit 1' "$@" <&0 2>&9 9>&- &
+        command_pid=$!
+        _mole_forward_pending_signal
+        # Bash 3.2 can discard INT inside a USR1 trap entered from wait. Settle
+        # the launcher's one readiness notification before using that builtin.
+        # A launcher that exits before notifying must still reach status collection.
+        {
+            while [[ "$command_ready" != "true" ]] && kill -0 "$command_pid" 2> /dev/null; do
+                sleep 0.01 || true
+            done
+        } 2> /dev/null
+        # wait returns early for a trapped signal. Retry only when this wait was
+        # interrupted, retaining the first cancellation status through child cleanup.
+        # Its stderr is dropped because bash reports a child killed by a signal
+        # (SIGKILL, a crash) with a job-status line that quotes the perl one-liner;
+        # the exit status is unaffected. The redirect sits on a group, not on the
+        # wait builtin: on bash 3.2 a TERM or HUP trap followed within a fraction
+        # of a millisecond by INT can leave a redirected wait looping at full CPU.
+        while true; do
+            observed_generation=$signal_generation
+            rc=0
+            { wait "$command_pid"; } 2> /dev/null || rc=$?
+            [[ "$observed_generation" -eq "$signal_generation" ]] && break
+        done
+    } 2> /dev/null
+    exec 9>&-
+    [[ "$interrupted" -eq 0 ]] || rc=$interrupted
+    trap - HUP INT TERM USR1
+    if [[ "$rc" -lt 128 ]]; then
+        local notice
+        notice=$(read_update_message_cache "$HOME/.cache/mole/update_message")
+        [[ -z "$notice" ]] || printf '\n%s\n' "$notice" >&2
+    fi
+    exit "$rc"
 }
 
 # UI helpers
 show_brand_banner() {
-    cat << EOF
-${GREEN} __  __       _      ${NC}
-${GREEN}|  \/  | ___ | | ___ ${NC}
-${GREEN}| |\/| |/ _ \| |/ _ \\${NC}
-${GREEN}| |  | | (_) | |  __/${NC}  ${BLUE}https://mole.fit${NC}
-${GREEN}|_|  |_|\___/|_|\___|${NC}  ${GREEN}${MOLE_TAGLINE}${NC}
-
-EOF
+    # printf keeps read-only help independent of Bash 3.2 heredoc scratch files.
+    printf '%s\n' \
+        "${GREEN} __  __       _      ${NC}" \
+        "${GREEN}|  \/  | ___ | | ___ ${NC}" \
+        "${GREEN}| |\/| |/ _ \| |/ _ \\${NC}" \
+        "${GREEN}| |  | | (_) | |  __/${NC}  ${BLUE}https://mole.fit${NC}" \
+        "${GREEN}|_|  |_|\___/|_|\___|${NC}  ${GREEN}${MOLE_TAGLINE}${NC}" \
+        ""
 }
 
 show_version() {
@@ -969,7 +1194,7 @@ show_version() {
     local sip_status
     if command -v csrutil > /dev/null; then
         sip_status=$(csrutil status 2> /dev/null | grep -o "enabled\|disabled" || echo "Unknown")
-        sip_status="$(LC_ALL=C tr '[:lower:]' '[:upper:]' <<< "${sip_status:0:1}")${sip_status:1}"
+        sip_status="$(printf '%s' "${sip_status:0:1}" | LC_ALL=C tr '[:lower:]' '[:upper:]')${sip_status:1}"
     else
         sip_status="Unknown"
     fi
@@ -978,8 +1203,16 @@ show_version() {
     disk_free=$(get_free_space)
 
     local install_method="Manual"
-    if is_homebrew_install; then
+    if is_nix_install; then
+        install_method="Nix"
+    elif is_homebrew_install; then
         install_method="Homebrew"
+        # A --HEAD build keeps the release number in VERSION; only its keg
+        # name says which main commit it built.
+        local head_keg_re='/Cellar/mole/HEAD-([0-9a-fA-F]+)(/|$)'
+        if [[ "${SCRIPT_DIR:-}" =~ $head_keg_re ]]; then
+            install_method="Homebrew (HEAD ${BASH_REMATCH[1]})"
+        fi
     fi
 
     local channel
@@ -1049,7 +1282,6 @@ update_mole() (
     mole_local_generation_management_guard update || exit "$?"
     local force_update="${1:-false}"
     local nightly_update="${2:-false}"
-    local update_interrupted=false
     local sudo_keepalive_pid=""
     local UPDATE_LOCK_CONTROL=""
     local UPDATE_LOCK_HOLDER_PID=""
@@ -1064,14 +1296,23 @@ update_mole() (
                 "$UPDATE_LOCK_CONTROL" "$UPDATE_LOCK_HOLDER_PID" "$UPDATE_LOCK_ACQUIRED" "$UPDATE_LOCK_TOKEN"
         fi
     }
-    trap '_update_cleanup; update_interrupted=true; echo ""; exit 130' INT TERM
+    trap '_update_cleanup; echo ""; exit 130' INT TERM
     trap '_update_cleanup' EXIT
+
+    if is_nix_install; then
+        local review_icon="${ICON_REVIEW:-⊙}"
+        log_error "Mole was installed via Nix. Self-update is disabled."
+        printf '%s To update Mole: nix profile upgrade mole, or update the Mole input in your Nix configuration\n' "$review_icon"
+        exit 1
+    fi
 
     if is_homebrew_install; then
         if [[ "$nightly_update" == "true" ]]; then
             local review_icon="${ICON_REVIEW:-⊙}"
             log_error "Nightly update is only available for script installations. Homebrew installs follow stable releases."
-            printf '%s Reinstall via script to use: mo update --nightly\n' "$review_icon"
+            # install.sh exits while Homebrew owns mole; the formula's head
+            # builds main, so stay on Homebrew to try it.
+            printf '%s To try main: brew uninstall mole && brew install --HEAD mole\n' "$review_icon"
             exit 1
         fi
         update_via_homebrew "$VERSION"
@@ -1309,8 +1550,12 @@ update_mole() (
                 new_version="$fallback_version"
             fi
             printf '%s\n\n' "${GREEN}${ICON_SUCCESS}${NC} Updated to ${success_label}, ${new_version:-unknown}"
+            log_operation "update" "REBUILT" "${mole_path:-mole}" "updated to ${new_version:-unknown}"
         else
             printf '\n'
+            if printf '%s\n' "$output" | grep -q "Updated to latest version"; then
+                log_operation "update" "REBUILT" "${mole_path:-mole}" "updated to ${fallback_version:-unknown}"
+            fi
         fi
     }
 

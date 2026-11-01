@@ -4,10 +4,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -95,40 +94,35 @@ func createInsightEntries() []dirEntry {
 
 // measureInsightSize measures the size of a path.
 // Old Downloads is treated specially: only files older than 90 days are counted.
-func measureInsightSize(path string) (int64, error) {
-	return measureInsightSizeWithContext(context.Background(), path)
+func measureInsightSize(ctx context.Context, path string) (int64, error) {
+	return measureInsightSizeWithPublication(ctx, path, nil)
 }
 
-func measureInsightSizeWithContext(ctx context.Context, path string) (int64, error) {
+func measureInsightSizeWithPublication(ctx context.Context, path string, publication *scanPublication) (int64, error) {
 	home := os.Getenv("HOME")
 
 	if home != "" && path == filepath.Join(home, "Downloads") {
-		size, err := measureOldDownloadsWithContext(ctx, path, 90)
-		if stopped := ctx.Err(); stopped != nil {
-			return 0, stopped
-		}
-		if err == nil {
-			_ = storeOverviewSizeWithContext(ctx, path, size)
-			if stopped := ctx.Err(); stopped != nil {
-				return 0, stopped
+		size, err := measureOldDownloads(ctx, path, 90)
+		if overviewMeasurementStorable(size, err) {
+			if publication == nil {
+				publication = overviewPublicationFromContext(ctx)
+			}
+			if storeErr := storeOverviewMeasurementWithPublication(publication, path, size, err != nil); errors.Is(storeErr, context.Canceled) || errors.Is(storeErr, context.DeadlineExceeded) {
+				return 0, storeErr
 			}
 		}
 		return size, err
 	}
 
-	return measureOverviewSizeWithContext(ctx, path)
+	return measureOverviewSizeWithPublication(ctx, path, publication)
 }
 
 // measureOldDownloads calculates total size of files in a directory
 // that haven't been modified in the given number of days.
-func measureOldDownloads(dir string, daysOld int) (int64, error) {
-	return measureOldDownloadsWithContext(context.Background(), dir, daysOld)
-}
-
-func measureOldDownloadsWithContext(ctx context.Context, dir string, daysOld int) (int64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
+func measureOldDownloads(ctx context.Context, dir string, daysOld int) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, duTimeout)
+	defer cancel()
+	var failures scanFailures
 	cutoff := time.Now().AddDate(0, 0, -daysOld)
 	var total int64
 
@@ -138,8 +132,9 @@ func measureOldDownloadsWithContext(ctx context.Context, dir string, daysOld int
 	}
 
 	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return 0, err
+		if ctx.Err() != nil {
+			failures.record(ctx.Err())
+			break
 		}
 		// Skip hidden files.
 		if strings.HasPrefix(entry.Name(), ".") {
@@ -148,50 +143,21 @@ func measureOldDownloadsWithContext(ctx context.Context, dir string, daysOld int
 
 		info, err := entry.Info()
 		if err != nil {
+			failures.record(err)
 			continue
 		}
 
 		if info.ModTime().Before(cutoff) {
 			if entry.IsDir() {
 				// Use du for directories.
-				if size, err := getDirSizeFastWithContext(ctx, filepath.Join(dir, entry.Name())); err == nil {
-					total += size
-				} else if ctx.Err() != nil {
-					return 0, ctx.Err()
-				}
+				size, err := getDirectorySizeFromDu(ctx, filepath.Join(dir, entry.Name()))
+				failures.record(err)
+				total += size
 			} else {
 				total += info.Size()
 			}
 		}
 	}
 
-	return total, nil
-}
-
-// getDirSizeFast measures directory size using du.
-func getDirSizeFast(path string) (int64, error) {
-	return getDirSizeFastWithContext(context.Background(), path)
-}
-
-func getDirSizeFastWithContext(parent context.Context, path string) (int64, error) {
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "du", "-sk", path)
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, err
-	}
-
-	fields := strings.Fields(string(output))
-	if len(fields) == 0 {
-		return 0, nil
-	}
-
-	kb, err := strconv.ParseInt(fields[0], 10, 64)
-	if err != nil {
-		return 0, err
-	}
-
-	return kb * 1024, nil
+	return total, failures.first
 }

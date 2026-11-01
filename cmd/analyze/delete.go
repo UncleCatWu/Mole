@@ -36,9 +36,9 @@ const trashTimeout = 30 * time.Second
 // Finder fallback.
 const trashBinary = "/usr/bin/trash"
 
-var errTrashBinaryUnavailable = errors.New("Trash binary unavailable")
+var errTrashBinaryUnavailable = errors.New("trash binary unavailable")
 var errTrashFilesystemUnavailable = errors.New("filesystem Trash unavailable")
-var errTrashOutcomeUnknown = errors.New("Trash command outcome unknown")
+var errTrashOutcomeUnknown = errors.New("trash command outcome unknown")
 
 var trashBinaryProbe = func() error {
 	_, err := os.Stat(trashBinary)
@@ -66,13 +66,19 @@ type deleteRequest struct {
 	ctx        context.Context
 }
 
-func deletePathCmd(path string, counter *int64, requests ...deleteRequest) tea.Cmd {
+func deletePathCmd(path string, counter *int64, audit *deleteAudit, requests ...deleteRequest) tea.Cmd {
 	var request deleteRequest
 	if len(requests) > 0 {
 		request = requests[0]
 	}
 	return func() tea.Msg {
+		if err := deleteContext([]context.Context{request.ctx}).Err(); err != nil {
+			return deleteProgressMsg{operationID: request.id, parentPath: request.parentPath, done: true, path: path, err: err}
+		}
+		audit.begin()
 		count, err := trashPathWithProgress(path, counter, request.ctx)
+		audit.record(path, err)
+		audit.end()
 		return deleteProgressMsg{
 			operationID: request.id,
 			parentPath:  request.parentPath,
@@ -80,12 +86,13 @@ func deletePathCmd(path string, counter *int64, requests ...deleteRequest) tea.C
 			err:         err,
 			count:       count,
 			path:        path,
+			logWarning:  audit.warning(),
 		}
 	}
 }
 
 // deleteMultiplePathsCmd moves paths to Trash and aggregates results.
-func deleteMultiplePathsCmd(paths []string, counter *int64, requests ...deleteRequest) tea.Cmd {
+func deleteMultiplePathsCmd(paths []string, counter *int64, audit *deleteAudit, requests ...deleteRequest) tea.Cmd {
 	var request deleteRequest
 	if len(requests) > 0 {
 		request = requests[0]
@@ -96,6 +103,10 @@ func deleteMultiplePathsCmd(paths []string, counter *int64, requests ...deleteRe
 		var errors []string
 		var removedPaths []string
 		var stopErr error
+		if err := ctx.Err(); err != nil {
+			return deleteProgressMsg{operationID: request.id, parentPath: request.parentPath, done: true, err: err}
+		}
+		audit.begin()
 
 		// Process deeper paths first to avoid parent/child conflicts.
 		pathsToDelete := append([]string(nil), paths...)
@@ -109,6 +120,7 @@ func deleteMultiplePathsCmd(paths []string, counter *int64, requests ...deleteRe
 				break
 			}
 			count, err := trashPathWithProgress(path, counter, request.ctx)
+			audit.record(path, err)
 			totalCount += count
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -132,6 +144,7 @@ func deleteMultiplePathsCmd(paths []string, counter *int64, requests ...deleteRe
 		if stopErr != nil {
 			resultErr = stopErr
 		}
+		audit.end()
 
 		return deleteProgressMsg{
 			operationID:  request.id,
@@ -141,6 +154,7 @@ func deleteMultiplePathsCmd(paths []string, counter *int64, requests ...deleteRe
 			count:        totalCount,
 			path:         "",
 			removedPaths: removedPaths,
+			logWarning:   audit.warning(),
 		}
 	}
 }
@@ -440,7 +454,8 @@ func isProtectedAnalyzeDeletePath(path string) bool {
 		if cleanPath == dockerDesktopState || strings.HasPrefix(cleanPath, dockerDesktopState+string(filepath.Separator)) {
 			return true
 		}
-		if isPathWithinExistingRoot(cleanPath, dockerDesktopState) {
+		if isPathWithinExistingRoot(cleanPath, dockerDesktopState) ||
+			containsProtectedRoot(cleanPath, dockerDesktopState) {
 			return true
 		}
 
@@ -448,7 +463,8 @@ func isProtectedAnalyzeDeletePath(path string) bool {
 		if cleanPath == orbstackState || strings.HasPrefix(cleanPath, orbstackState+string(filepath.Separator)) {
 			return true
 		}
-		if isPathWithinExistingRoot(cleanPath, orbstackState) {
+		if isPathWithinExistingRoot(cleanPath, orbstackState) ||
+			containsProtectedRoot(cleanPath, orbstackState) {
 			return true
 		}
 
@@ -458,7 +474,9 @@ func isProtectedAnalyzeDeletePath(path string) bool {
 				if !strings.HasSuffix(strings.ToLower(entry.Name()), "dev.orbstack") {
 					continue
 				}
-				if isPathWithinExistingRoot(cleanPath, filepath.Join(groupContainers, entry.Name())) {
+				stateRoot := filepath.Join(groupContainers, entry.Name())
+				if isPathWithinExistingRoot(cleanPath, stateRoot) ||
+					containsProtectedRoot(cleanPath, stateRoot) {
 					return true
 				}
 			}
@@ -582,6 +600,19 @@ func protectedAnalyzeHomeRoots() []string {
 	return homeRoots
 }
 
+func containsProtectedRoot(path, protectedRoot string) bool {
+	// An absent runtime must not make an otherwise empty container directory
+	// undeletable. Unknown visibility still keeps its structural ancestors.
+	if _, err := os.Lstat(protectedRoot); os.IsNotExist(err) {
+		return false
+	}
+	if resolved, err := filepath.EvalSymlinks(protectedRoot); err == nil &&
+		isPathWithinExistingRoot(resolved, path) {
+		return true
+	}
+	return isPathWithinExistingRoot(protectedRoot, path)
+}
+
 func isPathWithinExistingRoot(path, protectedRoot string) bool {
 	protectedInfo, err := os.Stat(protectedRoot)
 	if err != nil {
@@ -626,6 +657,7 @@ var endpointSecurityBundlePrefixes = []string{
 	"com.paloaltonetworks.",
 	"com.cisco.anyconnect",
 	"com.cisco.secureclient",
+	"com.alibaba.security.",
 }
 
 // isEndpointSecurityCachePath reports whether path is an endpoint-security / EDR
@@ -636,6 +668,13 @@ func isEndpointSecurityCachePath(path string) bool {
 	lowerPath := strings.ToLower(path)
 	if !strings.HasPrefix(lowerPath, "/private/var/folders/") && !strings.HasPrefix(lowerPath, "/var/folders/") {
 		return false
+	}
+	// A whole Darwin user/cache container also moves any protected agent
+	// below it. Keep the structural ancestors; ordinary app cache leaves stay
+	// eligible without an unbounded recursive scan of the shared container.
+	rel := strings.TrimPrefix(strings.TrimPrefix(lowerPath, "/private"), "/var/folders/")
+	if len(strings.Split(rel, string(filepath.Separator))) <= 3 {
+		return true
 	}
 	for _, prefix := range endpointSecurityBundlePrefixes {
 		if strings.Contains(lowerPath, prefix) {

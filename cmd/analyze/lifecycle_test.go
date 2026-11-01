@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	tea "github.com/charmbracelet/bubbletea"
 	"io"
 	"os"
 	"os/exec"
@@ -17,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 type exitLifecycleModel struct {
@@ -44,7 +45,7 @@ func TestAnalyzerProgramExitCancelsAndWaits(t *testing.T) {
 		scanCtx, scanCancel := context.WithCancel(l.ctx)
 		pubCtx, pubCancel := context.WithCancel(scanCtx)
 		publication := newScanPublication(pubCtx, pubCancel)
-		m := exitLifecycleModel{model: model{lifecycle: l, scanRequestContext: scanCtx, scanRequestCancel: scanCancel, cacheSavePublication: publication}, started: make(chan struct{}), finished: make(chan struct{}), exit: msg}
+		m := exitLifecycleModel{model: model{lifecycle: l, liveScanCancel: scanCancel, cachePublications: map[string]*scanPublication{"fixture": publication}}, started: make(chan struct{}), finished: make(chan struct{}), exit: msg}
 		p := tea.NewProgram(m, tea.WithInput(nil), tea.WithOutput(io.Discard), tea.WithoutRenderer(), tea.WithFilter(analyzerExitFilter))
 		_, err := p.Run()
 		if _, interrupted := msg.(tea.InterruptMsg); interrupted && !errors.Is(err, tea.ErrInterrupted) {
@@ -79,7 +80,7 @@ func TestAnalyzerRunErrorCancelsLifetime(t *testing.T) {
 	if err == nil {
 		t.Fatal("positive control: program did not report its canceled startup")
 	}
-	if m.lifecycle.ctx.Err() == nil || m.scanRequestContext.Err() == nil {
+	if m.lifecycle.ctx.Err() == nil {
 		t.Fatal("Run error did not revoke lifetime")
 	}
 }
@@ -243,7 +244,8 @@ func TestOverviewPublicationRevokesWriterQueuedOnStoreLock(t *testing.T) {
 			resetOverviewSnapshotForTest()
 			m := newModel(t.TempDir(), false)
 			defer m.lifecycle.stop()
-			ctx := m.scanRequestContext
+			_, publication := m.newLiveScanRequest()
+			ctx := publication.ctx
 			overviewSnapshotMu.Lock()
 			started := make(chan struct{})
 			result := make(chan error, 1)
@@ -255,7 +257,7 @@ func TestOverviewPublicationRevokesWriterQueuedOnStoreLock(t *testing.T) {
 			go func() {
 				switch action {
 				case "cancel":
-					m.scanRequestPublication.cancel()
+					publication.cancel()
 				case "refresh":
 					m.cancelLiveScan()
 				case "exit":
@@ -286,7 +288,8 @@ func TestOverviewPublicationRevokesWriterQueuedOnStoreLock(t *testing.T) {
 			}
 			fresh := newModel(m.path, false)
 			defer fresh.lifecycle.stop()
-			if err := storeOverviewSizeWithContext(fresh.scanRequestContext, fresh.path, 93); err != nil {
+			_, freshPublication := fresh.newLiveScanRequest()
+			if err := storeOverviewSizeWithContext(freshPublication.ctx, fresh.path, 93); err != nil {
 				t.Fatal(err)
 			}
 			if size, err := loadStoredOverviewSize(fresh.path); err != nil || size != 93 {
@@ -316,6 +319,7 @@ exec /bin/sleep 30
 `), 0700); err != nil {
 		t.Fatal(err)
 	}
+	useDuStub(t, filepath.Join(bin, "du"))
 	m := newModel(root, false)
 	defer m.lifecycle.stop()
 	queued := m.scanFreshCmd(root)
@@ -388,5 +392,74 @@ func TestAnalyzerNativeSignalNegativeControl(t *testing.T) {
 	output := strings.Join(lines, "\n")
 	if !strings.Contains(output, "ANALYZER_NATIVE_SIGNAL_HANDLED") || !strings.Contains(output, "ANALYZER_EXIT_BOUNDARY_MISSING") {
 		t.Fatalf("negative control missed native signal: %s", output)
+	}
+}
+
+func TestDeletingIgnoresHiddenActions(t *testing.T) {
+	keys := []tea.KeyMsg{
+		{Type: tea.KeyDown}, {Type: tea.KeyDelete}, {Type: tea.KeyBackspace},
+		{Type: tea.KeyEnter}, {Type: tea.KeyEsc},
+		{Type: tea.KeyRunes, Runes: []rune(" ")},
+	}
+	for _, key := range keys {
+		t.Run(key.String(), func(t *testing.T) {
+			m := newModel(t.TempDir(), false)
+			m.scanning = false
+			m.deleting = true
+			m.entries = []dirEntry{
+				{Name: "first", Path: filepath.Join(m.path, "first"), Size: 1, IsDir: true},
+				{Name: "second", Path: filepath.Join(m.path, "second"), Size: 2},
+			}
+			next, cmd := m.Update(key)
+			got := next.(model)
+			if cmd != nil || got.path != m.path || got.selected != m.selected || got.deleteConfirm || len(got.multiSelected) != 0 || got.scanning {
+				t.Fatalf("busy input changed state: key=%s path=%s selected=%d confirm=%v scanning=%v cmd=%v", key.String(), got.path, got.selected, got.deleteConfirm, got.scanning, cmd != nil)
+			}
+		})
+	}
+}
+
+func TestDeletingCannotDispatchHiddenConfirmation(t *testing.T) {
+	for _, busy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "idle", true: "deleting"}[busy], func(t *testing.T) {
+			m := newModel(t.TempDir(), false)
+			m.scanning = false
+			m.deleting = busy
+			m.entries = []dirEntry{
+				{Name: "first", Path: filepath.Join(m.path, "first"), Size: 1},
+				{Name: "second", Path: filepath.Join(m.path, "second"), Size: 2},
+			}
+			for _, key := range []tea.KeyMsg{{Type: tea.KeyDown}, {Type: tea.KeyBackspace}, {Type: tea.KeyEnter}} {
+				next, cmd := m.Update(key)
+				m = next.(model)
+				if key.Type == tea.KeyEnter && (cmd != nil) == busy {
+					t.Fatalf("delete dispatch while busy=%v: cmd=%v", busy, cmd != nil)
+				}
+				// Never run the returned command: this test checks dispatch only.
+			}
+		})
+	}
+}
+
+func TestDeletingKeepsQuitKeys(t *testing.T) {
+	for _, key := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune("q")},
+		{Type: tea.KeyRunes, Runes: []rune("Q")},
+		{Type: tea.KeyCtrlC},
+	} {
+		ctx, cancel := context.WithCancel(context.Background())
+		m := model{deleting: true, deleteCancel: cancel}
+		next, cmd := m.Update(key)
+		got := next.(model)
+		if cmd != nil || !got.quitAfterDelete || ctx.Err() == nil {
+			t.Fatalf("%s did not cancel and wait for completion", key.String())
+		}
+		_, quit := got.Update(deleteProgressMsg{done: true, err: context.Canceled})
+		if quit == nil {
+			t.Fatalf("%s did not quit after matching completion", key.String())
+		}
+		if _, ok := quit().(tea.QuitMsg); !ok {
+			t.Fatalf("%s did not return QuitMsg", key.String())
+		}
 	}
 }

@@ -68,9 +68,9 @@ EOF
     for mode in valid private_home; do
         run_owner_case "$mode" update
         [ "$status" -eq 16 ]
-        [[ "$output" == *'Restore the preserved official entry with:'* ]]
-        [[ "$output" != *'OWNER_PROBE'* && "$output" != *'BREW_UPDATE'* ]]
-        [[ "$output" == *'SHARED_STATE_KEPT'* ]]
+        [[ "$output" == *'Restore the preserved official entry with:'* ]] || return 1
+        [[ "$output" != *'OWNER_PROBE'* && "$output" != *'BREW_UPDATE'* ]] || return 1
+        [[ "$output" == *'SHARED_STATE_KEPT'* ]] || return 1
     done
 }
 
@@ -78,9 +78,9 @@ EOF
     for action in menu nightly remove remove_dry; do
         run_owner_case valid "$action"
         [ "$status" -eq 16 ]
-        [[ "$output" == *'Restore the preserved official entry with:'* ]]
-        [[ "$output" != *'OWNER_PROBE'* && "$output" != *'FORMULA_PROBE'* && "$output" != *'BREW_ACTION'* ]]
-        [[ "$output" == *'SHARED_STATE_KEPT'* ]]
+        [[ "$output" == *'Restore the preserved official entry with:'* ]] || return 1
+        [[ "$output" != *'OWNER_PROBE'* && "$output" != *'FORMULA_PROBE'* && "$output" != *'BREW_ACTION'* ]] || return 1
+        [[ "$output" == *'SHARED_STATE_KEPT'* ]] || return 1
     done
 }
 
@@ -89,9 +89,9 @@ EOF
         for action in update remove_dry; do
             run_owner_case "$mode" "$action"
             [ "$status" -eq 16 ]
-            [[ "$output" != *'Restore the preserved official entry with:'* ]]
-            [[ "$output" != *'OWNER_PROBE'* && "$output" != *'FORMULA_PROBE'* && "$output" != *'BREW_ACTION'* && "$output" != *'BREW_UPDATE'* ]]
-            [[ "$output" == *'SHARED_STATE_KEPT'* ]]
+            [[ "$output" != *'Restore the preserved official entry with:'* ]] || return 1
+            [[ "$output" != *'OWNER_PROBE'* && "$output" != *'FORMULA_PROBE'* && "$output" != *'BREW_ACTION'* && "$output" != *'BREW_UPDATE'* ]] || return 1
+            [[ "$output" == *'SHARED_STATE_KEPT'* ]] || return 1
         done
     done
 }

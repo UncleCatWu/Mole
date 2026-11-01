@@ -6,7 +6,7 @@ set -euo pipefail
 
 optimize_whitelist_pattern_is_retired() {
     case "$1" in
-        dock_refresh | memory_pressure_relief) return 0 ;;
+        dock_refresh | memory_pressure_relief | launch_services_rebuild) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -50,7 +50,7 @@ save_whitelist_patterns() {
         header_text="# Mole Optimization Whitelist - These checks will be skipped during optimization"
     else
         config_file="$WHITELIST_CONFIG_CLEAN"
-        header_text="# Mole Whitelist - Protected paths won't be deleted\n# Default protections: Playwright browsers, Ollama models, Surge Mac, R renv, Finder metadata\n# Add one pattern per line to keep items safe."
+        header_text="# Mole Whitelist - Protected paths won't be deleted\n# Saved selections replace optional defaults; built-in safety protections still apply.\n# Add one pattern per line to keep items safe."
     fi
 
     ensure_user_file "$config_file"
@@ -90,14 +90,22 @@ save_whitelist_patterns() {
 # Get all cache items with their patterns
 get_all_cache_items() {
     # Format: "display_name|pattern|category"
+    # The Gradle build cache row stands for the default ~/.gradle/caches/*
+    # protection, so it keeps that exact spelling: a narrower row never matches
+    # the default and unchecking it changes nothing (#458). clean_dev_jvm only
+    # lists the build-cache-* entries under this root.
+    # Every other row follows the same rule: a cleanup must consult that exact
+    # path, or ticking the row promises protection it cannot give. Drop a row
+    # when its cleanup goes away. The Ollama default stays in
+    # DEFAULT_WHITELIST_PATTERNS, which needs no menu row.
     cat << 'EOF'
 Apple Mail cache|$HOME/Library/Caches/com.apple.mail/*|system_cache
-Gradle build cache (Android Studio, Gradle projects)|$HOME/.gradle/caches/build-cache-*/*|ide_cache
+Gradle build cache (Android Studio, Gradle projects)|$HOME/.gradle/caches/*|ide_cache
 Gradle daemon processes cache|$HOME/.gradle/daemon/*|ide_cache
 Gradle worker cache|$HOME/.gradle/workers/*|ide_cache
 Xcode DerivedData (build outputs, indexes)|$HOME/Library/Developer/Xcode/DerivedData/*|ide_cache
 Xcode internal cache files|$HOME/Library/Caches/com.apple.dt.Xcode/*|ide_cache
-Xcode iOS device support symbols|$HOME/Library/Developer/Xcode/iOS DeviceSupport/*/Symbols/System/Library/Caches/*|ide_cache
+Xcode device support symbols|$HOME/Library/Developer/Xcode/* DeviceSupport/*/Symbols/System/Library/Caches/*|ide_cache
 JetBrains IDEs data (IntelliJ, PyCharm, WebStorm, GoLand)|$HOME/Library/Application Support/JetBrains/*|ide_cache
 JetBrains IDEs cache|$HOME/Library/Caches/JetBrains/*|ide_cache
 Android Studio cache and indexes|$HOME/Library/Caches/Google/AndroidStudio*/*|ide_cache
@@ -112,10 +120,7 @@ Chrome on-device AI models|$HOME/Library/Application Support/Google/Chrome/OptGu
 Chrome optimization guide models|$HOME/Library/Application Support/Google/Chrome/optimization_guide_model_store/*|ai_ml_cache
 Bazel build cache|$HOME/.cache/bazel/*|compiler_cache
 Rust Cargo registry cache|$HOME/.cargo/registry/cache/*|compiler_cache
-Rust documentation cache|$HOME/.rustup/toolchains/*/share/doc/*|compiler_cache
 Rustup toolchain downloads|$HOME/.rustup/downloads/*|compiler_cache
-ccache compiler cache|$HOME/.ccache/*|compiler_cache
-sccache distributed compiler cache|$HOME/.cache/sccache/*|compiler_cache
 Turbo monorepo build cache|$HOME/.turbo/*|compiler_cache
 Next.js build cache|$HOME/.next/*|compiler_cache
 Vite build cache|$HOME/.vite/*|compiler_cache
@@ -125,26 +130,25 @@ Ruff Python linter cache|$HOME/.cache/ruff/*|compiler_cache
 MyPy type checker cache|$HOME/.cache/mypy/*|compiler_cache
 Pytest test cache|$HOME/.pytest_cache/*|compiler_cache
 PyInstaller binary cache|$HOME/Library/Application Support/pyinstaller/bincache*|compiler_cache
-Flutter SDK cache|$HOME/.cache/flutter/*|compiler_cache
 Swift Package Manager cache|$HOME/.cache/swift-package-manager/*|compiler_cache
 Zig compiler cache|$HOME/.cache/zig/*|compiler_cache
 CocoaPods cache (iOS dependencies)|$HOME/Library/Caches/CocoaPods/*|package_manager
 npm package cache|$HOME/.npm/_cacache/*|package_manager
-pip Python package cache|$HOME/.cache/pip/*|package_manager
+pip Python package cache|$HOME/Library/Caches/pip/*|package_manager
 uv Python package cache|$HOME/.cache/uv/*|package_manager
-R renv global cache (virtual environments)|$HOME/Library/Caches/org.R-project.R/R/renv/*|package_manager
 tealdeer tldr pages cache|$HOME/Library/Caches/tealdeer/tldr-pages|package_manager
 Homebrew downloaded packages|$HOME/Library/Caches/Homebrew/*|package_manager
-Yarn package manager cache|$HOME/.cache/yarn/*|package_manager
+Yarn Berry package cache|$HOME/.yarn/berry/cache/*|package_manager
+Yarn v1 package cache|$HOME/Library/Caches/Yarn/*|package_manager
 pnpm package store|$HOME/Library/pnpm/store/*|package_manager
+Bun package cache|$HOME/.bun/install/cache/*|package_manager
 Composer PHP dependencies cache (legacy)|$HOME/.composer/cache/*|package_manager
 Composer PHP dependencies cache|$HOME/Library/Caches/composer/*|package_manager
-RubyGems cache|$HOME/.gem/cache/*|package_manager
+RubyGems package cache|$HOME/.gem/ruby/*/cache/*.gem|package_manager
+RubyGems spec cache|$HOME/.gem/specs/*|package_manager
 Conda package metadata/tarball cache|$HOME/.conda/pkgs|package_manager
 Anaconda package metadata/tarball cache|$HOME/anaconda3/pkgs|package_manager
 Playwright browser binaries|$HOME/Library/Caches/ms-playwright*|ai_ml_cache
-Selenium WebDriver binaries|$HOME/.cache/selenium/*|ai_ml_cache
-Ollama local AI models|$HOME/.ollama/models/*|ai_ml_cache
 Safari web browser cache|$HOME/Library/Caches/com.apple.Safari/*|browser_cache
 Chrome browser cache|$HOME/Library/Caches/Google/Chrome/*|browser_cache
 Firefox browser cache|$HOME/Library/Caches/Firefox/*|browser_cache
@@ -152,9 +156,8 @@ Brave browser cache|$HOME/Library/Caches/BraveSoftware/Brave-Browser/*|browser_c
 Surge proxy cache|$HOME/Library/Caches/com.nssurge.surge-mac/*|network_tools
 Surge configuration and data|$HOME/Library/Application Support/com.nssurge.surge-mac/*|network_tools
 Docker BuildX cache|$HOME/.docker/buildx/cache/*|container_cache
-Podman container cache|$HOME/.local/share/containers/cache/*|container_cache
+Podman container storage temp|$HOME/.local/share/containers/storage/tmp/*|container_cache
 Tart OCI/IPSW cache|$HOME/.tart/cache|container_cache
-Final Cut Pro proxy media (render files still cleaned)|$HOME/Movies/*.fcpbundle/*/Transcoded Media/Proxy Media|app_cache
 Font cache|$HOME/Library/Caches/com.apple.FontRegistry/*|system_cache
 Spotlight metadata cache|$HOME/Library/Caches/com.apple.spotlight/*|system_cache
 CloudKit cache|$HOME/Library/Caches/CloudKit/*|system_cache
@@ -214,14 +217,22 @@ load_whitelist() {
         config_file="$WHITELIST_CONFIG_CLEAN"
     fi
 
-    local using_legacy="false"
-    if [[ ! -f "$config_file" && -n "$legacy_file" && -f "$legacy_file" ]]; then
-        config_file="$legacy_file"
-        using_legacy="true"
+    local using_legacy="false" config_state=0 unreadable_label="whitelist"
+    [[ "$mode" != "optimize" ]] || unreadable_label="optimize whitelist"
+    mole_whitelist_file_state "$config_file" "$unreadable_label" || config_state=$?
+    [[ $config_state -ne 2 ]] || return 1
+    if [[ $config_state -eq 1 && -n "$legacy_file" ]]; then
+        config_state=0
+        mole_whitelist_file_state "$legacy_file" "$unreadable_label" || config_state=$?
+        [[ $config_state -ne 2 ]] || return 1
+        if [[ $config_state -eq 0 ]]; then
+            config_file="$legacy_file"
+            using_legacy="true"
+        fi
     fi
 
-    if [[ -f "$config_file" ]]; then
-        while IFS= read -r line; do
+    if [[ $config_state -eq 0 ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
             # shellcheck disable=SC2295
             line="${line#"${line%%[![:space:]]*}"}"
             # shellcheck disable=SC2295
@@ -252,6 +263,19 @@ load_whitelist() {
             # task IDs are migrated away.
             if [[ "$mode" == "optimize" ]] && optimize_whitelist_pattern_is_retired "$pattern"; then
                 continue
+            fi
+            # The menu saved the Gradle build cache row as build-cache-*/*
+            # after #845. Read that line as the row so it shows checked and
+            # unchecking clears it; keeping it saves the wider default instead.
+            if [[ "$mode" == "clean" ]] && patterns_equivalent "$pattern" "$HOME/.gradle/caches/build-cache-*/*"; then
+                pattern="$HOME/.gradle/caches/*"
+            fi
+            # The menu saved the Xcode device support symbols row as iOS-only
+            # before all DeviceSupport platforms were covered. Read that line as
+            # the row so it shows checked and unchecking clears it; keeping it
+            # saves the wider pattern instead.
+            if [[ "$mode" == "clean" ]] && patterns_equivalent "$pattern" "$HOME/Library/Developer/Xcode/iOS DeviceSupport/*/Symbols/System/Library/Caches/*"; then
+                pattern="$HOME/Library/Developer/Xcode/* DeviceSupport/*/Symbols/System/Library/Caches/*"
             fi
             local duplicate="false"
             if [[ ${#unique_patterns[@]} -gt 0 ]]; then
@@ -318,8 +342,9 @@ manage_whitelist() {
 manage_whitelist_categories() {
     local mode="$1"
 
-    # Load currently enabled patterns from both sources
-    load_whitelist "$mode"
+    # Load currently enabled patterns from both sources. An unreadable file
+    # stops here: saving the menu would replace what the user wrote.
+    load_whitelist "$mode" || return 1
 
     # Build cache items list
     local -a cache_items=()

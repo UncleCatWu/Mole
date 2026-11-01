@@ -23,8 +23,10 @@ source "$LIB_DIR/core/common.sh"
 # Set up global cleanup trap
 trap cleanup_temp_files EXIT INT TERM
 
-PAM_SUDO_FILE="${MOLE_PAM_SUDO_FILE:-/etc/pam.d/sudo}"
-PAM_SUDO_LOCAL_FILE="${MOLE_PAM_SUDO_LOCAL_FILE:-$(dirname "$PAM_SUDO_FILE")/sudo_local}"
+{
+    IFS= read -r PAM_SUDO_FILE
+    IFS= read -r PAM_SUDO_LOCAL_FILE
+} < <(mole_pam_sudo_paths)
 readonly PAM_SUDO_FILE
 readonly PAM_SUDO_LOCAL_FILE
 readonly PAM_TID_LINE="auth       sufficient     pam_tid.so"
@@ -38,14 +40,14 @@ secure_install_pam() {
 is_touchid_configured() {
     # Check sudo_local first
     if [[ -f "$PAM_SUDO_LOCAL_FILE" ]]; then
-        grep -q "pam_tid.so" "$PAM_SUDO_LOCAL_FILE" 2> /dev/null && return 0
+        mole_pam_enables_touchid "$PAM_SUDO_LOCAL_FILE" && return 0
     fi
 
     # Fallback to standard sudo file
     if [[ ! -f "$PAM_SUDO_FILE" ]]; then
         return 1
     fi
-    grep -q "pam_tid.so" "$PAM_SUDO_FILE" 2> /dev/null
+    mole_pam_enables_touchid "$PAM_SUDO_FILE"
 }
 
 # Check if system supports Touch ID
@@ -81,7 +83,7 @@ show_status() {
     if is_touchid_configured; then
         echo -e "${GREEN}${ICON_SUCCESS}${NC} Touch ID is enabled for sudo"
     else
-        echo -e "${YELLOW}☻${NC} Touch ID is not configured for sudo"
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Touch ID is not configured for sudo"
     fi
 }
 
@@ -114,9 +116,9 @@ enable_touchid() {
     # Check if we should use sudo_local (Sonoma+)
     if grep -q "sudo_local" "$PAM_SUDO_FILE"; then
         # Check if already correctly configured in sudo_local
-        if [[ -f "$PAM_SUDO_LOCAL_FILE" ]] && grep -q "pam_tid.so" "$PAM_SUDO_LOCAL_FILE"; then
+        if [[ -f "$PAM_SUDO_LOCAL_FILE" ]] && mole_pam_enables_touchid "$PAM_SUDO_LOCAL_FILE"; then
             # It is in sudo_local, but let's check if it's ALSO in sudo (incomplete migration)
-            if grep -q "pam_tid.so" "$PAM_SUDO_FILE"; then
+            if mole_pam_enables_touchid "$PAM_SUDO_FILE"; then
                 # Clean up legacy config
                 temp_file=$(create_temp_file)
                 grep -v "pam_tid.so" "$PAM_SUDO_FILE" > "$temp_file"
@@ -131,7 +133,7 @@ enable_touchid() {
         # Not configured in sudo_local yet.
         # Check if configured in sudo (Legacy)
         local is_legacy_configured=false
-        if grep -q "pam_tid.so" "$PAM_SUDO_FILE"; then
+        if mole_pam_enables_touchid "$PAM_SUDO_FILE"; then
             is_legacy_configured=true
         fi
 
@@ -146,7 +148,7 @@ enable_touchid() {
             write_success=true
         else
             # Append if not present
-            if ! grep -q "pam_tid.so" "$PAM_SUDO_LOCAL_FILE"; then
+            if ! mole_pam_enables_touchid "$PAM_SUDO_LOCAL_FILE"; then
                 temp_file=$(create_temp_file)
                 cp "$PAM_SUDO_LOCAL_FILE" "$temp_file"
                 echo "$PAM_TID_LINE" >> "$temp_file"
@@ -167,6 +169,7 @@ enable_touchid() {
             else
                 log_success "Touch ID enabled, via sudo_local, try: sudo ls"
             fi
+            log_operation "touchid" "REBUILT" "$PAM_SUDO_LOCAL_FILE" "touchid enabled"
             return 0
         else
             log_error "Failed to write to sudo_local"
@@ -213,6 +216,7 @@ enable_touchid() {
     # Apply the changes
     if secure_install_pam "$temp_file" "$PAM_SUDO_FILE" 2> /dev/null; then
         log_success "Touch ID enabled, try: sudo ls"
+        log_operation "touchid" "REBUILT" "$PAM_SUDO_FILE" "touchid enabled"
         return 0
     else
         log_error "Failed to enable Touch ID"
@@ -241,20 +245,21 @@ disable_touchid() {
     fi
 
     # Check sudo_local first
-    if [[ -f "$PAM_SUDO_LOCAL_FILE" ]] && grep -q "pam_tid.so" "$PAM_SUDO_LOCAL_FILE"; then
+    if [[ -f "$PAM_SUDO_LOCAL_FILE" ]] && mole_pam_enables_touchid "$PAM_SUDO_LOCAL_FILE"; then
         # Remove from sudo_local
         temp_file=$(create_temp_file)
         grep -v "pam_tid.so" "$PAM_SUDO_LOCAL_FILE" > "$temp_file"
 
         if secure_install_pam "$temp_file" "$PAM_SUDO_LOCAL_FILE" 2> /dev/null; then
             # Since we modified sudo_local, we should also check if it's in sudo file (legacy cleanup)
-            if grep -q "pam_tid.so" "$PAM_SUDO_FILE"; then
+            if mole_pam_enables_touchid "$PAM_SUDO_FILE"; then
                 temp_file=$(create_temp_file)
                 grep -v "pam_tid.so" "$PAM_SUDO_FILE" > "$temp_file"
                 secure_install_pam "$temp_file" "$PAM_SUDO_FILE"
             fi
             echo -e "${GREEN}${ICON_SUCCESS} Touch ID disabled, removed from sudo_local${NC}"
             echo ""
+            log_operation "touchid" "REBUILT" "$PAM_SUDO_LOCAL_FILE" "touchid disabled"
             return 0
         else
             log_error "Failed to disable Touch ID from sudo_local"
@@ -263,7 +268,7 @@ disable_touchid() {
     fi
 
     # Fallback to sudo file (legacy)
-    if grep -q "pam_tid.so" "$PAM_SUDO_FILE"; then
+    if mole_pam_enables_touchid "$PAM_SUDO_FILE"; then
         # Create backup only if it doesn't exist
         if [[ ! -f "${PAM_SUDO_FILE}.mole-backup" ]]; then
             if ! sudo cp "$PAM_SUDO_FILE" "${PAM_SUDO_FILE}.mole-backup" 2> /dev/null; then
@@ -279,6 +284,7 @@ disable_touchid() {
         if secure_install_pam "$temp_file" "$PAM_SUDO_FILE" 2> /dev/null; then
             echo -e "${GREEN}${ICON_SUCCESS} Touch ID disabled${NC}"
             echo ""
+            log_operation "touchid" "REBUILT" "$PAM_SUDO_FILE" "touchid disabled"
             return 0
         else
             log_error "Failed to disable Touch ID"
@@ -296,8 +302,11 @@ show_menu() {
     echo ""
     show_status
     if is_touchid_configured; then
-        echo -ne "${PURPLE}☛${NC} Press ${GREEN}Enter${NC} to disable, ${GRAY}Q${NC} to quit: "
-        IFS= read -r -s -n1 key || key=""
+        echo -ne "${PURPLE}${ICON_CONFIRM}${NC} Press ${GREEN}Enter${NC} to disable, ${GRAY}Q${NC} to quit: "
+        if ! IFS= read -r -s -n1 key; then
+            printf '\n'
+            return 1
+        fi
         drain_pending_input # Clean up any escape sequence remnants
         echo ""
 
@@ -315,8 +324,11 @@ show_menu() {
                 ;;
         esac
     else
-        echo -ne "${PURPLE}☛${NC} Press ${GREEN}Enter${NC} to enable, ${GRAY}Q${NC} to quit: "
-        IFS= read -r -s -n1 key || key=""
+        echo -ne "${PURPLE}${ICON_CONFIRM}${NC} Press ${GREEN}Enter${NC} to enable, ${GRAY}Q${NC} to quit: "
+        if ! IFS= read -r -s -n1 key; then
+            printf '\n'
+            return 1
+        fi
         drain_pending_input # Clean up any escape sequence remnants
 
         case "$key" in

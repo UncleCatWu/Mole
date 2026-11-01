@@ -1,8 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-	export PROJECT_ROOT
+	mole_test_setup_project_root
 }
 
 @test "optimize outcomes record one result per task" {
@@ -13,7 +14,7 @@ source "$PROJECT_ROOT/lib/optimize/outcomes.sh"
 optimize_outcomes_reset
 optimize_task_start
 optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_APPLIED"
-optimize_task_finish system_maintenance
+optimize_task_finish network_optimization
 
 [[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
 [[ "$(optimize_outcome_count unchanged)" == "0" ]] || exit 1

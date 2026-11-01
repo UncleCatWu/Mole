@@ -1,11 +1,26 @@
 #!/usr/bin/env bats
+
+load helpers/common
+
 # get_memory_info must scale vm_stat page counts by vm_stat's own page size
 # (16384 on Apple Silicon), not a hardcoded 4096, or memory_used_gb in the
 # status JSON reads 4x low on Apple Silicon.
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_project_root
+}
+
+@test "get_memory_info reads total memory without /usr/sbin in PATH (#1804)" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="/usr/bin:/bin" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh" 2> /dev/null || true
+source "$PROJECT_ROOT/lib/check/health_json.sh"
+get_memory_info
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    read -r _ total_gb <<< "$output"
+    LC_ALL=C awk -v t="$total_gb" 'BEGIN { exit !(t > 0) }' || { echo "total memory read as $total_gb"; return 1; }
 }
 
 @test "get_memory_info uses vm_stat's declared page size" {
@@ -22,6 +37,7 @@ sysctl() {
         *) command sysctl "$@" ;;
     esac
 }
+SYSCTL_CMD=sysctl
 vm_stat() {
     cat <<'VMSTAT'
 Mach Virtual Memory Statistics: (page size of 16384 bytes)

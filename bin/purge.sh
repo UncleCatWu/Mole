@@ -32,7 +32,7 @@ source "$SCRIPT_DIR/../lib/clean/project.sh"
 
 # Purge ends at safe_remove just like clean, so initialize the invoking user's
 # whitelist before project discovery or the interactive selection begins.
-load_mole_whitelist
+load_mole_whitelist || exit 1
 
 # Configuration
 CURRENT_SECTION=""
@@ -312,7 +312,7 @@ show_help() {
     echo "  --include-empty Show zero-size project artifact directories"
     echo "  --yes           Confirm unattended cleanup of eligible artifacts"
     echo "  --debug         Enable debug logging"
-    echo "  --help          Show this help message"
+    echo "  -h, --help      Show this help message"
     echo ""
     echo -e "${YELLOW}Default Paths:${NC}"
     for path in "${DEFAULT_PURGE_SEARCH_PATHS[@]}"; do
@@ -330,7 +330,7 @@ main() {
                 manage_purge_paths
                 exit 0
                 ;;
-            "--help")
+            "--help" | "-h")
                 show_help
                 exit 0
                 ;;

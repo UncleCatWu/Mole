@@ -2,8 +2,10 @@
 
 set timeout 4
 set project_root [lindex $argv 0]
+set mode [lindex $argv 1]
+set timeout_bin [lindex $argv 2]
 
-spawn /bin/bash "$project_root/tests/timeout_tty_read_fixture.sh" "$project_root"
+spawn /bin/bash "$project_root/tests/timeout_tty_read_fixture.sh" "$project_root" "$mode" "$timeout_bin"
 
 expect {
     -re {READY\r?\n} {}

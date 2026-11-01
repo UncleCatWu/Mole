@@ -52,7 +52,7 @@ mole_path_identity() {
     if [[ -e "$normalized" || -L "$normalized" ]]; then
         if command -v stat > /dev/null 2>&1; then
             local fs_id=""
-            fs_id=$(stat -L -f '%d:%i' "$normalized" 2> /dev/null || stat -f '%d:%i' "$normalized" 2> /dev/null || true)
+            fs_id=$("$STAT_BSD" -L -f '%d:%i' "$normalized" 2> /dev/null || "$STAT_BSD" -f '%d:%i' "$normalized" 2> /dev/null || true)
             if [[ "$fs_id" =~ ^[0-9]+:[0-9]+$ ]]; then
                 printf 'inode:%s\n' "$fs_id"
                 return 0
@@ -117,7 +117,7 @@ _mole_repair_stale_brew_entries() {
 
     local relink_rc=0
     HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
-        run_with_timeout "${MOLE_HOMEBREW_UPDATE_TIMEOUT:-120}" \
+        run_with_timeout 120 \
         brew link --overwrite mole > /dev/null 2>&1 || relink_rc=$?
     if [[ $relink_rc -eq 0 ]]; then
         echo -e "${GREEN}${ICON_SUCCESS}${NC} Repaired stale launcher, now pointing at the current Homebrew install"
@@ -135,7 +135,7 @@ update_via_homebrew() {
     temp_upgrade=$(mktemp_file "brew_upgrade")
 
     # Set up trap for interruption (Ctrl+C) with inline cleanup
-    trap 'stop_inline_spinner 2>/dev/null; safe_remove "$temp_update" true; safe_remove "$temp_upgrade" true; echo ""; exit 130' INT TERM
+    trap 'stop_inline_spinner 2>/dev/null; rm -f "$temp_update" "$temp_upgrade"; echo ""; exit 130' INT TERM # SAFE: own mktemp scratch files
 
     # Update Homebrew
     if [[ -t 1 ]]; then
@@ -144,7 +144,7 @@ update_via_homebrew() {
         echo "Updating Homebrew..."
     fi
 
-    local brew_update_timeout="${MOLE_HOMEBREW_UPDATE_TIMEOUT:-120}"
+    local brew_update_timeout=120
     HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
         run_with_timeout "$brew_update_timeout" brew update > "$temp_update" 2>&1 || true
 
@@ -159,7 +159,7 @@ update_via_homebrew() {
         echo "Upgrading Mole..."
     fi
 
-    local brew_upgrade_timeout="${MOLE_HOMEBREW_UPGRADE_TIMEOUT:-120}"
+    local brew_upgrade_timeout=120
     local upgrade_status=0
     HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
         run_with_timeout "$brew_upgrade_timeout" brew upgrade mole > "$temp_upgrade" 2>&1 || upgrade_status=$?
@@ -175,8 +175,8 @@ update_via_homebrew() {
     trap - INT TERM
 
     # Cleanup temp files
-    safe_remove "$temp_update" true
-    safe_remove "$temp_upgrade" true
+    # Own mktemp scratch files: safe_remove would log them as cleanup rows.
+    rm -f "$temp_update" "$temp_upgrade" # SAFE: own mktemp scratch files
 
     if [[ "$upgrade_status" -ne 0 ]]; then
         log_error "Homebrew upgrade failed"
@@ -205,6 +205,7 @@ update_via_homebrew() {
         echo ""
         echo -e "${GREEN}${ICON_SUCCESS}${NC} Updated to latest version, ${new_version:-$current_version}"
         echo ""
+        log_operation "update" "REBUILT" "Homebrew mole" "updated to ${new_version:-unknown}"
     fi
 
     # Both success shapes can leave a stale foreign launcher shadowing the
@@ -291,6 +292,7 @@ remove_apps_from_dock() {
                     [[ -n "$raw_path" && "$url" == *"$raw_path"* ]]; }; then
                     if /usr/libexec/PlistBuddy -c "Delete :$dock_array:$i" "$plist" 2> /dev/null; then
                         changed=true
+                        log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "REMOVED" "$full_path" "dock entry"
                         # After deletion, current index i now points to the next item.
                         continue
                     fi

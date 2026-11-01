@@ -58,14 +58,126 @@ _simulator_app_cache_delete_guard_allows() {
     mole_clean_process_guard _simulator_cleanup_process_state "Simulator or CoreSimulator running"
 }
 
-_final_cut_pro_delete_guard_allows() {
-    mole_clean_process_guard final_cut_pro_is_running "Final Cut Pro started"
+# Per-device leaves Mole Mac removes whole, only on a device whose
+# device.plist reads shut down (state 1) and not deleted; an unreadable
+# plist is unknown, so its device is left alone. The poster store is only
+# ever removed whole: with it gone the next boot rebuilds it as a new device
+# does, while removing only its gallery descriptors left `staticdescriptors`
+# empty and the gallery failing to render (iOS 27.1, 2026-10-28). Empty
+# leaves are not listed, so an idle Mac reports nothing.
+_SIMULATOR_DEVICE_LEAVES=(
+    "data/private/var/MobileAsset/AssetsV2"
+    "data/var/db/diagnostics"
+    "data/var/db/uuidtext"
+    "data/Library/Caches"
+    "data/Library/Application Support/PRBPosterExtensionDataStore"
+)
+
+_simulator_device_is_shut_down() {
+    local plist="$1/device.plist"
+    [[ -f "$plist" ]] || return 1
+    local snapshot="" probe_rc=0
+    # Read once: an absent optional key in a valid snapshot is different from
+    # an unreadable or disappearing device.plist.
+    snapshot=$(run_with_timeout 2 /usr/bin/plutil -convert xml1 -o - "$plist" 2> /dev/null) || probe_rc=$?
+    mole_rc_signal "$probe_rc" && return "$probe_rc"
+    [[ $probe_rc -eq 0 ]] || return 1
+    # A failed plutil query does not establish optional-key absence.
+    # Judge types and optional-key absence from the successful XML snapshot,
+    # using the same root-dict depth contract as obsolete-extension metadata.
+    # shellcheck disable=SC2016 # Field references belong to awk, not Bash.
+    run_with_timeout 2 /usr/bin/awk '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line == "<dict>" || line == "<array>") {
+                if (depth == 0) root_dict = (line == "<dict>")
+                if (depth == 1 && (pending == "state" || pending == "isDeleted")) invalid = 1
+                depth++; pending = ""; next
+            }
+            if (line == "</dict>" || line == "</array>") { depth--; pending = ""; next }
+            if (depth == 1 && line ~ /^<key>.*<\/key>$/) {
+                pending = substr(line, 6, length(line) - 11)
+                next
+            }
+            if (depth == 1 && pending == "state") {
+                state_count++
+                if (line != "<integer>1</integer>") invalid = 1
+            }
+            if (depth == 1 && pending == "isDeleted") {
+                deleted_count++
+                if (line != "<false/>") invalid = 1
+            }
+            pending = ""
+        }
+        END { exit !(root_dict && depth == 0 && state_count == 1 && deleted_count <= 1 && !invalid) }
+    ' <<< "$snapshot" 2> /dev/null || probe_rc=$?
+    mole_rc_signal "$probe_rc" && return "$probe_rc"
+    [[ $probe_rc -eq 0 ]]
+}
+
+# A leaf qualifies only at its listed place under the Devices root, with no
+# link anywhere between the device folder and the leaf, on a shut-down device.
+_simulator_device_leaf_is_eligible() {
+    local path="$1"
+    local devices_root="$HOME/Library/Developer/CoreSimulator/Devices"
+    local device="${path%%/data/*}"
+    local leaf="${path#"$device"/}"
+    [[ "$device" != "$path" && "${device%/*}" == "$devices_root" ]] || return 1
+    [[ -d "$device" && ! -L "$device" && -d "$path" && ! -L "$path" ]] || return 1
+    local known="" candidate
+    for candidate in "${_SIMULATOR_DEVICE_LEAVES[@]}"; do
+        [[ "$leaf" == "$candidate" ]] && known=1
+    done
+    [[ -n "$known" ]] || return 1
+    local device_physical="" leaf_physical=""
+    device_physical=$(cd "$device" 2> /dev/null && pwd -P) || return 1
+    leaf_physical=$(cd "$path" 2> /dev/null && pwd -P) || return 1
+    [[ "$leaf_physical" == "$device_physical/$leaf" ]] || return 1
+    _simulator_device_is_shut_down "$device"
+}
+
+# Prints one existing, non-empty leaf per line.
+_simulator_device_leaf_targets() {
+    local devices_root="$HOME/Library/Developer/CoreSimulator/Devices"
+    [[ -d "$devices_root" ]] || return 0
+    local device leaf target probe_rc
+    for device in "$devices_root"/*; do
+        [[ -d "$device" && ! -L "$device" ]] || continue
+        probe_rc=0
+        _simulator_device_is_shut_down "$device" || probe_rc=$?
+        mole_rc_signal "$probe_rc" && return "$probe_rc"
+        [[ $probe_rc -eq 0 ]] || continue
+        for leaf in "${_SIMULATOR_DEVICE_LEAVES[@]}"; do
+            target="$device/$leaf"
+            [[ -n "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit 2> /dev/null)" ]] || continue
+            probe_rc=0
+            _simulator_device_leaf_is_eligible "$target" || probe_rc=$?
+            mole_rc_signal "$probe_rc" && return "$probe_rc"
+            [[ $probe_rc -eq 0 ]] || continue
+            printf '%s\n' "$target"
+        done
+    done
+}
+
+# Delete-time callback: the simulator probe first, whose refusal stops the
+# batch, then this leaf's own device read again, whose refusal skips only it.
+_simulator_device_leaf_delete_guard_allows() {
+    local path="${1:-}"
+    _MOLE_SAFE_CLEAN_SKIP_PATH=""
+    _simulator_app_cache_delete_guard_allows || return $?
+    [[ -n "$path" ]] || return 0
+    _MOLE_SAFE_CLEAN_SKIP_PATH="$path"
+    _MOLE_CLEAN_GUARD_REASON="simulator device no longer shut down"
+    _simulator_device_leaf_is_eligible "$path" || return $?
+    _MOLE_SAFE_CLEAN_SKIP_PATH=""
+    return 0
 }
 
 _defer_app_cache_guard_family() {
     case "$1" in
-        _simulator_app_cache_delete_guard_allows) mole_defer_cleanup_family "Simulator" ;;
-        _final_cut_pro_delete_guard_allows) mole_defer_cleanup_family "Final Cut Pro" ;;
+        _simulator_app_cache_delete_guard_allows | _simulator_device_leaf_delete_guard_allows) mole_defer_cleanup_family "Simulator" ;;
         _autodesk_cache_delete_guard_allows) mole_defer_cleanup_family "Autodesk" ;;
         *) mole_defer_cleanup_family "Xcode" ;;
     esac
@@ -78,7 +190,10 @@ _app_cache_safe_clean_guarded() {
     local _MOLE_CLEAN_GUARD_REASON="process state changed"
 
     if ! declare -f safe_clean_guarded > /dev/null 2>&1; then
-        if ! "$delete_guard"; then
+        local guard_rc=0
+        "$delete_guard" || guard_rc=$?
+        mole_rc_signal "$guard_rc" && return "$guard_rc"
+        if [[ $guard_rc -ne 0 ]]; then
             mole_report_guard_stop "$display_name" _defer_app_cache_guard_family "$delete_guard"
             return 1
         fi
@@ -102,12 +217,17 @@ clean_xcode_derived_data() {
 
     [[ -d "$dd_dir" ]] || return 0
 
+    # Filtering runs a protection check per project, about a second for 128
+    # projects before the measuring spinner below starts.
+    start_section_spinner "Checking Xcode DerivedData..."
+
     # Count projects before recording an active-process skip, so an empty
     # DerivedData root stays silent.
     local -a projects=()
-    local dir
+    local dir all_count=0
     for dir in "$dd_dir"/*; do
         [[ -d "$dir" ]] || continue
+        all_count=$((all_count + 1))
         if should_protect_path "$dir" || is_path_whitelisted "$dir" || holds_compiled_model_cache "$dir"; then
             continue
         fi
@@ -115,12 +235,16 @@ clean_xcode_derived_data() {
     done
 
     local project_count=${#projects[@]}
-    [[ $project_count -eq 0 ]] && return 0
+    if [[ $project_count -eq 0 ]]; then
+        stop_section_spinner
+        return 0
+    fi
 
     # Only a conclusive "no matching process" result authorizes cleanup.
     local xcode_state=0
     _xcode_cleanup_process_state || xcode_state=$?
     if [[ $xcode_state -ne 1 ]]; then
+        stop_section_spinner
         if [[ $xcode_state -eq 2 ]]; then
             echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode DerivedData · skipped (process state unknown)"
             note_activity
@@ -155,14 +279,18 @@ clean_xcode_derived_data() {
                 dry_run_stopped_reason=$(_xcode_cleanup_skip_reason "$xcode_state")
                 break
             fi
-            local size_rc=0
-            dir_size_kb=$(get_path_size_kb "$dir" 2> /dev/null) || size_rc=$?
-            if [[ $size_rc -ne 0 ]]; then
+            local size_rc=0 stop_rc=0
+            dir_size_kb=$(get_path_size_kb "$dir" "" readable 2> /dev/null) || size_rc=$?
+            mole_item_size_continues "$size_rc" || stop_rc=$?
+            if [[ $stop_rc -ne 0 ]]; then
                 stop_section_spinner
-                _mole_record_clean_cancellation "$size_rc"
-                return "$size_rc"
+                return "$stop_rc"
             fi
-            [[ "$dir_size_kb" =~ ^[0-9]+$ ]] || dir_size_kb=0
+            local size_known=true
+            [[ $size_rc -eq 0 && "$dir_size_kb" =~ ^[0-9]+$ ]] || {
+                dir_size_kb=0
+                size_known=false
+            }
             xcode_state=0
             _xcode_cleanup_process_state || xcode_state=$?
             if [[ $xcode_state -ne 1 ]]; then
@@ -170,7 +298,7 @@ clean_xcode_derived_data() {
                 break
             fi
             if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                record_dry_run_cleanup_target "$dir" "$dir_size_kb" 1 true || continue
+                record_dry_run_cleanup_target "$dir" "$dir_size_kb" 1 "$size_known" || continue
             fi
             size_kb=$((size_kb + dir_size_kb))
             dry_run_count=$((dry_run_count + 1))
@@ -181,8 +309,13 @@ clean_xcode_derived_data() {
             [[ $dry_run_count -eq 1 ]] && project_label="project"
             local size_human
             size_human=$(bytes_to_human "$((size_kb * 1024))")
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Xcode DerivedData · ${dry_run_count} ${project_label}, ${size_human}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Xcode DerivedData · ${dry_run_count} ${project_label}, $(colorize_human_size "${size_human}") ${YELLOW}dry${NC}"
             note_activity
+            # Large files skips its DerivedData row only when this row holds
+            # every project; a kept or skipped one still needs that row.
+            if [[ -z "$dry_run_stopped_reason" && $dry_run_count -eq $all_count ]]; then
+                _MOLE_DERIVED_DATA_COVERED=true
+            fi
         fi
         if [[ -n "$dry_run_stopped_reason" ]]; then
             if [[ "$dry_run_stopped_reason" == "process state unknown" ]]; then
@@ -215,14 +348,14 @@ clean_xcode_derived_data() {
         fi
 
         local dir_size_kb=0
-        local size_rc=0
-        dir_size_kb=$(get_path_size_kb "$dir" 2> /dev/null) || size_rc=$?
-        if [[ $size_rc -ne 0 ]]; then
+        local size_rc=0 stop_rc=0
+        dir_size_kb=$(get_path_size_kb "$dir" "" readable 2> /dev/null) || size_rc=$?
+        mole_item_size_continues "$size_rc" || stop_rc=$?
+        if [[ $stop_rc -ne 0 ]]; then
             stop_section_spinner
-            _mole_record_clean_cancellation "$size_rc"
-            return "$size_rc"
+            return "$stop_rc"
         fi
-        [[ "$dir_size_kb" =~ ^[0-9]+$ ]] || dir_size_kb=0
+        [[ $size_rc -eq 0 && "$dir_size_kb" =~ ^[0-9]+$ ]] || dir_size_kb=0
 
         # Sizing is timeout-bounded but can still take long enough for a build
         # to start. Recheck at the deletion boundary, not only before du.
@@ -246,11 +379,12 @@ clean_xcode_derived_data() {
         size_human=$(bytes_to_human "$((removed_size_kb * 1024))")
         local line_color
         line_color=$(cleanup_result_color_kb "$removed_size_kb" 2> /dev/null || echo "$GREEN")
-        echo -e "  ${line_color}${ICON_SUCCESS}${NC} Xcode DerivedData · ${removed} ${project_label}, ${line_color}${size_human}${NC}"
-        files_cleaned=$((${files_cleaned:-0} + removed))
-        total_size_cleaned=$((${total_size_cleaned:-0} + removed_size_kb))
-        total_items=$((${total_items:-0} + 1))
+        echo -e "  ${line_color}${ICON_SUCCESS}${NC} Xcode DerivedData · ${removed} ${project_label}, $(colorize_human_size "${size_human}")"
+        mole_add_cleaned_row "$removed" "$removed_size_kb"
         note_activity
+        if [[ -z "$stopped_reason" && $removed -eq $all_count ]]; then
+            _MOLE_DERIVED_DATA_COVERED=true
+        fi
     fi
     if [[ -n "$stopped_reason" ]]; then
         if [[ "$stopped_reason" == "process state unknown" ]]; then
@@ -264,7 +398,18 @@ clean_xcode_derived_data() {
 # Xcode and iOS tooling.
 clean_xcode_tools() {
     local simulator_has_targets=false
+    local -a simulator_device_leaves=()
+    local simulator_leaf leaf_output="" leaf_rc=0 guarded_rc=0
+    leaf_output=$(_simulator_device_leaf_targets) || leaf_rc=$?
+    mole_rc_signal "$leaf_rc" && return "$leaf_rc"
+    [[ $leaf_rc -eq 0 ]] || return 0
+    while IFS= read -r simulator_leaf; do
+        [[ -n "$simulator_leaf" ]] && simulator_device_leaves+=("$simulator_leaf")
+    done <<< "$leaf_output"
+    # The leaves pass the same protection and whitelist filter as the other
+    # targets, so a fully whitelisted simulator never reports a skip.
     if mole_cleanup_targets_exist \
+        "${simulator_device_leaves[@]+"${simulator_device_leaves[@]}"}" \
         "$HOME/Library/Developer/CoreSimulator/Caches"/* \
         "$HOME/Library/Developer/CoreSimulator/Devices"/*/data/tmp/* \
         "$HOME/Library/Logs/CoreSimulator"/*; then
@@ -280,17 +425,40 @@ clean_xcode_tools() {
                 _simulator_app_cache_delete_guard_allows \
                 "Simulator caches" \
                 ~/Library/Developer/CoreSimulator/Caches/* \
-                "Simulator cache" || return 0
+                "Simulator cache" || {
+                guarded_rc=$?
+                mole_rc_signal "$guarded_rc" && return "$guarded_rc"
+                return 0
+            }
             _app_cache_safe_clean_guarded \
                 _simulator_app_cache_delete_guard_allows \
                 "Simulator temp files" \
                 ~/Library/Developer/CoreSimulator/Devices/*/data/tmp/* \
-                "Simulator temp files" || return 0
+                "Simulator temp files" || {
+                guarded_rc=$?
+                mole_rc_signal "$guarded_rc" && return "$guarded_rc"
+                return 0
+            }
+            if [[ ${#simulator_device_leaves[@]} -gt 0 ]]; then
+                _app_cache_safe_clean_guarded \
+                    _simulator_device_leaf_delete_guard_allows \
+                    "Simulator device data" \
+                    "${simulator_device_leaves[@]}" \
+                    "Simulator device data" || {
+                    guarded_rc=$?
+                    mole_rc_signal "$guarded_rc" && return "$guarded_rc"
+                    return 0
+                }
+            fi
             _app_cache_safe_clean_guarded \
                 _simulator_app_cache_delete_guard_allows \
                 "CoreSimulator logs" \
                 ~/Library/Logs/CoreSimulator/* \
-                "CoreSimulator logs" || return 0
+                "CoreSimulator logs" || {
+                guarded_rc=$?
+                mole_rc_signal "$guarded_rc" && return "$guarded_rc"
+                return 0
+            }
         else
             if [[ $simulator_state -eq 2 ]]; then
                 echo -e "  ${GRAY}${ICON_WARNING}${NC} Simulator caches · skipped (process state unknown)"
@@ -319,7 +487,11 @@ clean_xcode_tools() {
                     _xcode_app_cache_delete_guard_allows \
                     "Xcode cache" \
                     ~/Library/Caches/com.apple.dt.Xcode/* \
-                    "Xcode cache" || return 0
+                    "Xcode cache" || {
+                    guarded_rc=$?
+                    mole_rc_signal "$guarded_rc" && return "$guarded_rc"
+                    return 0
+                }
             fi
 
             # The cache pass may take long enough for the separate build
@@ -347,7 +519,11 @@ clean_xcode_tools() {
                 _xcode_app_cache_delete_guard_allows \
                 "Xcode build products" \
                 ~/Library/Developer/Xcode/Products/* \
-                "Xcode build products" || return 0
+                "Xcode build products" || {
+                guarded_rc=$?
+                mole_rc_signal "$guarded_rc" && return "$guarded_rc"
+                return 0
+            }
             clean_xcode_derived_data || return $?
         else
             if [[ $xcode_state -eq 2 ]]; then
@@ -359,6 +535,54 @@ clean_xcode_tools() {
         fi
     fi
 }
+# The directory names an editor's `.obsolete` journal marks stale, one per line.
+#
+# Reads the XML plutil emits rather than the `plutil -p` rendering an earlier
+# fix parsed. `man plutil` says of `-p`: "The output format is not stable and
+# not designed for machine parsing", and it is not. macOS 15 prints a JSON
+# boolean true as `1` while macOS 26 and 27 print `true`, so a filter pinned to
+# one spelling silently cleans nothing on the other (tw93/Mole#1512), and where
+# a boolean prints as `1` no filter can tell it from the integer 1 at all.
+#
+# That rendering is also depth-blind, which is the worse half: its keys carry
+# no nesting, so `{"outer":{"inner":true}}` handed back `inner` as a top-level
+# extension directory. That is a wrong deletion, not a missed one.
+#
+# In the XML, depth is explicit and each type is its own tag, so a key counts
+# only when it sits in the root dict and its value is exactly `<true/>`. Empty
+# containers are self-closing (`<dict/>`, `<array/>`) and must not move the
+# depth, so every tag is compared for equality rather than by prefix.
+_mole_obsolete_extension_keys() {
+    local obsolete_file="$1"
+    plutil -convert xml1 -o - "$obsolete_file" 2> /dev/null | awk '
+        # &amp; is decoded LAST: a key holding the literal text "&lt;" arrives
+        # as "&amp;lt;", and decoding &amp; first would turn it into a real "<".
+        function decode(s) {
+            gsub(/&lt;/, "<", s)
+            gsub(/&gt;/, ">", s)
+            gsub(/&amp;/, "\\&", s)
+            return s
+        }
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line == "<dict>" || line == "<array>") { depth++; pending = ""; next }
+            if (line == "</dict>" || line == "</array>") { depth--; pending = ""; next }
+            if (depth == 1 && line ~ /^<key>.*<\/key>$/) {
+                pending = substr(line, 6, length(line) - 11)
+                next
+            }
+            if (depth == 1 && pending != "") {
+                if (line == "<true/>") print decode(pending)
+                pending = ""
+                next
+            }
+            pending = ""
+        }
+    '
+}
+
 # Remove extension directories that VS Code / Cursor have marked obsolete.
 # Each editor writes a .obsolete JSON file under its extensions root whose keys
 # are stale extension directory names left behind after an extension update.
@@ -384,41 +608,53 @@ clean_editor_obsolete_extensions() {
             target="$ext_root/$key"
             [[ -d "$target" ]] || continue
             safe_clean "$target" "Obsolete $editor_label extension"
-        done < <(plutil -convert xml1 -o - "$obsolete_file" 2> /dev/null |
-            plutil -p - 2> /dev/null |
-            sed -nE 's/^[[:space:]]*"([^"]+)"[[:space:]]*=>[[:space:]]*true[[:space:]]*$/\1/p')
+        done < <(_mole_obsolete_extension_keys "$obsolete_file")
     done
 }
+# CodeBuddyExtension is shared by the CodeBuddy editors and WorkBuddy.
+# A closed editor alone does not establish that these caches are idle.
+_codebuddy_shared_cache_running() {
+    mole_pgrep_any -x 'CodeBuddy|CodeBuddy CN|WorkBuddy' \
+        -f '/(CodeBuddy( CN)?|WorkBuddy)[.]app/'
+}
+
 # Code editors.
 clean_code_editors() {
-    safe_clean ~/Library/Application\ Support/Code/logs/* "VS Code logs"
-    safe_clean ~/Library/Application\ Support/Code/Cache/* "VS Code cache"
-    safe_clean ~/Library/Application\ Support/Code/CachedExtensions/* "VS Code extension cache"
-    safe_clean ~/Library/Application\ Support/Code/CachedData/* "VS Code data cache"
-    safe_clean ~/Library/Application\ Support/Code/WebStorage/*/CacheStorage/* "VS Code webview cache"
+    mole_safe_clean_app_cache "Visual Studio Code" ~/Library/Application\ Support/Code/logs/* "VS Code logs"
+    mole_safe_clean_app_cache "Visual Studio Code" ~/Library/Application\ Support/Code/Cache/* "VS Code cache"
+    mole_safe_clean_app_cache "Visual Studio Code" ~/Library/Application\ Support/Code/CachedExtensionVSIXs/* "VS Code extension cache"
+    mole_safe_clean_app_cache "Cursor" ~/Library/Application\ Support/Cursor/CachedExtensionVSIXs/* "Cursor extension cache"
+    mole_safe_clean_app_cache "Visual Studio Code" ~/Library/Application\ Support/Code/CachedData/* "VS Code data cache"
+    mole_safe_clean_app_cache "Visual Studio Code" ~/Library/Application\ Support/Code/WebStorage/*/CacheStorage/* "VS Code webview cache"
     safe_clean ~/Library/Caches/com.sublimetext.*/* "Sublime Text cache"
     safe_clean ~/Library/Caches/Zed/* "Zed cache"
     # Zed npm caches: node/cache (system-node scratch) and node/node-v*/cache
     # (per-version managed runtime, see #88); keep editor state under db/ untouched.
-    safe_clean ~/Library/Application\ Support/Zed/node/cache/* "Zed npm cache"
-    safe_clean ~/Library/Application\ Support/Zed/node/node-v*/cache/* "Zed npm cache"
+    mole_safe_clean_app_cache "Zed" ~/Library/Application\ Support/Zed/node/cache/* "Zed npm cache"
+    mole_safe_clean_app_cache "Zed" ~/Library/Application\ Support/Zed/node/node-v*/cache/* "Zed npm cache"
     safe_clean ~/Library/Logs/Zed/* "Zed logs"
     clean_editor_obsolete_extensions
-    # CodeBuddy Extension (VS Code fork, Electron)
+    # Shared desktop extension caches have more than one possible owner.
     if [[ -d ~/Library/Application\ Support/CodeBuddyExtension ]]; then
-        safe_clean ~/Library/Application\ Support/CodeBuddyExtension/Cache/* "CodeBuddy Extension cache"
-        safe_clean ~/Library/Application\ Support/CodeBuddyExtension/logs/* "CodeBuddy Extension logs"
+        local codebuddy_rc=0
+        _dev_safe_clean_process_guarded _codebuddy_shared_cache_running "CodeBuddy" "CodeBuddy Extension cache" \
+            ~/Library/Application\ Support/CodeBuddyExtension/Cache/* "CodeBuddy Extension cache" || codebuddy_rc=$?
+        [[ $codebuddy_rc -le 1 ]] || return "$codebuddy_rc"
+        codebuddy_rc=0
+        _dev_safe_clean_process_guarded _codebuddy_shared_cache_running "CodeBuddy" "CodeBuddy Extension logs" \
+            ~/Library/Application\ Support/CodeBuddyExtension/logs/* "CodeBuddy Extension logs" || codebuddy_rc=$?
+        [[ $codebuddy_rc -le 1 ]] || return "$codebuddy_rc"
     fi
     # CodeBuddy CN (VS Code fork, Electron)
     if [[ -d ~/Library/Application\ Support/CodeBuddy\ CN ]]; then
-        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/Cache/* "CodeBuddy CN cache"
-        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/CachedData/* "CodeBuddy CN cached data"
-        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/CachedExtensionVSIXs/* "CodeBuddy CN extension cache"
-        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/Code\ Cache/* "CodeBuddy CN code cache"
-        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/GPUCache/* "CodeBuddy CN GPU cache"
-        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/DawnGraphiteCache/* "CodeBuddy CN Dawn cache"
-        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/DawnWebGPUCache/* "CodeBuddy CN WebGPU cache"
-        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/logs/* "CodeBuddy CN logs"
+        mole_safe_clean_app_cache "CodeBuddy CN" ~/Library/Application\ Support/CodeBuddy\ CN/Cache/* "CodeBuddy CN cache"
+        mole_safe_clean_app_cache "CodeBuddy CN" ~/Library/Application\ Support/CodeBuddy\ CN/CachedData/* "CodeBuddy CN cached data"
+        mole_safe_clean_app_cache "CodeBuddy CN" ~/Library/Application\ Support/CodeBuddy\ CN/CachedExtensionVSIXs/* "CodeBuddy CN extension cache"
+        mole_safe_clean_app_cache "CodeBuddy CN" ~/Library/Application\ Support/CodeBuddy\ CN/Code\ Cache/* "CodeBuddy CN code cache"
+        mole_safe_clean_app_cache "CodeBuddy CN" ~/Library/Application\ Support/CodeBuddy\ CN/GPUCache/* "CodeBuddy CN GPU cache"
+        mole_safe_clean_app_cache "CodeBuddy CN" ~/Library/Application\ Support/CodeBuddy\ CN/DawnGraphiteCache/* "CodeBuddy CN Dawn cache"
+        mole_safe_clean_app_cache "CodeBuddy CN" ~/Library/Application\ Support/CodeBuddy\ CN/DawnWebGPUCache/* "CodeBuddy CN WebGPU cache"
+        mole_safe_clean_app_cache "CodeBuddy CN" ~/Library/Application\ Support/CodeBuddy\ CN/logs/* "CodeBuddy CN logs"
     fi
 }
 # Lark / Feishu desktop embeds a Chromium webview (the "aha" explorer profile)
@@ -446,12 +682,43 @@ _feishu_service_worker_delete_guard_allows() {
     mole_clean_process_guard feishu_or_lark_running "Feishu or Lark started"
 }
 
+# Feishu's disk caches: the plain build's ~/Library/Caches/LarkShell and the
+# sandboxed build's container Caches. The owner must still be stopped and the
+# entry must still sit directly under the root inspected.
+_feishu_disk_cache_delete_guard_allows() {
+    local path="$1"
+    _feishu_service_worker_delete_guard_allows || return $?
+
+    local feishu_data="$HOME/Library/Containers/com.bytedance.macos.feishu/Data"
+    local cache_root="${path%/*}"
+    case "$cache_root" in
+        "$HOME/Library/Caches/LarkShell")
+            _messaging_container_bind_candidate "$path" "$cache_root" "$HOME/Library/Caches"
+            ;;
+        "$feishu_data/Library/Caches")
+            _messaging_container_bind_candidate "$path" "$cache_root" "$feishu_data"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Newer builds add a second engine, `iron/users/<user>/profile_main`, whose
+# CacheStorage held 3.7GB of a 3.76GB profile on a work Mac (2026-10-19); only
+# that leaf is taken there, since profile_main also keeps login state. The
+# sandboxed build (com.bytedance.macos.feishu) keeps both trees inside its
+# container. Mole Mac parity: CacheScanner.larkProfileCachePairs.
 clean_feishu_service_worker_caches() {
+    local feishu_sandbox="$HOME/Library/Containers/com.bytedance.macos.feishu/Data/Library/Application Support/LarkShell"
     local -a sw_roots=(
         "$HOME/Library/Application Support/LarkShell/aha/users"
         "$HOME/Library/Application Support/LarkInternational/aha/users"
+        "$feishu_sandbox/aha/users"
+        "$HOME/Library/Application Support/LarkShell/iron/users"
+        "$HOME/Library/Application Support/LarkInternational/iron/users"
+        "$feishu_sandbox/iron/users"
     )
-    local -a root_labels=("Feishu" "Lark")
+    local -a root_labels=("Feishu" "Lark" "Feishu" "Feishu" "Lark" "Feishu")
+    local -a root_profiles=(profile_explorer profile_explorer profile_explorer profile_main profile_main profile_main)
     local -a cache_paths=()
     local -a cache_labels=()
     local root_index sw_root app_label physical_root _profile cache_path physical_cache
@@ -464,7 +731,7 @@ clean_feishu_service_worker_caches() {
             debug_log "Refusing symlinked ${app_label} profile root: $sw_root -> $physical_root"
             continue
         fi
-        for _profile in "$sw_root"/*/profile_explorer; do
+        for _profile in "$sw_root"/*/"${root_profiles[$root_index]}"; do
             [[ -d "$_profile" ]] || continue
             cache_path="${_profile%/}/Service Worker/CacheStorage"
             [[ -d "$cache_path" ]] || continue
@@ -598,6 +865,10 @@ clean_notion_service_worker_caches() {
 #   WeChat .wxapplet/WMPF                         161 MB
 #                                          total ~1.4 GB reclaimed
 #
+# Added later from a work Mac (2026-10-19), WeChat 4.x:
+#   WeChat app_data/radium/web/profiles/*/Cache and
+#          Service Worker/CacheStorage            671 MB
+#
 # Non-targets, never removed because they are user data or account state:
 #   WeChat Documents/xwechat_files/**       chat databases and received files
 #   WeChat Documents/app_data/radium/users  per-account webview state
@@ -675,6 +946,15 @@ _wechat_container_delete_guard_allows() {
     local cache_root="${path%/*}"
     case "$cache_root" in
         "$wechat_data/Documents/app_data/log" | "$wechat_data/.wxapplet/WMPF") ;;
+        "$wechat_data/Documents/app_data/radium/web/profiles/"*)
+            local relative="${cache_root#"$wechat_data/Documents/app_data/radium/web/profiles/"}"
+            local profile="${relative%%/*}"
+            [[ -n "$profile" && "$profile" != "$relative" ]] || return 1
+            case "${relative#*/}" in
+                "Cache" | "Service Worker/CacheStorage") ;;
+                *) return 1 ;;
+            esac
+            ;;
         *) return 1 ;;
     esac
     _messaging_container_bind_candidate "$path" "$cache_root" "$wechat_data"
@@ -733,13 +1013,25 @@ _clean_messaging_container_roots() {
 
     local _MOLE_SAFE_REMOVE_FINAL_GUARD="$delete_guard"
     local guarded_rc=0
+    # Roots sharing a label (one web cache per browser profile) clean as one
+    # row, so five profiles read as one "WeChat web cache" line, not five.
+    local done_labels=$'\n' i other_root
+    local -a label_targets=()
     while [[ $# -ge 2 ]]; do
-        cache_root="$1"
         label="$2"
         shift 2
-        [[ -d "$cache_root" && ! -L "$cache_root" ]] || continue
+        [[ "$done_labels" == *$'\n'"$label"$'\n'* ]] && continue
+        done_labels+="$label"$'\n'
+        label_targets=()
+        for ((i = 0; i + 1 < ${#root_pairs[@]}; i += 2)); do
+            [[ "${root_pairs[i + 1]}" == "$label" ]] || continue
+            other_root="${root_pairs[i]}"
+            [[ -d "$other_root" && ! -L "$other_root" ]] || continue
+            label_targets+=("$other_root"/*)
+        done
+        [[ ${#label_targets[@]} -gt 0 ]] || continue
         guarded_rc=0
-        safe_clean_guarded "$delete_guard" "$cache_root"/* "$label" || guarded_rc=$?
+        safe_clean_guarded "$delete_guard" "${label_targets[@]}" "$label" || guarded_rc=$?
         if [[ $guarded_rc -eq 75 ]]; then
             mole_report_guard_stop "$family container caches" \
                 mole_defer_cleanup_family "$family"
@@ -758,6 +1050,20 @@ clean_wechat_container_caches() {
     if [[ -d "$wechat_data" ]]; then
         wechat_targets+=("$wechat_data/Documents/app_data/log" "WeChat logs")
         wechat_targets+=("$wechat_data/.wxapplet/WMPF" "WeChat mini program cache")
+        # The built-in browser keeps one Chromium profile per tab group; only
+        # its HTTP and Service Worker caches go, never IndexedDB or WebStorage.
+        local web_profile physical_web_profile
+        for web_profile in "$wechat_data/Documents/app_data/radium/web/profiles"/*/; do
+            web_profile="${web_profile%/}"
+            [[ -d "$web_profile" ]] || continue
+            physical_web_profile=$(cd -P "$web_profile" 2> /dev/null && pwd -P) || continue
+            if [[ "$physical_web_profile" != "$web_profile" ]]; then
+                debug_log "Refusing symlinked WeChat web profile: $web_profile -> $physical_web_profile"
+                continue
+            fi
+            wechat_targets+=("$web_profile/Cache" "WeChat web cache")
+            wechat_targets+=("$web_profile/Service Worker/CacheStorage" "WeChat service worker cache")
+        done
         _clean_messaging_container_roots "WeChat" \
             _wechat_container_process_guard_allows \
             _wechat_container_delete_guard_allows \
@@ -798,9 +1104,12 @@ clean_wechat_container_caches() {
 
 # Communication apps.
 clean_communication_apps() {
-    safe_clean ~/Library/Application\ Support/discord/Cache/* "Discord cache"
-    safe_clean ~/Library/Application\ Support/legcord/Cache/* "Legcord cache"
-    safe_clean ~/Library/Application\ Support/Slack/Cache/* "Slack cache"
+    mole_safe_clean_app_cache "Discord" ~/Library/Application\ Support/discord/Cache/* "Discord cache"
+    mole_safe_clean_app_cache "Legcord" ~/Library/Application\ Support/legcord/Cache/* "Legcord cache"
+    # Vesktop moves Electron's session data to sessionData; its vencordFiles sibling stays.
+    mole_safe_clean_app_cache "Vesktop" ~/Library/Application\ Support/vesktop/sessionData/Cache/* "Vesktop cache"
+    mole_safe_clean_app_cache "Vesktop" ~/Library/Application\ Support/vesktop/sessionData/Code\ Cache/* "Vesktop code cache"
+    mole_safe_clean_app_cache "Slack" ~/Library/Application\ Support/Slack/Cache/* "Slack cache"
     safe_clean ~/Library/Caches/us.zoom.xos/* "Zoom cache"
     safe_clean ~/Library/Caches/com.tencent.xinWeChat/* "WeChat cache"
     safe_clean ~/Library/Caches/ru.keepcoder.Telegram/* "Telegram cache"
@@ -812,15 +1121,20 @@ clean_communication_apps() {
     safe_clean ~/Library/Caches/com.tencent.WeWorkMac/* "WeCom cache"
     safe_clean ~/Library/Caches/com.tencent.qq/* "QQ cache"
     safe_clean ~/Library/Caches/com.feishu.*/* "Feishu cache"
+    _clean_messaging_container_roots "Feishu/Lark" \
+        _feishu_service_worker_delete_guard_allows \
+        _feishu_disk_cache_delete_guard_allows \
+        "$HOME/Library/Caches/LarkShell" "Feishu cache" \
+        "$HOME/Library/Containers/com.bytedance.macos.feishu/Data/Library/Caches" "Feishu cache"
     clean_feishu_service_worker_caches
     # Notion partitions remain review-only until local reclaim and recovery are verified.
     if [[ -d ~/Library/Application\ Support/Microsoft/Teams ]]; then
-        safe_clean ~/Library/Application\ Support/Microsoft/Teams/Cache/* "Microsoft Teams legacy cache"
-        safe_clean ~/Library/Application\ Support/Microsoft/Teams/Application\ Cache/* "Microsoft Teams legacy application cache"
-        safe_clean ~/Library/Application\ Support/Microsoft/Teams/Code\ Cache/* "Microsoft Teams legacy code cache"
-        safe_clean ~/Library/Application\ Support/Microsoft/Teams/GPUCache/* "Microsoft Teams legacy GPU cache"
-        safe_clean ~/Library/Application\ Support/Microsoft/Teams/logs/* "Microsoft Teams legacy logs"
-        safe_clean ~/Library/Application\ Support/Microsoft/Teams/tmp/* "Microsoft Teams legacy temp files"
+        mole_safe_clean_app_cache "Microsoft Teams" ~/Library/Application\ Support/Microsoft/Teams/Cache/* "Microsoft Teams legacy cache"
+        mole_safe_clean_app_cache "Microsoft Teams" ~/Library/Application\ Support/Microsoft/Teams/Application\ Cache/* "Microsoft Teams legacy application cache"
+        mole_safe_clean_app_cache "Microsoft Teams" ~/Library/Application\ Support/Microsoft/Teams/Code\ Cache/* "Microsoft Teams legacy code cache"
+        mole_safe_clean_app_cache "Microsoft Teams" ~/Library/Application\ Support/Microsoft/Teams/GPUCache/* "Microsoft Teams legacy GPU cache"
+        mole_safe_clean_app_cache "Microsoft Teams" ~/Library/Application\ Support/Microsoft/Teams/logs/* "Microsoft Teams legacy logs"
+        mole_safe_clean_app_cache "Microsoft Teams" ~/Library/Application\ Support/Microsoft/Teams/tmp/* "Microsoft Teams legacy temp files"
     fi
     clean_wechat_container_caches
 }
@@ -844,11 +1158,20 @@ clean_ai_apps() {
     # installs to ~/.lmstudio in 0.3.6, but existing data is not migrated, so
     # never recursively clean the legacy root. The Library/Caches target above
     # is the only path treated as an auto-rebuildable cache here.
-    safe_clean ~/Library/Caches/CCTClearcutLogger "Google Clearcut logs"
     if [[ -d "$HOME/Library/Application Support/Codex" || -d "$HOME/Library/Logs/com.openai.codex" ]]; then
         debug_log "Codex Desktop state left intact by default"
     fi
 }
+# Adobe's video apps share Common/Media Cache Files (conformed audio and peak
+# files) and index it from the sibling Media Cache database, which stays
+# untouched. Any of them running can be reading or writing the files, and
+# bundle names carry a year ("Adobe Premiere Pro 2025.app"), so match the
+# bundle path rather than an exact executable name.
+_adobe_media_cache_running() {
+    mole_pgrep_any \
+        -f '/Adobe (Premiere Pro|After Effects|Media Encoder|Audition|Prelude|Character Animator|Premiere Elements|Premiere Rush)[^/]*[.]app/'
+}
+
 # Design and creative tools.
 clean_design_tools() {
     safe_clean ~/Library/Caches/com.bohemiancoding.sketch3/* "Sketch cache"
@@ -856,123 +1179,12 @@ clean_design_tools() {
     safe_clean ~/Library/Caches/Adobe/* "Adobe cache"
     safe_clean ~/Library/Caches/com.adobe.*/* "Adobe app caches"
     safe_clean ~/Library/Caches/com.figma.Desktop/* "Figma cache"
-    safe_clean ~/Library/Application\ Support/Adobe/Common/Media\ Cache\ Files/* "Adobe media cache files"
+    local adobe_media_rc=0
+    _dev_safe_clean_process_guarded _adobe_media_cache_running "Adobe" "Adobe media cache files" \
+        ~/Library/Application\ Support/Adobe/Common/Media\ Cache\ Files/* "Adobe media cache files" || adobe_media_rc=$?
+    [[ $adobe_media_rc -le 1 ]] || return "$adobe_media_rc"
 }
 # Video editing tools.
-final_cut_pro_is_running() {
-    mole_pgrep_any \
-        -x "Final Cut Pro" \
-        -f "/Final Cut Pro.app/"
-}
-
-final_cut_pro_path_has_protected_component() {
-    local path="$1"
-
-    case "$path" in
-        */Original\ Media | */Original\ Media/* | \
-            */CurrentVersion.flexolibrary | */CurrentVersion.plist | */Settings.plist | \
-            */Motion\ Templates | */Motion\ Templates/* | \
-            */Final\ Cut\ Pro\ Backups | */Final\ Cut\ Pro\ Backups/*)
-            return 0
-            ;;
-    esac
-
-    return 1
-}
-
-is_final_cut_pro_generated_cache_target() {
-    local library="$1"
-    local target="$2"
-
-    [[ -n "$library" && -n "$target" ]] || return 1
-    [[ "$library" == /* && "$target" == /* ]] || return 1
-    [[ "$library" == "$HOME"/Movies/*.fcpbundle ]] || return 1
-    [[ "$target" == "$library"/* ]] || return 1
-    [[ -d "$library" && ! -L "$library" ]] || return 1
-    [[ -d "$target" && ! -L "$target" ]] || return 1
-
-    final_cut_pro_path_has_protected_component "$target" && return 1
-
-    if declare -f validate_path_for_deletion > /dev/null 2>&1; then
-        validate_path_for_deletion "$target" > /dev/null 2>&1 || return 1
-    fi
-
-    local relative_target="${target#"$library"/}"
-    case "$relative_target" in
-        */Render\ Files/High\ Quality\ Media | */Transcoded\ Media/Proxy\ Media)
-            return 0
-            ;;
-    esac
-
-    return 1
-}
-
-find_final_cut_pro_generated_cache_targets() {
-    local movies_dir="$HOME/Movies"
-    [[ -d "$movies_dir" ]] || return 0
-
-    local library target
-    while IFS= read -r -d '' library; do
-        [[ -d "$library" && ! -L "$library" ]] || continue
-
-        while IFS= read -r -d '' target; do
-            if is_final_cut_pro_generated_cache_target "$library" "$target"; then
-                printf '%s\0' "$target"
-            fi
-        done < <(command find "$library" \
-            \( -type d \( \
-            -name "Original Media" -o \
-            -name "Analysis Files" -o \
-            -name "Motion Templates" -o \
-            -name "Final Cut Pro Backups" \
-            \) -prune \) -o \
-            \( -type d \( \
-            -path "*/Render Files/High Quality Media" -o \
-            -path "*/Transcoded Media/Proxy Media" \
-            \) -print0 \) 2> /dev/null || true)
-    done < <(command find "$movies_dir" -maxdepth 4 -type d -name "*.fcpbundle" -prune -print0 2> /dev/null || true)
-}
-
-clean_final_cut_pro_generated_caches() {
-    local -a fcp_cache_targets=()
-    local target
-    while IFS= read -r -d '' target; do
-        if mole_cleanup_targets_exist "$target"; then
-            fcp_cache_targets+=("$target")
-        fi
-    done < <(find_final_cut_pro_generated_cache_targets)
-
-    [[ ${#fcp_cache_targets[@]} -gt 0 ]] || return 0
-
-    local process_state=0
-    final_cut_pro_is_running || process_state=$?
-    if [[ $process_state -ne 1 ]]; then
-        if [[ $process_state -eq 2 ]]; then
-            echo -e "  ${GRAY}${ICON_WARNING}${NC} Final Cut Pro generated caches · skipped (process state unknown)"
-            note_activity
-        else
-            mole_defer_cleanup_family "Final Cut Pro"
-        fi
-        return 0
-    fi
-
-    # Final Cut Pro generated cache cleanup (issue #843).
-    # Safety scope for the first pass:
-    # - only scan ~/Movies, the default Apple library location;
-    # - only delete exact generated-media directories documented by Apple as
-    #   regenerable: render media and proxy media;
-    # - never touch Original Media, library databases, plist settings, backups,
-    #   Motion templates, Analysis Files, optimized media, or external .fcpcache.
-    # Future expansion can add explicit flags or configurable roots for
-    # optimized media, Analysis Files, and external cache bundles after more
-    # field feedback.
-    _app_cache_safe_clean_guarded \
-        _final_cut_pro_delete_guard_allows \
-        "Final Cut Pro generated caches" \
-        "${fcp_cache_targets[@]}" \
-        "Final Cut Pro generated cache" || true
-}
-
 jianying_pro_is_running() {
     command -v pgrep > /dev/null 2>&1 || return 2
 
@@ -1010,44 +1222,11 @@ clean_jianying_pro_generated_caches() {
         return 0
     fi
 
-    # JianyingPro (剪映专业版 / CapCut CN, com.lemon.lvpro) generated cache
-    # cleanup (issue #1277). Same shape as Final Cut Pro (#843): the editor
-    # keeps heavy generated caches under ~/Movies/JianyingPro/User Data/Cache/
-    # instead of ~/Library/Caches, so standard cleanup never reaches them.
-    #
-    # Safety scope for the first pass:
-    # - only the default cache root under ~/Movies; never User Data/Projects
-    #   (the user's editable drafts) or any sibling of Cache;
-    # - only remove an explicit whitelist of regenerable subdirectories:
-    #   subtitle-recognition PCM scratch, frame thumbnails, audio waveforms,
-    #   algorithm scratch, and prerender/remux temp;
-    # - never touch draft-referenced or downloaded assets (effect,
-    #   onlineMaterial, artistEffect, music, AITextTemplate, template,
-    #   local_models, AigcMaterailCache, agencycache); plaintext draft configs
-    #   reference effect 8000+ times, so anything not on this list is preserved.
-    #
-    # image/ and importcache3/ are deliberately excluded: both hold copies of
-    # material the user imported, draft_info.json is encrypted so no plaintext
-    # reference check can prove they are unreferenced, and mo clean deletes
-    # permanently. If the user has since moved or deleted the source file, the
-    # cached copy is the only remaining one. Revisit only with evidence that
-    # the editor re-imports from the original on demand.
-    #
-    # Verified on a real machine (macOS 15.7 Intel, JianyingPro 11.1.0):
-    # removing this set reclaimed ~70GB, 2025-era projects reopened cleanly, and
-    # the app recreated the scratch directories on next launch.
+    # Scratch only. Rendered/remuxed media can be the last copy when the
+    # original footage is gone; inspect those files in the editor or Analyze.
+    # Imported files, downloaded materials and project data also stay untouched.
     local -a regenerable_subdirs=(
-        recognize
-        frameThumbnail
-        audioWave
-        AlgorithmCache
-        ILASDKDB
-        RemuxCache
-        prerender
-        segmentPrerenderCache
-        MotionBlurCache
-        ttsTemp
-        tmp
+        recognize frameThumbnail audioWave AlgorithmCache ILASDKDB ttsTemp tmp
     )
 
     local -a targets=()
@@ -1067,7 +1246,6 @@ clean_jianying_pro_generated_caches() {
 clean_video_tools() {
     safe_clean ~/Library/Caches/net.telestream.screenflow10/* "ScreenFlow cache"
     safe_clean ~/Library/Caches/com.apple.FinalCut/* "Final Cut Pro cache"
-    clean_final_cut_pro_generated_caches
     safe_clean ~/Library/Caches/com.blackmagic-design.DaVinciResolve/* "DaVinci Resolve cache"
     safe_clean ~/Movies/CacheClip/* "DaVinci Resolve CacheClip"
     safe_clean ~/Library/Caches/com.adobe.PremierePro.*/* "Premiere Pro cache"
@@ -1165,7 +1343,7 @@ _autodesk_fusion_version_dir_version() {
     local bundle_id=""
     bundle_id=$(run_with_timeout "$probe_timeout" /usr/bin/plutil \
         -extract CFBundleIdentifier raw "$info_plist" < /dev/null 2> /dev/null) || probe_rc=$?
-    [[ $probe_rc -eq 124 || $probe_rc -ge 128 ]] && return "$probe_rc"
+    mole_rc_timeout_or_signal "$probe_rc" && return "$probe_rc"
     [[ $probe_rc -eq 0 && "$bundle_id" == "com.autodesk.fusion360" ]] || return 1
 
     probe_timeout=$(_mole_timeout_with_deadline \
@@ -1174,7 +1352,7 @@ _autodesk_fusion_version_dir_version() {
     local version=""
     version=$(run_with_timeout "$probe_timeout" /usr/bin/plutil \
         -extract CFBundleVersion raw "$info_plist" < /dev/null 2> /dev/null) || probe_rc=$?
-    [[ $probe_rc -eq 124 || $probe_rc -ge 128 ]] && return "$probe_rc"
+    mole_rc_timeout_or_signal "$probe_rc" && return "$probe_rc"
     [[ $probe_rc -eq 0 && "$version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
 
     probe_timeout=$(_mole_timeout_with_deadline \
@@ -1183,7 +1361,7 @@ _autodesk_fusion_version_dir_version() {
     local executable=""
     executable=$(run_with_timeout "$probe_timeout" /usr/bin/plutil \
         -extract CFBundleExecutable raw "$info_plist" < /dev/null 2> /dev/null) || probe_rc=$?
-    [[ $probe_rc -eq 124 || $probe_rc -ge 128 ]] && return "$probe_rc"
+    mole_rc_timeout_or_signal "$probe_rc" && return "$probe_rc"
     [[ $probe_rc -eq 0 &&
         ("$executable" == "Autodesk Fusion" || "$executable" == "Autodesk Fusion 360") ]] || return 1
     local executable_path="$macos_dir/$executable"
@@ -1366,7 +1544,7 @@ _autodesk_fusion_plan_old_versions() {
         version_rc=0
         _autodesk_fusion_version_dir_version \
             "$dir" "$deadline_seconds" || version_rc=$?
-        if [[ $version_rc -eq 124 || $version_rc -ge 128 ]]; then
+        if mole_rc_timeout_or_signal "$version_rc"; then
             inventory_rc=$version_rc
             break
         elif [[ $version_rc -ne 0 ]]; then
@@ -1408,7 +1586,7 @@ _autodesk_fusion_guard_current_is_unchanged() {
         "$_MOLE_AUTODESK_FUSION_GUARD_DEADLINE" || resolve_rc=$?
     if [[ $resolve_rc -ne 0 ]]; then
         _MOLE_AUTODESK_FUSION_GUARD_REASON="current version unknown"
-        [[ $resolve_rc -eq 124 || $resolve_rc -ge 128 ]] && return "$resolve_rc"
+        mole_rc_timeout_or_signal "$resolve_rc" && return "$resolve_rc"
         return 1
     fi
     if [[ "$_MOLE_AUTODESK_FUSION_RESOLVED_DIR" != "$_MOLE_AUTODESK_FUSION_GUARD_CURRENT_DIR" ||
@@ -1452,7 +1630,7 @@ _autodesk_fusion_delete_guard_allows() {
         "$target" "$_MOLE_AUTODESK_FUSION_GUARD_DEADLINE" || version_rc=$?
     if [[ $version_rc -ne 0 ]]; then
         _MOLE_AUTODESK_FUSION_GUARD_REASON="candidate identity changed"
-        [[ $version_rc -eq 124 || $version_rc -ge 128 ]] && return "$version_rc"
+        mole_rc_timeout_or_signal "$version_rc" && return "$version_rc"
         return 1
     fi
     if ! _autodesk_fusion_version_is_older \
@@ -1514,7 +1692,7 @@ clean_autodesk_fusion_old_bundles() {
     local current_rc=0
     _autodesk_fusion_resolve_current_version \
         "$production_root" "$cleanup_deadline" || current_rc=$?
-    if [[ $current_rc -eq 124 ]]; then
+    if mole_rc_timeout "$current_rc"; then
         echo -e "  ${GRAY}${ICON_WARNING}${NC} Autodesk Fusion old versions · skipped (current version probe timed out)"
         note_activity
         return 0
@@ -1532,7 +1710,7 @@ clean_autodesk_fusion_old_bundles() {
     _autodesk_fusion_plan_old_versions \
         "$production_root" "$current_dir" "$current_version" \
         "$cleanup_deadline" || plan_rc=$?
-    if [[ $plan_rc -eq 124 ]]; then
+    if mole_rc_timeout "$plan_rc"; then
         echo -e "  ${GRAY}${ICON_WARNING}${NC} Autodesk Fusion old versions · skipped (inventory timed out)"
         note_activity
         return 0
@@ -1574,7 +1752,7 @@ clean_autodesk_fusion_old_bundles() {
 
         guard_rc=0
         _autodesk_fusion_delete_guard_allows "$dir" || guard_rc=$?
-        if [[ $guard_rc -eq 124 ]]; then
+        if mole_rc_timeout "$guard_rc"; then
             stopped_reason="verification timed out"
             break
         elif [[ $guard_rc -ge 128 ]]; then
@@ -1591,7 +1769,7 @@ clean_autodesk_fusion_old_bundles() {
         if [[ $size_rc -eq 0 ]]; then
             size_kb=$(get_path_size_kb "$dir" "$size_timeout") || size_rc=$?
         fi
-        if [[ $size_rc -eq 124 ]]; then
+        if mole_rc_timeout "$size_rc"; then
             stopped_reason="size probe timed out"
             break
         elif [[ $size_rc -ge 128 ]]; then
@@ -1607,7 +1785,7 @@ clean_autodesk_fusion_old_bundles() {
             # that a real safe_remove final guard would enforce.
             guard_rc=0
             _autodesk_fusion_delete_guard_allows "$dir" || guard_rc=$?
-            if [[ $guard_rc -eq 124 ]]; then
+            if mole_rc_timeout "$guard_rc"; then
                 stopped_reason="verification timed out"
                 break
             elif [[ $guard_rc -ge 128 ]]; then
@@ -1634,7 +1812,7 @@ clean_autodesk_fusion_old_bundles() {
         if [[ $remove_rc -eq 0 ]]; then
             total_size=$((total_size + size_kb))
             cleaned_count=$((cleaned_count + 1))
-        elif [[ $remove_rc -eq 124 ]]; then
+        elif mole_rc_timeout "$remove_rc"; then
             stopped_reason="removal timed out"
             break
         elif [[ $remove_rc -ge 128 ]]; then
@@ -1663,15 +1841,13 @@ clean_autodesk_fusion_old_bundles() {
         local size_human
         size_human=$(bytes_to_human "$((total_size * 1024))")
         if [[ "${DRY_RUN:-false}" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Autodesk Fusion old versions${NC} · ${YELLOW}${cleaned_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Autodesk Fusion old versions${NC} · ${YELLOW}$(mole_count_label "${cleaned_count}" dir), $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Autodesk Fusion old versions${NC} · ${line_color}${cleaned_count} dirs, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Autodesk Fusion old versions${NC} · ${line_color}$(mole_count_label "${cleaned_count}" dir), $(colorize_human_size "${size_human}")"
         fi
-        files_cleaned=$((${files_cleaned:-0} + cleaned_count))
-        total_size_cleaned=$((${total_size_cleaned:-0} + total_size))
-        total_items=$((${total_items:-0} + 1))
+        mole_add_cleaned_row "$cleaned_count" "$total_size"
         note_activity
     fi
     if [[ $failed_count -gt 0 ]]; then
@@ -1727,6 +1903,46 @@ clean_3d_tools() {
     clean_autodesk_fusion_old_bundles
 }
 # Productivity apps.
+# Futu NiuNiu (cn.futu.niuniu.nx) downloads each in-app update as one DMG
+# into LiveUpdate/mac_qtnn and never removes it: a 582 MB package from July
+# sat beside an app updated in October (2026-10-19). Only that folder's
+# children, never the rest of the container; the sandbox is unreadable without
+# Full Disk Access, so nothing is listed then. The guard is re-asked at every
+# sink because an update can start downloading while Mole runs.
+futu_running() {
+    mole_pgrep_any \
+        -x "FTNN" \
+        -f '/Contents/MacOS/FTNN( |$)'
+}
+
+_futu_update_delete_guard_allows() {
+    mole_clean_process_guard futu_running "Futu started"
+}
+
+clean_futu_update_downloads() {
+    local root="$HOME/Library/Containers/cn.futu.niuniu.nx/Data/Library/Application Support/LiveUpdate/mac_qtnn"
+    mole_cleanup_targets_exist "$root"/* || return 0
+    local physical_root
+    physical_root=$(cd -P "$root" 2> /dev/null && pwd -P) || return 0
+    if [[ "$physical_root" != "$root" ]]; then
+        debug_log "Refusing symlinked Futu update folder: $root -> $physical_root"
+        return 0
+    fi
+
+    local _MOLE_CLEAN_GUARD_REASON=""
+    if ! _futu_update_delete_guard_allows; then
+        mole_report_guard_stop "Futu update downloads" mole_defer_cleanup_family "Futu"
+        return 0
+    fi
+    local guarded_rc=0
+    safe_clean_guarded _futu_update_delete_guard_allows "$root"/* "Futu update downloads" || guarded_rc=$?
+    if [[ $guarded_rc -eq 75 ]]; then
+        mole_report_guard_stop "Futu update downloads" mole_defer_cleanup_family "Futu"
+        return 0
+    fi
+    return "$guarded_rc"
+}
+
 clean_productivity_apps() {
     safe_clean ~/Library/Caches/com.tw93.MiaoYan/* "MiaoYan cache"
     safe_clean ~/Library/Caches/com.klee.desktop/* "Klee cache"
@@ -1740,27 +1956,12 @@ clean_productivity_apps() {
     safe_clean ~/.cache/kaku/* "Kaku cache"
     safe_clean ~/Library/Application\ Support/spacedrive/thumbnails/* "Spacedrive thumbnail cache"
     safe_clean ~/Library/Containers/is.follow/Data/Library/Application\ Support/Folo/Cache/Cache_Data/* "Folo cache"
+    clean_futu_update_downloads
 }
 # Music/media players (protect Spotify offline music).
 clean_media_players() {
-    local spotify_cache="$HOME/Library/Caches/com.spotify.client"
-    local spotify_data="$HOME/Library/Application Support/Spotify"
-    local has_offline_music=false
-    # offline.bnk exists even with no offline downloads; only treat it as evidence
-    # when it has real content (>1 KB). Encrypted track blobs (*.file) are reliable.
-    local bnk_file="$spotify_data/PersistentCache/Storage/offline.bnk"
-    local bnk_size=0
-    [[ -f "$bnk_file" ]] && bnk_size=$(stat -f%z "$bnk_file" 2> /dev/null || echo 0)
-    if [[ $bnk_size -gt 1024 ]] ||
-        [[ -d "$spotify_data/PersistentCache/Storage" && -n "$(find "$spotify_data/PersistentCache/Storage" -type f -name "*.file" 2> /dev/null | head -1)" ]]; then
-        has_offline_music=true
-    fi
-    if [[ "$has_offline_music" == "true" ]]; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Spotify cache protected · offline music detected"
-        note_activity
-    else
-        safe_clean ~/Library/Caches/com.spotify.client/* "Spotify cache"
-    fi
+    # Spotify's cache can contain offline music in more than one layout.
+    # Absence of an offline marker does not prove it disposable.
     safe_clean ~/Library/Caches/com.apple.Music "Apple Music cache"
     safe_clean ~/Library/Caches/com.apple.podcasts "Apple Podcasts cache"
     # Apple Podcasts sandbox container: zombie sparse files and stale artwork cache (#387)
@@ -1854,10 +2055,9 @@ clean_neatdm_stale_segments() {
     for seg_dir in "${stale_dirs[@]}"; do
         local size_kb=""
         local size_rc=0
-        size_kb=$(get_path_size_kb "$seg_dir") || size_rc=$?
-        [[ $size_rc -eq 0 ]] || _mole_record_clean_cancellation "$size_rc"
-        [[ $size_rc -eq 0 ]] || return "$size_rc"
-        [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+        size_kb=$(get_path_size_kb "$seg_dir" "" readable) || size_rc=$?
+        mole_item_size_continues "$size_rc" || return $?
+        [[ $size_rc -eq 0 && "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
 
         if [[ "$DRY_RUN" != "true" ]]; then
             if safe_remove "$seg_dir" true; then
@@ -1874,15 +2074,13 @@ clean_neatdm_stale_segments() {
         local size_human
         size_human=$(bytes_to_human "$((stale_kb * 1024))")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} NeatDM stale downloads · ${stale_count} items, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} NeatDM stale downloads · $(mole_count_label "${stale_count}" item), $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$stale_kb")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} NeatDM stale downloads · ${stale_count} items, ${line_color}${size_human}${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} NeatDM stale downloads · $(mole_count_label "${stale_count}" item), $(colorize_human_size "${size_human}")"
         fi
-        files_cleaned=$((files_cleaned + stale_count))
-        total_size_cleaned=$((total_size_cleaned + stale_kb))
-        total_items=$((total_items + 1))
+        mole_add_cleaned_row "$stale_count" "$stale_kb"
         note_activity
     fi
 }
@@ -1971,12 +2169,12 @@ clean_system_utils() {
     safe_clean ~/Library/Application\ Support/WeType/DictUpdate/* "WeType dict update cache"
     # mihomo-party proxy tool (Electron)
     if [[ -d ~/Library/Application\ Support/mihomo-party ]]; then
-        safe_clean ~/Library/Application\ Support/mihomo-party/Cache/* "mihomo-party cache"
-        safe_clean ~/Library/Application\ Support/mihomo-party/Code\ Cache/* "mihomo-party code cache"
-        safe_clean ~/Library/Application\ Support/mihomo-party/GPUCache/* "mihomo-party GPU cache"
-        safe_clean ~/Library/Application\ Support/mihomo-party/DawnGraphiteCache/* "mihomo-party Dawn cache"
-        safe_clean ~/Library/Application\ Support/mihomo-party/DawnWebGPUCache/* "mihomo-party WebGPU cache"
-        safe_clean ~/Library/Application\ Support/mihomo-party/logs/* "mihomo-party logs"
+        mole_safe_clean_app_cache "mihomo-party" ~/Library/Application\ Support/mihomo-party/Cache/* "mihomo-party cache"
+        mole_safe_clean_app_cache "mihomo-party" ~/Library/Application\ Support/mihomo-party/Code\ Cache/* "mihomo-party code cache"
+        mole_safe_clean_app_cache "mihomo-party" ~/Library/Application\ Support/mihomo-party/GPUCache/* "mihomo-party GPU cache"
+        mole_safe_clean_app_cache "mihomo-party" ~/Library/Application\ Support/mihomo-party/DawnGraphiteCache/* "mihomo-party Dawn cache"
+        mole_safe_clean_app_cache "mihomo-party" ~/Library/Application\ Support/mihomo-party/DawnWebGPUCache/* "mihomo-party WebGPU cache"
+        mole_safe_clean_app_cache "mihomo-party" ~/Library/Application\ Support/mihomo-party/logs/* "mihomo-party logs"
     fi
     # Stash proxy tool
     safe_clean ~/Library/Caches/ws.stash.app.mac/* "Stash cache"
@@ -2006,25 +2204,27 @@ clean_remote_desktop() {
 clean_user_gui_applications() {
     # Product and media App Container rows share one recursive-handle budget.
     local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
+    # safe_clean stops the section spinner before it prints a row, so restart
+    # it before each app group; otherwise the rest of the section runs with
+    # nothing on screen.
+    local app_group group_rc
+    for app_group in clean_communication_apps clean_dingtalk clean_ai_apps \
+        clean_design_tools clean_video_tools clean_3d_tools clean_productivity_apps \
+        clean_media_players clean_video_players clean_download_managers \
+        clean_gaming_platforms clean_translation_apps clean_screenshot_tools \
+        clean_email_clients clean_task_apps clean_shell_utils clean_system_utils \
+        clean_note_apps clean_launcher_apps clean_remote_desktop; do
+        start_section_spinner "Scanning apps..."
+        if [[ "$app_group" == "clean_download_managers" ]]; then
+            group_rc=0
+            "$app_group" || group_rc=$?
+            if [[ $group_rc -ne 0 ]]; then
+                stop_section_spinner
+                return "$group_rc"
+            fi
+        else
+            "$app_group"
+        fi
+    done
     stop_section_spinner
-    clean_communication_apps
-    clean_dingtalk
-    clean_ai_apps
-    clean_design_tools
-    clean_video_tools
-    clean_3d_tools
-    clean_productivity_apps
-    clean_media_players
-    clean_video_players
-    clean_download_managers || return $?
-    clean_gaming_platforms
-    clean_translation_apps
-    clean_screenshot_tools
-    clean_email_clients
-    clean_task_apps
-    clean_shell_utils
-    clean_system_utils
-    clean_note_apps
-    clean_launcher_apps
-    clean_remote_desktop
 }

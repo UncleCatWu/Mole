@@ -181,6 +181,15 @@ cleanup_all() {
             [[ -n "$failed_action" ]] || continue
             log_operation "optimize" "TASK_FAILED" "$failed_action" "task outcome"
         done < <(optimize_failed_actions)
+        # Applied tasks changed system state (SQLite, defaults, Spotlight,
+        # DNS); a preview applied nothing, so it records none.
+        if [[ "${MOLE_DRY_RUN:-0}" != "1" ]]; then
+            local applied_action
+            while IFS= read -r applied_action; do
+                [[ -n "$applied_action" ]] || continue
+                log_operation "optimize" "REBUILT" "$applied_action" "task outcome"
+            done < <(optimize_actions_with_outcome "$MOLE_OPTIMIZE_OUTCOME_APPLIED")
+        fi
     fi
     if [[ "$exit_status" -ne 0 && "$failed" -eq 0 ]]; then
         local failure_action="session"
@@ -210,7 +219,7 @@ main() {
             "--debug")
                 export MO_DEBUG=1
                 ;;
-            "--dry-run")
+            "--dry-run" | "-n")
                 export MOLE_DRY_RUN=1
                 ;;
             "--whitelist")
@@ -273,7 +282,7 @@ main() {
         stop_inline_spinner
     fi
 
-    load_whitelist "optimize"
+    load_whitelist "optimize" || exit 1
     if [[ ${#CURRENT_WHITELIST_PATTERNS[@]} -gt 0 ]]; then
         local count=${#CURRENT_WHITELIST_PATTERNS[@]}
         if [[ $count -le 3 ]]; then

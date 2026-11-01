@@ -73,4 +73,4 @@ The project pays particular attention to:
 - Sensitive data exclusions
 - Packaging, release artifacts, checksums, and update/install flows
 
-For the current technical design and known limitations, see [SECURITY_AUDIT.md](SECURITY_AUDIT.md).
+For the current technical design and known limitations, see [SECURITY_DESIGN.md](docs/SECURITY_DESIGN.md) and [SECURITY_AUDIT.md](SECURITY_AUDIT.md).

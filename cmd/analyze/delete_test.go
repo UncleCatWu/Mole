@@ -65,7 +65,7 @@ func TestDeleteMultiplePathsCmdHandlesParentChild(t *testing.T) {
 	}
 
 	var counter int64
-	msg := deleteMultiplePathsCmd([]string{parent, child}, &counter)()
+	msg := deleteMultiplePathsCmd([]string{parent, child}, &counter, nil)()
 	progress, ok := msg.(deleteProgressMsg)
 	if !ok {
 		t.Fatalf("expected deleteProgressMsg, got %T", msg)
@@ -139,6 +139,63 @@ func TestValidateTrashTargetRejectsDockerDesktopLiveData(t *testing.T) {
 				t.Fatalf("validateTrashTarget(%q) error = %v, want protected path error", path, err)
 			}
 		})
+	}
+}
+
+func TestValidateTrashTargetRejectsParentsOfProtectedRuntimeState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	containers := filepath.Join(home, "Library", "Containers")
+	if err := os.MkdirAll(containers, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateTrashTarget(containers); err != nil {
+		t.Fatalf("empty container directory was protected: %v", err)
+	}
+	for _, relative := range []string{
+		"Library/Containers/com.docker.docker/Data",
+		"Library/Group Containers/HUAQ24HBR6.dev.orbstack/data",
+	} {
+		if err := os.MkdirAll(filepath.Join(home, relative), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, relative := range []string{"Library", "Library/Containers", "Library/Group Containers"} {
+		path := filepath.Join(home, relative)
+		if err := validateTrashTarget(path); err == nil {
+			t.Errorf("parent of protected runtime state accepted: %s", path)
+		}
+		alias := filepath.Join(t.TempDir(), "parent-alias")
+		if err := os.Symlink(path, alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateTrashTarget(alias); err == nil {
+			t.Errorf("alias of protected runtime parent accepted: %s", alias)
+		}
+	}
+	for _, relative := range []string{"Library/Caches/rebuildable", "Library/Containers/com.example.app", "Library/Group Containers/example.dev.orbstack-backup"} {
+		if err := validateTrashTarget(filepath.Join(home, relative)); err != nil {
+			t.Errorf("unrelated sibling refused: %s: %v", relative, err)
+		}
+	}
+}
+
+func TestValidateTrashTargetRejectsPhysicalParentOfLinkedRuntimeState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	external := t.TempDir()
+	state := filepath.Join(external, "runtime")
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(state, filepath.Join(home, ".orbstack")); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateTrashTarget(external); err == nil {
+		t.Fatal("physical parent of linked runtime state was accepted")
+	}
+	if err := validateTrashTarget(filepath.Join(external, "ordinary-sibling")); err != nil {
+		t.Fatalf("ordinary sibling was protected: %v", err)
 	}
 }
 
@@ -369,6 +426,11 @@ func TestValidateTrashTargetRejectsEndpointSecurityCaches(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	tests := []string{
+		"/private/var/folders/zz",
+		"/private/var/folders/zz/aa",
+		"/private/var/folders/zz/aa/C",
+		"/var/folders/zz/aa/T",
+		"/var/folders/zz/aa/X",
 		"/private/var/folders/zz/aa/C/com.crowdstrike.falcon.App/com.apple.metalfe",
 		"/private/var/folders/zz/aa/X/com.sentinelone.agent.code_sign_clone",
 		"/var/folders/zz/aa/C/com.jamf.management/cache",

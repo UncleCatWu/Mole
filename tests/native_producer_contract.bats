@@ -11,11 +11,11 @@ run_native_case() {
 }
 @test "native AppSupport find prefix timeout discards plan and preserves partial later sections" {
     run_native_case app_scan
-    [[ "$output" == *'LATER_SECTION'* && "$output" == *'Potential space:'*'At least'* ]]
+    [[ "$output" == *'LATER_SECTION'* && "$output" == *'Potential space:'*'+'* ]]
 }
 @test "native AppSupport du timeout keeps item and counts only completed sibling" {
     run_native_case app_du
-    [[ "$output" == *'LATER_SECTION'* && "$output" == *'Potential space:'*'At least'* ]]
+    [[ "$output" == *'LATER_SECTION'* && "$output" == *'Potential space:'*'+'* ]]
 }
 @test "native project recursive completed producer preserves depth prune and sorted consumer domain" {
     run_native_case project_complete

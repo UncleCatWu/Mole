@@ -33,36 +33,32 @@ source "$_MOLE_CORE_DIR/app_protection_data.sh"
 # Return 0 when Xcode/build tooling is active, 1 after reliable no-match
 # results, and 2 when process ownership cannot be established.
 xcode_build_tooling_process_state() {
-    command -v pgrep > /dev/null 2>&1 || return 2
-
-    local process probe_status
-    for process in Xcode xcodebuild xctest XCTRunner XCBBuildService swift-frontend; do
-        if pgrep -x "$process" > /dev/null 2>&1; then
-            return 0
-        else
-            probe_status=$?
-            [[ $probe_status -eq 1 ]] || return 2
-        fi
-    done
-    return 1
+    mole_pgrep_any -x Xcode -x xcodebuild -x xctest -x XCTRunner \
+        -x XCBBuildService -x swift-frontend
 }
 
-# Centralized check for critical system components (case-insensitive)
+# Centralized check for critical system components (case-insensitive).
+# nocasematch instead of a lowercasing tr: clean asks this once per
+# candidate, so a subprocess here cost seconds per run.
 is_critical_system_component() {
     local token="$1"
     [[ -z "$token" ]] && return 1
 
-    local lower
-    lower=$(echo "$token" | LC_ALL=C tr '[:upper:]' '[:lower:]')
-
-    case "$lower" in
+    local restore_nocasematch=false
+    if ! shopt -q nocasematch; then
+        shopt -s nocasematch
+        restore_nocasematch=true
+    fi
+    local critical=1
+    case "$token" in
         *backgroundtaskmanagement* | *loginitems* | *systempreferences* | *systemsettings* | *settings* | *preferences* | *controlcenter* | *biometrickit* | *sfl* | *tcc*)
-            return 0
-            ;;
-        *)
-            return 1
+            critical=0
             ;;
     esac
+    if [[ "$restore_nocasematch" == "true" ]]; then
+        shopt -u nocasematch
+    fi
+    return "$critical"
 }
 
 # Check if bundle ID matches pattern (glob support)
@@ -151,7 +147,8 @@ official_uninstaller_vendor() {
     for rule in "${OFFICIAL_UNINSTALLER_RULES[@]}"; do
         IFS='|' read -r vendor prefixes fragments <<< "$rule"
         IFS=',' read -r -a _prefixes <<< "$prefixes"
-        for prefix in "${_prefixes[@]}"; do
+        # A rule may leave a field empty; bash 3.2 under set -u rejects an empty "${arr[@]}".
+        for prefix in "${_prefixes[@]+"${_prefixes[@]}"}"; do
             [[ -n "$prefix" && "$normalized_bundle" == "$prefix"* ]] && {
                 printf '%s\n' "$vendor"
                 return 0
@@ -159,7 +156,7 @@ official_uninstaller_vendor() {
         done
 
         IFS=',' read -r -a _fragments <<< "$fragments"
-        for fragment in "${_fragments[@]}"; do
+        for fragment in "${_fragments[@]+"${_fragments[@]}"}"; do
             if [[ -n "$fragment" ]] &&
                 { [[ "$normalized_name" == *"$fragment"* ]] || [[ "$normalized_path" == *"$fragment"* ]]; }; then
                 printf '%s\n' "$vendor"
@@ -225,7 +222,8 @@ should_protect_data() {
         com.tencent.* | com.sogou.* | com.baidu.* | com.googlecode.* | im.rime.*)
             # These might have wildcards, check detailed list
             for pattern in "${DATA_PROTECTED_BUNDLES[@]}"; do
-                if bundle_matches_pattern "$bundle_id" "$pattern"; then
+                # shellcheck disable=SC2053 # unquoted RHS is the glob, as in bundle_matches_pattern
+                if [[ -n "$pattern" && "$bundle_id" == $pattern ]]; then
                     return 0
                 fi
             done
@@ -235,7 +233,8 @@ should_protect_data() {
 
     # Fallback: check against the full DATA_PROTECTED_BUNDLES list
     for pattern in "${DATA_PROTECTED_BUNDLES[@]}"; do
-        if bundle_matches_pattern "$bundle_id" "$pattern"; then
+        # shellcheck disable=SC2053 # unquoted RHS is the glob, as in bundle_matches_pattern
+        if [[ -n "$pattern" && "$bundle_id" == $pattern ]]; then
             return 0
         fi
     done
@@ -339,9 +338,44 @@ _mole_is_shared_home_state_root() {
             "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Bb][Ii][Nn] | \
             "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Ll][Ii][Bb] | \
             "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Ss][Hh][Aa][Rr][Ee] | \
-            "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Ss][Tt][Aa][Tt][Ee])
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Ss][Tt][Aa][Tt][Ee] | \
+            "$HOME/Library/Unity" | "$HOME/Library/Application Support/Epic")
             return 0
             ;;
+    esac
+    return 1
+}
+
+# Steam keeps the user's whole game library (steamapps/common) and per-account
+# userdata under this one root, so an uninstall must never offer the root or
+# anything inside it, whichever app is being removed. Exact root only: the
+# character classes cover the case-insensitive spellings of the same directory,
+# not similarly named siblings. mo clean still reaches the rebuildable caches
+# inside it, so callers apply this in uninstall mode only.
+_mole_is_steam_library_path() {
+    local path="${1%/}"
+    case "$path" in
+        "$HOME"/[Ll][Ii][Bb][Rr][Aa][Rr][Yy]/[Aa][Pp][Pp][Ll][Ii][Cc][Aa][Tt][Ii][Oo][Nn]\ [Ss][Uu][Pp][Pp][Oo][Rr][Tt]/[Ss][Tt][Ee][Aa][Mm] | \
+            "$HOME"/[Ll][Ii][Bb][Rr][Aa][Rr][Yy]/[Aa][Pp][Pp][Ll][Ii][Cc][Aa][Tt][Ii][Oo][Nn]\ [Ss][Uu][Pp][Pp][Oo][Rr][Tt]/[Ss][Tt][Ee][Aa][Mm]/*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# WeChat's built-in browser keeps one Chromium profile per tab group under
+# radium/web/profiles. Only entries inside a profile's HTTP cache and Service
+# Worker CacheStorage are regenerable; IndexedDB, WebStorage and the profile
+# itself stay protected with the rest of the container.
+_is_wechat_web_profile_cache_child() {
+    local path="$1"
+    local root="$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/radium/web/profiles/"
+    local relative="${path#"$root"}"
+    [[ "$relative" != "$path" ]] || return 1
+    local profile="${relative%%/*}"
+    [[ -n "$profile" && "$profile" != "$relative" ]] || return 1
+    case "${relative#*/}" in
+        Cache/?* | "Service Worker/CacheStorage/"?*) return 0 ;;
     esac
     return 1
 }
@@ -358,7 +392,25 @@ should_protect_path() {
     local path="$1"
     [[ -z "$path" ]] && return 1
 
+    # Local database/session state and recovery copies are not rebuildable caches.
+    # Explicit uninstall retains its separate reviewed-data policy.
+    if [[ "${MOLE_UNINSTALL_MODE:-0}" != "1" ]]; then
+        case "$path" in
+            "$HOME/.prometheus/data" | "$HOME/.prometheus/data/"* | \
+                "$HOME/.jupyter/runtime" | "$HOME/.jupyter/runtime/"* | \
+                "$HOME/.gitconfig.lock" | "$HOME/.gitconfig.bak"* | \
+                "$HOME/.config/fish/fish_history.bak"* | \
+                "$HOME/.bash_history.bak"* | "$HOME/.zsh_history.bak"*)
+                return 0
+                ;;
+        esac
+    fi
+
     if _mole_is_shared_home_state_root "$path"; then
+        return 0
+    fi
+
+    if [[ "${MOLE_UNINSTALL_MODE:-0}" == "1" ]] && _mole_is_steam_library_path "$path"; then
         return 0
     fi
 
@@ -434,7 +486,8 @@ should_protect_path() {
         # blocking on the blanket com.apple.* match in should_protect_data.
         if [[ "$path" == */Data/Library/Caches/* || "$path" == */Data/tmp/* ||
             "$path" == "$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/log/"* ||
-            "$path" == "$HOME/Library/Containers/com.tencent.xinWeChat/Data/.wxapplet/WMPF/"* ]]; then
+            "$path" == "$HOME/Library/Containers/com.tencent.xinWeChat/Data/.wxapplet/WMPF/"* ]] ||
+            _is_wechat_web_profile_cache_child "$path"; then
             _container_cache_path=true
         elif [[ "${MOLE_UNINSTALL_MODE:-0}" != "1" ]] && should_protect_data "$bundle_id"; then
             return 0
@@ -547,6 +600,12 @@ should_protect_path() {
             */Library/Caches/com.apple.siriactionsd.ShortcutsSandboxCache | */Library/Caches/com.apple.siriactionsd.ShortcutsSandboxCache/*)
             return 0
             ;;
+        # Google ID store and Clearcut queue. Deleting them while Gemini runs
+        # starts an unbounded write loop (#1607).
+        */Library/Caches/GIPPseudonymousID | */Library/Caches/GIPPseudonymousID/* | \
+            */Library/Caches/CCTClearcutLogger | */Library/Caches/CCTClearcutLogger/*)
+            return 0
+            ;;
         # Wallpaper and aerial screen saver assets are user-selected content.
         # Their download-time mtime does not indicate whether they are active,
         # and deleting them forces a large re-download and selection reset.
@@ -569,20 +628,23 @@ should_protect_path() {
         if [[ "${MOLE_UNINSTALL_MODE:-0}" == "1" ]]; then
             # Uninstall mode: first check if it's an uninstallable Apple app
             for pattern in "${APPLE_UNINSTALLABLE_APPS[@]}"; do
-                if bundle_matches_pattern "$path" "$pattern"; then
+                # shellcheck disable=SC2053 # unquoted RHS is the glob, as in bundle_matches_pattern
+                if [[ -n "$pattern" && "$path" == $pattern ]]; then
                     return 1 # Can be uninstalled
                 fi
             done
             # Then check system-critical components
             for pattern in "${SYSTEM_CRITICAL_BUNDLES[@]}"; do
-                if bundle_matches_pattern "$path" "$pattern"; then
+                # shellcheck disable=SC2053 # unquoted RHS is the glob, as in bundle_matches_pattern
+                if [[ -n "$pattern" && "$path" == $pattern ]]; then
                     return 0
                 fi
             done
         else
             # Normal mode (cleanup): protect both system-critical and data-protected bundles
             for pattern in "${SYSTEM_CRITICAL_BUNDLES[@]}" "${DATA_PROTECTED_BUNDLES[@]}"; do
-                if bundle_matches_pattern "$path" "$pattern"; then
+                # shellcheck disable=SC2053 # unquoted RHS is the glob, as in bundle_matches_pattern
+                if [[ -n "$pattern" && "$path" == $pattern ]]; then
                     return 0
                 fi
             done
@@ -663,7 +725,7 @@ is_path_whitelisted() {
 }
 
 _mole_uninstall_lower() {
-    printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'
+    printf '%s' "${1:-}" | /usr/bin/tr '[:upper:]' '[:lower:]'
 }
 
 _mole_uninstall_is_common_app_name() {
@@ -714,6 +776,17 @@ _mole_uninstall_name_variant_matches() {
     return 1
 }
 
+# IDEs glue a year and version to their product name. A bare prefix also
+# claims sibling products and backups, which an uninstall does not own.
+_mole_uninstall_versioned_product_matches() {
+    local leaf="$1" product="$2"
+    [[ -n "$product" ]] || return 1
+    [[ "$leaf" == "$product" ]] && return 0
+    [[ "$leaf" == "$product"* ]] || return 1
+    local version="${leaf#"$product"}"
+    [[ "$version" =~ ^[0-9]{4}(\.[0-9]+)+$ ]]
+}
+
 # Materialize a completed, bounded find before any uninstall plan consumes it.
 # Process substitution hides the producer status and can expose a partial
 # prefix after timeout. A failed ordinary find therefore contributes no
@@ -736,11 +809,66 @@ _mole_uninstall_materialize_find0() {
         "$@" < /dev/null > "$output_file" 2> /dev/null || scan_rc=$?
     if [[ $scan_rc -ne 0 ]]; then
         : > "$output_file" || true
-        if [[ $scan_rc -eq 124 || $scan_rc -ge 128 ]]; then
+        if mole_rc_timeout_or_signal "$scan_rc"; then
             return "$scan_rc"
         fi
         debug_log "Skipping incomplete uninstall discovery root: ${1:-unknown}"
         return 0
+    fi
+    return 0
+}
+
+# Exact bundle-ID filenames identify the app's own agent. Other labels need a
+# readable plist whose launchd program resolves inside the selected bundle;
+# name matches and text mentions do not establish that ownership. Callers
+# recheck before teardown and removal. Returns 0 for owned, 1 for unproven,
+# or the timeout/signal status of a bounded plist probe.
+mole_uninstall_launch_agent_owned_by_app() {
+    local plist="$1"
+    local bundle_id="$2"
+    local app_path="$3"
+
+    case "${plist%/*}" in
+        "$HOME"/Library/LaunchAgents | /Library/LaunchAgents | /Library/LaunchDaemons) ;;
+        *) return 1 ;;
+    esac
+    [[ "$plist" == *.plist ]] || return 1
+    [[ -f "$plist" && ! -L "$plist" ]] || return 1
+    [[ "${plist##*/}" != com.apple.* ]] || return 1
+    if mole_is_reverse_dns_bundle_id "$bundle_id" &&
+        [[ "${plist##*/}" == "$bundle_id.plist" ]]; then
+        return 0
+    fi
+    [[ "$app_path" == /* && "$app_path" != / ]] || return 1
+
+    local deadline="${_MOLE_UNINSTALL_DISCOVERY_DEADLINE:-$((SECONDS + MOLE_TIMEOUT_QUICK_DETECT_SEC))}"
+    local timeout=""
+    timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        "$deadline") || return $?
+    local program="" probe_rc=0
+    program=$(run_with_timeout "$timeout" plutil -extract Program raw \
+        "$plist" 2> /dev/null) || probe_rc=$?
+    mole_rc_timeout_or_signal "$probe_rc" && return "$probe_rc"
+    if [[ $probe_rc -ne 0 ]]; then
+        timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+            "$deadline") || return $?
+        probe_rc=0
+        program=$(run_with_timeout "$timeout" plutil -extract \
+            ProgramArguments.0 raw "$plist" 2> /dev/null) || probe_rc=$?
+        mole_rc_timeout_or_signal "$probe_rc" && return "$probe_rc"
+        [[ $probe_rc -eq 0 ]] || return 1
+    fi
+
+    [[ "$program" == "$app_path"/* &&
+        ! "$program" =~ (^|/)\.\.(\/|$) &&
+        ! "$program" =~ [[:cntrl:]] ]] || return 1
+    if [[ -d "$app_path" ]]; then
+        [[ -f "$program" && ! -L "$program" ]] || return 1
+        local app_root="" program_parent=""
+        app_root=$(cd -P "$app_path" 2> /dev/null && pwd -P) || return 1
+        program_parent=$(cd -P "${program%/*}" 2> /dev/null && pwd -P) || return 1
+        [[ "$program_parent" == "$app_root" ||
+            "$program_parent" == "$app_root"/* ]] || return 1
     fi
     return 0
 }
@@ -872,7 +1000,7 @@ _path_belongs_to_independent_cli() {
     local base parent lc_name
     base="${path##*/}"
     parent="${path%/*}"
-    lc_name=$(printf '%s' "${base#.}" | tr '[:upper:]' '[:lower:]')
+    lc_name=$(printf '%s' "${base#.}" | /usr/bin/tr '[:upper:]' '[:lower:]')
     [[ -z "$lc_name" ]] && return 1
 
     case "$lc_name" in
@@ -891,6 +1019,67 @@ _path_belongs_to_independent_cli() {
             ;;
     esac
     return 1
+}
+
+# Metadata-backed leftovers use the same bounded owner probe at discovery
+# and immediately before their individual sink. A missing answer never owns it.
+mole_uninstall_jetbrains_selector() {
+    local app_path="$1" bundle_id="$2" selector="" rc=0 timeout=""
+    mole_ascii_lowercase bundle_id "$bundle_id"
+    [[ "$bundle_id" == com.jetbrains.* && -f "$app_path/Contents/Info.plist" &&
+        ! -L "$app_path/Contents/Info.plist" ]] || return 1
+    timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        "${_MOLE_UNINSTALL_DISCOVERY_DEADLINE:-$((SECONDS + MOLE_TIMEOUT_QUICK_DETECT_SEC))}") || return 1
+    selector=$(run_with_timeout "$timeout" /usr/libexec/PlistBuddy \
+        -c 'Print :JVMOptions:Properties:idea.paths.selector' \
+        "$app_path/Contents/Info.plist" 2> /dev/null) || rc=$?
+    mole_rc_signal "$rc" && return "$rc"
+    [[ $rc -eq 0 && "$selector" =~ ^[A-Za-z][A-Za-z0-9]*[0-9]{4}\.[0-9]+([.][0-9]+)?$ ]] || return 1
+    printf '%s\n' "$selector"
+}
+
+mole_uninstall_uuid_container_owned() {
+    local path="$1" bundle_id="$2" name="${1##*/}"
+    [[ "${path%/*}" == "$HOME/Library/Containers" && -d "$path" && ! -L "$path" ]] || return 1
+    [[ "$name" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || return 1
+    mole_is_reverse_dns_bundle_id "$bundle_id" || return 1
+    local metadata="$path/.com.apple.containermanagerd.metadata.plist"
+    [[ -f "$metadata" && ! -L "$metadata" ]] || return 1
+    local owner="" timeout="" rc=0
+    timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        "${_MOLE_UNINSTALL_DISCOVERY_DEADLINE:-$((SECONDS + MOLE_TIMEOUT_QUICK_DETECT_SEC))}") || return 1
+    owner=$(run_with_timeout "$timeout" /usr/bin/plutil -extract MCMMetadataIdentifier raw "$metadata" 2> /dev/null) || rc=$?
+    mole_rc_signal "$rc" && return "$rc"
+    [[ $rc -eq 0 && "$owner" == "$bundle_id" ]]
+}
+
+mole_uninstall_native_manifest_owned() {
+    local path="$1" app_path="$2"
+    [[ "${path%/*}" == "$HOME/Library/Application Support/"*/NativeMessagingHosts &&
+        "$path" == *.json && -f "$path" && ! -L "$path" &&
+        "$app_path" == /*.app && ! "$app_path" =~ [[:cntrl:]] ]] || return 1
+    local bytes="" host="" timeout="" rc=0
+    local _MOLE_UNINSTALL_DISCOVERY_DEADLINE="${_MOLE_UNINSTALL_DISCOVERY_DEADLINE:-$((SECONDS + MOLE_TIMEOUT_QUICK_DETECT_SEC))}"
+    timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        "$_MOLE_UNINSTALL_DISCOVERY_DEADLINE") || return 1
+    bytes=$(run_with_timeout "$timeout" "$STAT_BSD" -f%z "$path" 2> /dev/null) || rc=$?
+    mole_rc_signal "$rc" && return "$rc"
+    [[ $rc -eq 0 && "$bytes" =~ ^[0-9]+$ && ${#bytes} -le 5 && "$bytes" -le 65536 ]] || return 1
+    timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        "$_MOLE_UNINSTALL_DISCOVERY_DEADLINE") || return 1
+    host=$(run_with_timeout "$timeout" /usr/bin/plutil -extract path raw "$path" 2> /dev/null) || rc=$?
+    mole_rc_signal "$rc" && return "$rc"
+    [[ $rc -eq 0 && "$host" == "$app_path"/* &&
+        ! "$host" =~ (^|/)\.\.(/|$) && ! "$host" =~ [[:cntrl:]] ]] || return 1
+    # While the bundle exists, prove the executable's physical parent too.
+    # After its move the reviewed manifest hash pins this same launch target.
+    if [[ -d "$app_path" ]]; then
+        [[ -f "$host" && ! -L "$host" ]] || return 1
+        local app_root="" host_parent=""
+        app_root=$(cd -P "$app_path" 2> /dev/null && pwd -P) || return 1
+        host_parent=$(cd -P "${host%/*}" 2> /dev/null && pwd -P) || return 1
+        [[ "$host_parent" == "$app_root" || "$host_parent" == "$app_root"/* ]] || return 1
+    fi
 }
 
 _mole_uninstall_embedded_bundle_ids() {
@@ -922,7 +1111,8 @@ _mole_uninstall_embedded_bundle_ids() {
         bundle_root="${info%/Contents/Info.plist}"
         [[ "$bundle_root" != "$app_path" ]] || continue
         bundle_name="${bundle_root##*/}"
-        ext=$(printf '%s' "${bundle_name##*.}" | tr '[:upper:]' '[:lower:]')
+        # Extensions are ASCII; an unexpected byte only fails the match below.
+        mole_ascii_lowercase ext "${bundle_name##*.}"
 
         case "$ext" in
             xpc | appex) ;;
@@ -963,6 +1153,66 @@ _mole_uninstall_is_zed_channel() {
         "$name_lower" =~ ^zed([[:space:]]+(nightly|preview|beta|alpha|dev|canary|stable|release|rc|lts))?$ ]]
 }
 
+# PlayCover installs each iOS app as a flat bundle named <bundle-id>.app inside
+# its own container, and links a launcher alias into ~/Applications/PlayCover
+# whose every entry is a symlink back into that bundle (#1715).
+mole_playcover_apps_dir() {
+    printf '%s\n' "$HOME/Library/Containers/io.playcover.PlayCover/Applications"
+}
+
+# 0 when app_path is an installed PlayCover bundle: a real directory directly
+# in PlayCover's Applications dir with a root Info.plist and no Contents/.
+mole_is_playcover_app() {
+    local app_path="$1"
+    [[ "${app_path%/*}" == "$HOME/Library/Containers/io.playcover.PlayCover/Applications" ]] || return 1
+    [[ -d "$app_path" && ! -L "$app_path" ]] || return 1
+    [[ -f "$app_path/Info.plist" && ! -L "$app_path/Info.plist" ]] || return 1
+    [[ ! -e "$app_path/Contents" && ! -L "$app_path/Contents" ]]
+}
+
+# Prints the installed bundle a PlayCover launcher alias points at. Only a real
+# directory directly in ~/Applications/PlayCover qualifies, and every link in it
+# must point at the same-named entry of one installed bundle. Info.plist is a
+# link in older aliases and a copy since PlayCover's macOS 27 change
+# (LaunchServices refuses to open the alias while it is a link); a copy must
+# carry the bundle's id. A Finder .DS_Store is the other regular file tolerated.
+mole_playcover_alias_target() {
+    local alias_path="$1"
+    [[ "${alias_path%/*}" == "$HOME/Applications/PlayCover" ]] || return 1
+    [[ -d "$alias_path" && ! -L "$alias_path" && -e "$alias_path/Info.plist" ]] || return 1
+
+    local target="" entry link name
+    for entry in "$alias_path"/* "$alias_path"/.[!.]* "$alias_path"/..?*; do
+        [[ -L "$entry" ]] || continue
+        link=$(readlink "$entry" 2> /dev/null) || return 1
+        name="${entry##*/}"
+        [[ "$link" == /*"/$name" ]] || return 1
+        if [[ -z "$target" ]]; then
+            target="${link%/"$name"}"
+        elif [[ "$link" != "$target/$name" ]]; then
+            return 1
+        fi
+    done
+    [[ -n "$target" ]] && mole_is_playcover_app "$target" || return 1
+
+    local alias_id="" bundle_id=""
+    for entry in "$alias_path"/* "$alias_path"/.[!.]* "$alias_path"/..?*; do
+        [[ -e "$entry" && ! -L "$entry" ]] || continue
+        case "${entry##*/}" in
+            .DS_Store) [[ -f "$entry" ]] && continue ;;
+            Info.plist)
+                if [[ -f "$entry" ]]; then
+                    alias_id=$(plutil -extract CFBundleIdentifier raw "$entry" 2> /dev/null || echo "")
+                    bundle_id=$(plutil -extract CFBundleIdentifier raw "$target/Info.plist" 2> /dev/null || echo "")
+                    [[ -n "$alias_id" && "$alias_id" == "$bundle_id" ]] && continue
+                fi
+                ;;
+        esac
+        return 1
+    done
+    printf '%s\n' "$target"
+}
+
 find_app_files() {
     local bundle_id="$1"
     local app_name="$2"
@@ -984,13 +1234,13 @@ find_app_files() {
     # Normalize app name for matching - generate all common naming variants
     # Apps use inconsistent naming: "Maestro Studio" vs "maestro-studio" vs "MaestroStudio"
     # Note: Using tr for lowercase conversion (Bash 3.2 compatible, no ${var,,} support)
-    local nospace_name="${app_name// /}"                                               # "Maestro Studio" -> "MaestroStudio"
-    local underscore_name="${app_name// /_}"                                           # "Maestro Studio" -> "Maestro_Studio"
-    local hyphen_name="${app_name// /-}"                                               # "Maestro Studio" -> "Maestro-Studio"
-    local lowercase_name=$(echo "$app_name" | tr '[:upper:]' '[:lower:]')              # "Zed Nightly" -> "zed nightly"
-    local lowercase_nospace=$(echo "$nospace_name" | tr '[:upper:]' '[:lower:]')       # "MaestroStudio" -> "maestrostudio"
-    local lowercase_hyphen=$(echo "$hyphen_name" | tr '[:upper:]' '[:lower:]')         # "Maestro-Studio" -> "maestro-studio"
-    local lowercase_underscore=$(echo "$underscore_name" | tr '[:upper:]' '[:lower:]') # "Maestro_Studio" -> "maestro_studio"
+    local nospace_name="${app_name// /}"                                                        # "Maestro Studio" -> "MaestroStudio"
+    local underscore_name="${app_name// /_}"                                                    # "Maestro Studio" -> "Maestro_Studio"
+    local hyphen_name="${app_name// /-}"                                                        # "Maestro Studio" -> "Maestro-Studio"
+    local lowercase_name=$(echo "$app_name" | /usr/bin/tr '[:upper:]' '[:lower:]')              # "Zed Nightly" -> "zed nightly"
+    local lowercase_nospace=$(echo "$nospace_name" | /usr/bin/tr '[:upper:]' '[:lower:]')       # "MaestroStudio" -> "maestrostudio"
+    local lowercase_hyphen=$(echo "$hyphen_name" | /usr/bin/tr '[:upper:]' '[:lower:]')         # "Maestro-Studio" -> "maestro-studio"
+    local lowercase_underscore=$(echo "$underscore_name" | /usr/bin/tr '[:upper:]' '[:lower:]') # "Maestro_Studio" -> "maestro_studio"
 
     # Extract base name by removing common version/channel suffixes
     # "Zed Nightly" -> "Zed", "Firefox Developer Edition" -> "Firefox"
@@ -1000,7 +1250,7 @@ find_app_files() {
     if [[ "$app_name" =~ ^(.+)[[:space:]]+(${version_suffixes})$ ]]; then
         base_name="${BASH_REMATCH[1]}"
     fi
-    local base_lowercase=$(echo "$base_name" | tr '[:upper:]' '[:lower:]') # "Zed" -> "zed"
+    local base_lowercase=$(echo "$base_name" | /usr/bin/tr '[:upper:]' '[:lower:]') # "Zed" -> "zed"
 
     # Only use bundle_id in literal paths or find patterns after reverse-DNS
     # validation. A malformed Info.plist should not be able to traverse out of
@@ -1075,7 +1325,41 @@ find_app_files() {
             "$HOME/Library/Input Methods/$bundle_id.app"
             "$HOME/Library/Autosave Information/$bundle_id"
             "$HOME/Library/SyncedPreferences/$bundle_id.plist"
+            # PLCrashReporter keeps one folder per bundle id under its own root (#1736).
+            "$HOME/Library/Caches/com.plausiblelabs.crashreporter.data/$bundle_id"
+            "$HOME/Library/Caches/$bundle_id.ShipIt"
+            "$HOME/Library/Caches/com.crashlytics.data/$bundle_id"
+            "$HOME/Library/Application Support/com.bugsnag.Bugsnag/$bundle_id"
         )
+        # The per-user Darwin cache root holds a folder named by the exact
+        # bundle id too. An unresolved root skips this one path, a signal stops.
+        local darwin_cache_root="" darwin_cache_rc=0
+        darwin_cache_root=$(mole_darwin_user_cache_root 2> /dev/null) || darwin_cache_rc=$?
+        if mole_rc_signal "$darwin_cache_rc" 2> /dev/null; then
+            return "$darwin_cache_rc"
+        fi
+        if [[ $darwin_cache_rc -eq 0 && -n "$darwin_cache_root" ]]; then
+            user_patterns+=("$darwin_cache_root/$bundle_id")
+        fi
+    fi
+
+    # Exact product leaves only; framework parents belong to many apps.
+    # Shared runtime names cannot establish an updater or crash-folder owner.
+    if [[ ${#app_name} -ge 3 && "$app_name" != *[/\\]* &&
+        ! "$app_name" =~ [[:cntrl:]] ]] &&
+        ! _mole_uninstall_is_common_app_name "$app_name" &&
+        [[ "$lowercase_name" != electron ]]; then
+        user_patterns+=(
+            "$HOME/Library/Caches/SentryCrash/$app_name"
+            "$HOME/Library/Caches/KSCrash/$app_name"
+        )
+        local updater_name
+        for updater_name in "$hyphen_name" "$lowercase_hyphen" "$nospace_name" "$lowercase_nospace"; do
+            user_patterns+=(
+                "$HOME/Library/Caches/$updater_name-updater"
+                "$HOME/Library/Application Support/Caches/$updater_name-updater"
+            )
+        done
     fi
 
     # A bundle id's last segment often names the data directory more precisely
@@ -1094,8 +1378,8 @@ find_app_files() {
         local bundle_leaf="${bundle_id##*.}"
         local app_name_nospace="${app_name// /}"
         local bundle_leaf_lower app_name_nospace_lower
-        bundle_leaf_lower=$(printf '%s' "$bundle_leaf" | tr '[:upper:]' '[:lower:]')
-        app_name_nospace_lower=$(printf '%s' "$app_name_nospace" | tr '[:upper:]' '[:lower:]')
+        bundle_leaf_lower=$(printf '%s' "$bundle_leaf" | /usr/bin/tr '[:upper:]' '[:lower:]')
+        app_name_nospace_lower=$(printf '%s' "$app_name_nospace" | /usr/bin/tr '[:upper:]' '[:lower:]')
         if [[ ${#bundle_leaf} -ge 8 && ${#app_name_nospace} -ge 3 &&
             "$bundle_leaf" != "$app_name" &&
             "$bundle_leaf" =~ [a-z][A-Z] &&
@@ -1201,6 +1485,10 @@ find_app_files() {
             debug_log "Skipping shared home state root: $expanded_path"
             continue
         fi
+        if _mole_is_steam_library_path "$expanded_path"; then
+            debug_log "Skipping Steam library root: $expanded_path"
+            continue
+        fi
 
         if _path_belongs_to_independent_cli "$expanded_path"; then
             debug_log "Skipping independent CLI dotdir: $expanded_path"
@@ -1251,22 +1539,6 @@ find_app_files() {
                 if mole_name_starts_with_bundle_id_boundary "$pref" "$bundle_id"; then
                     files_to_clean+=("$pref")
                 fi
-            done < "$discovery_scan_file"
-        fi
-
-        # User LaunchAgents: wildcard scan for helper plists (e.g., com.example.app.helper.plist)
-        if [[ -d ~/Library/LaunchAgents ]]; then
-            discovery_scan_rc=0
-            _mole_uninstall_materialize_find0 "$discovery_scan_file" \
-                "$HOME/Library/LaunchAgents" -maxdepth 1 \
-                \( -name "${bundle_id}.plist" -o -name "${bundle_id}.*.plist" \) \
-                -print0 || discovery_scan_rc=$?
-            if [[ $discovery_scan_rc -ne 0 ]]; then
-                rm -f -- "$discovery_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
-                return "$discovery_scan_rc"
-            fi
-            while IFS= read -r -d '' plist; do
-                files_to_clean+=("$plist")
             done < "$discovery_scan_file"
         fi
 
@@ -1323,6 +1595,55 @@ find_app_files() {
                     done
                 fi
                 [[ "$already_added" == "true" ]] || files_to_clean+=("$derived_path")
+            done < "$discovery_scan_file"
+        done
+    fi
+
+    # UUID container names carry no app identity; their owner metadata does.
+    if [[ "$bundle_id_valid" == true && -d "$HOME/Library/Containers" ]]; then
+        discovery_scan_rc=0
+        _mole_uninstall_materialize_find0 "$discovery_scan_file" \
+            "$HOME/Library/Containers" -mindepth 1 -maxdepth 1 -type d -print0 || discovery_scan_rc=$?
+        if [[ $discovery_scan_rc -ne 0 ]]; then
+            rm -f -- "$discovery_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+            return "$discovery_scan_rc"
+        fi
+        local candidate owner_rc
+        # shellcheck disable=SC2094 # On failure remove the tracked scan after its last read.
+        while IFS= read -r -d '' candidate; do
+            owner_rc=0
+            mole_uninstall_uuid_container_owned "$candidate" "$bundle_id" || owner_rc=$?
+            if mole_rc_timeout_or_signal "$owner_rc"; then
+                rm -f -- "$discovery_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+                return "$owner_rc"
+            fi
+            [[ $owner_rc -ne 0 ]] || files_to_clean+=("$candidate")
+        done < "$discovery_scan_file"
+    fi
+
+    # Only manifests launching into this exact app are owned. Inspect host
+    # registries directly, without traversing unrelated browser profile data.
+    if [[ "$bundle_id_valid" == true && "$app_path" == /*.app ]]; then
+        local hosts_root manifest manifest_rc
+        for hosts_root in "$HOME/Library/Application Support/"*/NativeMessagingHosts \
+            "$HOME/Library/Application Support/"*/*/NativeMessagingHosts; do
+            [[ -d "$hosts_root" && ! -L "$hosts_root" ]] || continue
+            discovery_scan_rc=0
+            _mole_uninstall_materialize_find0 "$discovery_scan_file" \
+                "$hosts_root" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0 || discovery_scan_rc=$?
+            if [[ $discovery_scan_rc -ne 0 ]]; then
+                rm -f -- "$discovery_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+                return "$discovery_scan_rc"
+            fi
+            # shellcheck disable=SC2094 # On failure remove the tracked scan after its last read.
+            while IFS= read -r -d '' manifest; do
+                manifest_rc=0
+                mole_uninstall_native_manifest_owned "$manifest" "$app_path" || manifest_rc=$?
+                if mole_rc_timeout_or_signal "$manifest_rc"; then
+                    rm -f -- "$discovery_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+                    return "$manifest_rc"
+                fi
+                [[ $manifest_rc -ne 0 ]] || files_to_clean+=("$manifest")
             done < "$discovery_scan_file"
         done
     fi
@@ -1390,34 +1711,55 @@ find_app_files() {
         done <<< "$embedded_ids_output"
     fi
 
-    # Launch Agents by name (special handling)
-    # Note: LaunchDaemons are system-level and handled in find_app_system_files()
-    # Minimum 5-char threshold prevents false positives (e.g., "Time" matching system agents)
-    # Short-name apps (e.g., Zoom, Arc) are still cleaned via bundle_id matching above
-    # Security: Common words are excluded to prevent matching unrelated plist files
-    if [[ "$collect_app_name_paths" == "true" && ${#app_name} -ge 5 ]] && [[ -d ~/Library/LaunchAgents ]]; then
-        # Skip generic words that collide with many unrelated LaunchAgents.
-        # Shared with the system-level scan in find_app_system_files();
-        # defined in app_protection_data.sh.
-        if [[ "$app_name" =~ ^(${LAUNCH_AGENT_NAME_COMMON_WORDS})$ ]]; then
-            debug_log "Skipping LaunchAgent name search for common word: $app_name"
-        else
-            discovery_scan_rc=0
-            _mole_uninstall_materialize_find0 "$discovery_scan_file" \
-                "$HOME/Library/LaunchAgents" -maxdepth 1 \
-                -name "*$app_name*.plist" -print0 || discovery_scan_rc=$?
-            if [[ $discovery_scan_rc -ne 0 ]]; then
-                rm -f -- "$discovery_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
-                return "$discovery_scan_rc"
-            fi
+    # Exact app-path ownership also covers agents with unrelated labels. Scan
+    # once, but probe familiar labels first so a crowded directory cannot use
+    # the shared deadline before the likely candidates are checked.
+    if [[ -d ~/Library/LaunchAgents ]]; then
+        local search_agent_name=false
+        if [[ "$collect_app_name_paths" == true && ${#app_name} -ge 5 ]] &&
+            ! [[ "$app_name" =~ ^(${LAUNCH_AGENT_NAME_COMMON_WORDS})$ ]]; then
+            search_agent_name=true
+        fi
+        discovery_scan_rc=0
+        _mole_uninstall_materialize_find0 "$discovery_scan_file" \
+            "$HOME/Library/LaunchAgents" -maxdepth 1 -type f \
+            -name '*.plist' -print0 || discovery_scan_rc=$?
+        if [[ $discovery_scan_rc -ne 0 ]]; then
+            rm -f -- "$discovery_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+            return "$discovery_scan_rc"
+        fi
+        local -a agent_phases=(named)
+        [[ "$app_path" == /* && "$app_path" != / ]] && agent_phases+=(other)
+        local agent_phase agent_scan_rc=0
+        for agent_phase in "${agent_phases[@]}"; do
             while IFS= read -r -d '' plist; do
-                local plist_name=$(basename "$plist")
-                # Skip Apple's LaunchAgents
-                if [[ "$plist_name" =~ ^com\.apple\. ]]; then
-                    continue
+                local plist_name="${plist##*/}"
+                local named_candidate=false
+                if [[ "$bundle_id_valid" == true &&
+                    ("$plist_name" == "$bundle_id.plist" ||
+                    "$plist_name" == "$bundle_id."*.plist) ]]; then
+                    named_candidate=true
                 fi
-                files_to_clean+=("$plist")
+                if [[ "$search_agent_name" == true &&
+                    "$plist_name" == *"$app_name"* ]]; then
+                    named_candidate=true
+                fi
+                [[ "$agent_phase" == named && "$named_candidate" != true ]] && continue
+                [[ "$agent_phase" == other && "$named_candidate" == true ]] && continue
+                local agent_rc=0
+                mole_uninstall_launch_agent_owned_by_app "$plist" \
+                    "$bundle_id" "$app_path" || agent_rc=$?
+                if mole_rc_timeout_or_signal "$agent_rc"; then
+                    agent_scan_rc=$agent_rc
+                    break
+                fi
+                [[ $agent_rc -eq 0 ]] && files_to_clean+=("$plist")
             done < "$discovery_scan_file"
+            [[ $agent_scan_rc -ne 0 ]] && break
+        done
+        if [[ $agent_scan_rc -ne 0 ]]; then
+            rm -f -- "$discovery_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+            return "$agent_scan_rc"
         fi
     fi
 
@@ -1445,9 +1787,10 @@ find_app_files() {
         # source); ~/DevEco-Studio (IDE config + license state); ~/Library/
         # Application Support/Huawei, ~/Library/Huawei, ~/.huawei, ~/.ohos
         # (Huawei account tokens, signed device profiles, SDK config). Only
-        # sweep cache and log roots; everything else is opt-in.
-        for d in ~/Library/Caches/Huawei ~/Library/Logs/Huawei; do
-            [[ -d "$d" ]] && files_to_clean+=("$d")
+        # sweep DevEco's own cache and log leaves; the Huawei roots are shared
+        # with other Huawei products.
+        for d in ~/Library/Caches/Huawei/DevEcoStudio* ~/Library/Logs/Huawei/DevEcoStudio*; do
+            [[ -d "$d" && ! -L "$d" ]] && files_to_clean+=("$d")
         done
     fi
 
@@ -1471,6 +1814,7 @@ find_app_files() {
                 return "$discovery_scan_rc"
             fi
             while IFS= read -r -d '' d; do
+                _mole_uninstall_versioned_product_matches "${d##*/}" "AndroidStudio" || continue
                 files_to_clean+=("$d")
             done < "$discovery_scan_file"
         fi
@@ -1489,6 +1833,7 @@ find_app_files() {
             "$HOME/Library/Developer/Xcode/watchOS DeviceSupport" \
             "$HOME/Library/Developer/Xcode/tvOS DeviceSupport" \
             "$HOME/Library/Developer/Xcode/xrOS DeviceSupport" \
+            "$HOME/Library/Developer/Xcode/visionOS DeviceSupport" \
             "$HOME/Library/Developer/CoreSimulator/Caches"; do
             [[ -d "$d" ]] && files_to_clean+=("$d")
         done
@@ -1508,15 +1853,40 @@ find_app_files() {
                 return "$discovery_scan_rc"
             fi
             while IFS= read -r -d '' d; do
+                _mole_uninstall_versioned_product_matches "${d##*/}" "$app_name" || continue
                 files_to_clean+=("$d")
             done < "$discovery_scan_file"
         done
     fi
 
-    # 5. Unity / Unreal / Godot
+    local selector_bundle_id
+    mole_ascii_lowercase selector_bundle_id "$bundle_id"
+    if [[ "$collect_toolchain_leftovers" == true && "$selector_bundle_id" == com.jetbrains.* && -n "$app_path" ]]; then
+        local selector="" selector_rc=0
+        if [[ "$app_path" == "${_MOLE_UNINSTALL_SELECTOR_APP:-}" ]]; then
+            selector="${_MOLE_UNINSTALL_SELECTED_SELECTOR:-}"
+            [[ -n "$selector" ]] || selector_rc=1
+        else
+            selector=$(mole_uninstall_jetbrains_selector "$app_path" "$bundle_id") || selector_rc=$?
+        fi
+        if mole_rc_timeout_or_signal "$selector_rc"; then
+            rm -f -- "$discovery_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+            return "$selector_rc"
+        fi
+        if [[ $selector_rc -eq 0 ]]; then
+            local selector_root
+            for selector_root in "$HOME/Library/Application Support/JetBrains" \
+                "$HOME/Library/Caches/JetBrains" "$HOME/Library/Logs/JetBrains" \
+                "$HOME/Library/Preferences"; do
+                [[ ! -d "$selector_root/$selector" ]] || files_to_clean+=("$selector_root/$selector")
+            done
+        fi
+    fi
+
+    # Unity and Epic roots hold shared engines, assets and licence state.
+    # An app uninstall cannot claim them; exact per-app caches above remain.
+    # 5. Godot
     if [[ "$collect_toolchain_leftovers" == "true" ]]; then
-        [[ "$app_name" =~ Unity|unity ]] && [[ -d ~/Library/Unity ]] && files_to_clean+=("$HOME/Library/Unity")
-        [[ "$app_name" =~ Unreal|unreal ]] && [[ -d ~/Library/Application\ Support/Epic ]] && files_to_clean+=("$HOME/Library/Application Support/Epic")
         [[ "$app_name" =~ Godot|godot ]] && [[ -d ~/Library/Application\ Support/Godot ]] && files_to_clean+=("$HOME/Library/Application Support/Godot")
     fi
 
@@ -1558,6 +1928,18 @@ find_app_files() {
     if [[ "$collect_toolchain_leftovers" == "true" ]] &&
         { [[ "$bundle_id" == "net.ankiweb.anki" ]] || [[ "$app_name" == "Anki" ]]; }; then
         [[ -d "$HOME/Library/Application Support/AnkiProgramFiles" ]] && files_to_clean+=("$HOME/Library/Application Support/AnkiProgramFiles")
+    fi
+
+    # Claude Desktop signed in to a third-party provider (Bedrock, Vertex or a
+    # gateway) appends "-3p" to its userData and log folders (2.31226.1), so the
+    # display-name patterns never reach them; one uninstall left 436 MB of
+    # Application Support/Claude-3p behind. Exact paths only: ~/.claude and
+    # ~/.local/share/claude belong to the Claude Code CLI (#993).
+    if [[ "$collect_toolchain_leftovers" == "true" && "$bundle_id" == "com.anthropic.claudefordesktop" ]]; then
+        local claude_3p_dir
+        for claude_3p_dir in "$HOME/Library/Application Support/Claude-3p" "$HOME/Library/Logs/Claude-3p"; do
+            [[ -d "$claude_3p_dir" && ! -L "$claude_3p_dir" ]] && files_to_clean+=("$claude_3p_dir")
+        done
     fi
 
     # 7. Raycast
@@ -1638,6 +2020,31 @@ find_app_files() {
         done < "$discovery_scan_file"
     fi
 
+    # PlayCover keeps per-app settings beside the installed bundle under exact
+    # <bundle-id> names, plus the launcher alias (#1715). PlayChain is the
+    # app's emulated keychain and stays, like every other keychain store.
+    if [[ "$bundle_id_valid" == "true" ]] && mole_is_playcover_app "$app_path" &&
+        [[ "${app_path##*/}" == "$bundle_id.app" ]]; then
+        local playcover_root="${app_path%/Applications/*}"
+        local playcover_file
+        for playcover_file in \
+            "$playcover_root/App Settings/$bundle_id.plist" \
+            "$playcover_root/Keymapping/$bundle_id.plist" \
+            "$playcover_root/Entitlements/$bundle_id.plist"; do
+            [[ -f "$playcover_file" && ! -L "$playcover_file" ]] && files_to_clean+=("$playcover_file")
+        done
+        # Current PlayCover keeps each app's key maps in a folder of that name;
+        # the .plist above is the older single-file layout.
+        [[ -d "$playcover_root/Keymapping/$bundle_id" && ! -L "$playcover_root/Keymapping/$bundle_id" ]] &&
+            files_to_clean+=("$playcover_root/Keymapping/$bundle_id")
+        local playcover_alias
+        for playcover_alias in "$HOME/Applications/PlayCover"/*.[aA][pP][pP]; do
+            [[ -d "$playcover_alias" ]] || continue
+            [[ "$(mole_playcover_alias_target "$playcover_alias" 2> /dev/null)" == "$app_path" ]] &&
+                files_to_clean+=("$playcover_alias")
+        done
+    fi
+
     # Preserve discovery order while collapsing exact duplicates. A leftover
     # can be found first through a bundle-id prefix and again through an
     # embedded extension id; it should be previewed and removed only once.
@@ -1685,8 +2092,13 @@ get_diagnostic_report_paths_for_app() {
             exec_name=$(grep -A1 "CFBundleExecutable" "$app_path/Contents/Info.plist" 2> /dev/null | grep "<string>" | sed -n 's/.*<string>\([^<]*\)<\/string>.*/\1/p' | head -1)
         fi
     fi
+    # Every unrenamed Electron app reports as Electron-*.ips; that prefix
+    # would take other apps' reports, so use the app name instead.
+    mole_is_shared_runtime_executable "$exec_name" && exec_name=""
     prefix="${exec_name:-$nospace_name}"
     [[ -z "$prefix" || ${#prefix} -lt 3 ]] && return 0
+    # The Electron runtime app itself has no reports of its own to claim.
+    mole_is_shared_runtime_executable "$prefix" && return 0
     local -a prefixes=("$prefix")
     if [[ "$prefix" != *" Helper" ]]; then
         prefixes+=("$prefix Helper")
@@ -1705,8 +2117,8 @@ get_diagnostic_report_paths_for_app() {
     fi
     while IFS= read -r -d '' f; do
         [[ -z "$f" ]] && continue
-        local base
-        base=$(basename "$f" 2> /dev/null)
+        # find -print0 paths never end in a slash.
+        local base="${f##*/}"
         local matched_prefix=false
         local report_prefix
         for report_prefix in "${prefixes[@]}"; do
@@ -1746,10 +2158,10 @@ find_app_system_files() {
     local nospace_name="${app_name// /}"
     local underscore_name="${app_name// /_}"
     local hyphen_name="${app_name// /-}"
-    local lowercase_name=$(echo "$app_name" | tr '[:upper:]' '[:lower:]')
-    local lowercase_nospace=$(echo "$nospace_name" | tr '[:upper:]' '[:lower:]')
-    local lowercase_hyphen=$(echo "$hyphen_name" | tr '[:upper:]' '[:lower:]')
-    local lowercase_underscore=$(echo "$underscore_name" | tr '[:upper:]' '[:lower:]')
+    local lowercase_name=$(echo "$app_name" | /usr/bin/tr '[:upper:]' '[:lower:]')
+    local lowercase_nospace=$(echo "$nospace_name" | /usr/bin/tr '[:upper:]' '[:lower:]')
+    local lowercase_hyphen=$(echo "$hyphen_name" | /usr/bin/tr '[:upper:]' '[:lower:]')
+    local lowercase_underscore=$(echo "$underscore_name" | /usr/bin/tr '[:upper:]' '[:lower:]')
 
     # Standard system path patterns
     local -a system_patterns=(
@@ -2064,7 +2476,7 @@ find_app_receipt_files() {
                     -f -s "$bom_file" < /dev/null 2> /dev/null) || bom_rc=$?
             fi
             if [[ $bom_rc -ne 0 ]]; then
-                if [[ $bom_rc -eq 124 || $bom_rc -ge 128 ]]; then
+                if mole_rc_timeout_or_signal "$bom_rc"; then
                     rm -f -- "$receipt_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
                     return "$bom_rc"
                 fi
@@ -2142,6 +2554,21 @@ receipt_payload_path_is_allowlisted() {
     return 1
 }
 
+# A CFBundleExecutable is attacker-controlled, and pgrep/pkill read their
+# argument as an extended regular expression: a crafted ".*" matches nearly
+# every process, turning a name-based probe or kill into a machine-wide one.
+# Escape the same ERE metacharacters as _mole_regex_escape (a backslash before
+# any other byte is undefined in POSIX ERE and GNU grep warns "stray \") and
+# reject the shapes a real executable name cannot have, so callers fail closed
+# instead of handing pgrep an empty pattern, which matches every process.
+_mole_process_pattern_literal() {
+    local value="${1:-}"
+
+    [[ -n "$value" ]] || return 1
+    [[ ! "$value" =~ [[:cntrl:]] ]] || return 1
+    printf '%s' "$value" | LC_ALL=C sed 's/[][(){}.^$*+?|\\]/\\&/g'
+}
+
 # Terminate a running application during uninstall.
 # The user has already confirmed removal, so after the graceful Quit Apple
 # Event we escalate through SIGTERM and SIGKILL (and one sudo retry when
@@ -2149,6 +2576,25 @@ receipt_payload_path_is_allowlisted() {
 # after "Uninstall complete". Apps that need to flush state get the graceful
 # Quit window first; apps that stall past it lose unsaved work, which the
 # user has implicitly accepted by confirming.
+# Poll after a signal so an already-exited app does not consume the whole
+# grace period. Keep the original two-second sleep budget and signal statuses.
+# The pattern is a name already escaped by _mole_process_pattern_literal, so
+# pgrep matches it as a literal instead of an ERE.
+_mole_wait_for_app_exit() {
+    local pattern="$1" ticks=20 probe_rc=0 sleep_rc=0
+    while :; do
+        probe_rc=0
+        pgrep -x "$pattern" > /dev/null 2>&1 || probe_rc=$?
+        [[ $probe_rc -ge 128 ]] && return "$probe_rc"
+        [[ $probe_rc -eq 0 ]] || return 0
+        [[ $ticks -gt 0 ]] || return 1
+        sleep_rc=0
+        sleep 0.1 || sleep_rc=$?
+        [[ $sleep_rc -ge 128 ]] && return "$sleep_rc"
+        ticks=$((ticks - 1))
+    done
+}
+
 force_kill_app() {
     local app_name="$1"
     local app_path="${2:-""}"
@@ -2163,11 +2609,15 @@ force_kill_app() {
     # precise than the display name (which may be localized).
     local exec_name=""
     local bundle_id=""
-    if [[ -n "$app_path" && -e "$app_path/Contents/Info.plist" ]]; then
+    local info_plist="$app_path/Contents/Info.plist"
+    # A flat PlayCover bundle keeps its plist at the root; falling back to the
+    # display name there could match a different app with the same name.
+    [[ -n "$app_path" ]] && mole_is_playcover_app "$app_path" && info_plist="$app_path/Info.plist"
+    if [[ -n "$app_path" && -e "$info_plist" ]]; then
         # Targeted key reads (see the CFBundleExecutable note above): defaults
         # read parses the entire plist for one value.
-        exec_name=$(plutil -extract CFBundleExecutable raw "$app_path/Contents/Info.plist" 2> /dev/null || echo "")
-        bundle_id=$(plutil -extract CFBundleIdentifier raw "$app_path/Contents/Info.plist" 2> /dev/null || echo "")
+        exec_name=$(plutil -extract CFBundleExecutable raw "$info_plist" 2> /dev/null || echo "")
+        bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist" 2> /dev/null || echo "")
     fi
 
     # Use executable name for precise matching, fallback to app name
@@ -2186,10 +2636,48 @@ force_kill_app() {
             return 1
             ;;
     esac
+    # A shared runtime name such as Electron matches every unrenamed Electron
+    # app, so name-based probes and kills would reach apps the user did not
+    # select. Only Apple Events addressed by bundle id stay exact: quit the app
+    # if it runs, and report it as possibly running when it does not exit.
+    if mole_is_shared_runtime_executable "$match_pattern"; then
+        debug_log "force_kill_app: no name-based kill for shared runtime executable '$match_pattern'"
+        [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]] && return 0
+        command -v osascript > /dev/null 2>&1 || return 1
+        mole_is_reverse_dns_bundle_id "$bundle_id" || return 1
+        local shared_state="" shared_rc=0 shared_wait=20
+        while true; do
+            shared_rc=0
+            shared_state=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" \
+                osascript -e "application id \"$bundle_id\" is running" 2> /dev/null < /dev/null) || shared_rc=$?
+            [[ $shared_rc -ge 128 ]] && return "$shared_rc"
+            [[ $shared_rc -eq 0 && "$shared_state" == "false" ]] && return 0
+            [[ $shared_rc -eq 0 && "$shared_state" == "true" ]] || return 1
+            [[ $shared_wait -gt 0 ]] || return 1
+            if [[ $shared_wait -eq 20 ]]; then
+                run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" \
+                    osascript -e "tell application id \"$bundle_id\" to quit" > /dev/null 2>&1 < /dev/null || shared_rc=$?
+                [[ $shared_rc -ge 128 ]] && return "$shared_rc"
+            fi
+            sleep 0.1 || return $?
+            shared_wait=$((shared_wait - 1))
+        done
+    fi
+
+    # match_pattern comes from the bundle, not from Mole: probe and signal its
+    # literal name only. A name that cannot be a real process name (empty or
+    # holding a control byte) is refused instead of reaching pgrep, whose
+    # empty pattern matches every process.
+    local escaped_pattern="" pattern_rc=0
+    escaped_pattern=$(_mole_process_pattern_literal "$match_pattern") || pattern_rc=$?
+    if [[ $pattern_rc -ne 0 ]]; then
+        debug_log "force_kill_app: refusing unsafe process pattern '$match_pattern'"
+        return 1
+    fi
 
     # Check if process is running using exact match only
     local process_probe_rc=0
-    pgrep -x "$match_pattern" > /dev/null 2>&1 || process_probe_rc=$?
+    pgrep -x "$escaped_pattern" > /dev/null 2>&1 || process_probe_rc=$?
     [[ $process_probe_rc -ge 128 ]] && return "$process_probe_rc"
     if [[ $process_probe_rc -ne 0 ]]; then
         return 0
@@ -2219,7 +2707,7 @@ force_kill_app() {
         local quit_wait=20
         while [[ $quit_wait -gt 0 ]]; do
             process_probe_rc=0
-            pgrep -x "$match_pattern" > /dev/null 2>&1 || process_probe_rc=$?
+            pgrep -x "$escaped_pattern" > /dev/null 2>&1 || process_probe_rc=$?
             [[ $process_probe_rc -ge 128 ]] && return "$process_probe_rc"
             [[ $process_probe_rc -eq 0 ]] || break
             local sleep_rc=0
@@ -2234,7 +2722,7 @@ force_kill_app() {
 
     # Graceful Quit landed: skip the kill ladder entirely.
     process_probe_rc=0
-    pgrep -x "$match_pattern" > /dev/null 2>&1 || process_probe_rc=$?
+    pgrep -x "$escaped_pattern" > /dev/null 2>&1 || process_probe_rc=$?
     [[ $process_probe_rc -ge 128 ]] && return "$process_probe_rc"
     if [[ $process_probe_rc -ne 0 ]]; then
         return 0
@@ -2245,26 +2733,26 @@ force_kill_app() {
     # confirmed uninstall, so a still-running process at this point is
     # blocking a clean result and we trade unsaved state for that.
     local kill_rc=0
-    pkill -x "$match_pattern" 2> /dev/null || kill_rc=$?
+    pkill -x "$escaped_pattern" 2> /dev/null || kill_rc=$?
     [[ $kill_rc -ge 128 ]] && return "$kill_rc"
     local sleep_rc=0
-    sleep 2 || sleep_rc=$?
+    _mole_wait_for_app_exit "$escaped_pattern" || sleep_rc=$?
     [[ $sleep_rc -ge 128 ]] && return "$sleep_rc"
     process_probe_rc=0
-    pgrep -x "$match_pattern" > /dev/null 2>&1 || process_probe_rc=$?
+    pgrep -x "$escaped_pattern" > /dev/null 2>&1 || process_probe_rc=$?
     [[ $process_probe_rc -ge 128 ]] && return "$process_probe_rc"
     if [[ $process_probe_rc -ne 0 ]]; then
         return 0
     fi
 
     kill_rc=0
-    pkill -9 -x "$match_pattern" 2> /dev/null || kill_rc=$?
+    pkill -9 -x "$escaped_pattern" 2> /dev/null || kill_rc=$?
     [[ $kill_rc -ge 128 ]] && return "$kill_rc"
     sleep_rc=0
-    sleep 2 || sleep_rc=$?
+    _mole_wait_for_app_exit "$escaped_pattern" || sleep_rc=$?
     [[ $sleep_rc -ge 128 ]] && return "$sleep_rc"
     process_probe_rc=0
-    pgrep -x "$match_pattern" > /dev/null 2>&1 || process_probe_rc=$?
+    pgrep -x "$escaped_pattern" > /dev/null 2>&1 || process_probe_rc=$?
     [[ $process_probe_rc -ge 128 ]] && return "$process_probe_rc"
     if [[ $process_probe_rc -ne 0 ]]; then
         return 0
@@ -2278,10 +2766,10 @@ force_kill_app() {
     fi
     if [[ $sudo_probe_rc -eq 0 ]]; then
         kill_rc=0
-        sudo pkill -9 -x "$match_pattern" 2> /dev/null || kill_rc=$?
+        sudo pkill -9 -x "$escaped_pattern" 2> /dev/null || kill_rc=$?
         [[ $kill_rc -ge 128 ]] && return "$kill_rc"
         sleep_rc=0
-        sleep 2 || sleep_rc=$?
+        _mole_wait_for_app_exit "$escaped_pattern" || sleep_rc=$?
         [[ $sleep_rc -ge 128 ]] && return "$sleep_rc"
     fi
 
@@ -2290,7 +2778,7 @@ force_kill_app() {
     local retries=3
     while [[ $retries -gt 0 ]]; do
         process_probe_rc=0
-        pgrep -x "$match_pattern" > /dev/null 2>&1 || process_probe_rc=$?
+        pgrep -x "$escaped_pattern" > /dev/null 2>&1 || process_probe_rc=$?
         [[ $process_probe_rc -ge 128 ]] && return "$process_probe_rc"
         if [[ $process_probe_rc -ne 0 ]]; then
             return 0
@@ -2302,7 +2790,7 @@ force_kill_app() {
     done
 
     process_probe_rc=0
-    pgrep -x "$match_pattern" > /dev/null 2>&1 || process_probe_rc=$?
+    pgrep -x "$escaped_pattern" > /dev/null 2>&1 || process_probe_rc=$?
     [[ $process_probe_rc -ge 128 ]] && return "$process_probe_rc"
     [[ $process_probe_rc -eq 0 ]] && return 1
     return 0

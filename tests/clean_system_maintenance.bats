@@ -1,14 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-system-clean.XXXXXX")"
-    export HOME
+    mole_test_setup_home system-clean
 
     # Prevent AppleScript permission dialogs during tests
     MOLE_TEST_MODE=1
@@ -18,12 +13,7 @@ setup_file() {
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 # clean_deep_system reaches its two /private/var/folders sweeps through
@@ -31,9 +21,14 @@ teardown_file() {
 # plain "drop the timeout and run it" wrapper mock removes the production
 # bound as well. Each test then walked the host's real temp tree twice,
 # unbounded, for seconds. Intercept at the wrapper instead and hand back an
-# empty result, the same seam the code_sign_clone and GPU-cache tests below
-# already use to inject their fixtures.
+# empty result, the same seam the GPU-cache tests below use to inject their
+# fixtures. The browser clone stage reads the host's per-user temp dir (by
+# uid, not HOME) with the real ps, lsof and safe_remove, so tests that do not
+# exercise it run with the stage stubbed; tests/browser_clones.bats covers it
+# against fixtures. A test with its own run_with_timeout stubs it by hand.
 mock_run_with_timeout_skipping_var_folders() {
+    # shellcheck disable=SC2329  # Invoked by lib/clean/system.sh once defined.
+    clean_browser_code_sign_clones() { :; }
     # shellcheck disable=SC2329  # Invoked by lib/clean/system.sh once defined.
     run_with_timeout() {
         shift
@@ -45,35 +40,46 @@ mock_run_with_timeout_skipping_var_folders() {
 }
 export -f mock_run_with_timeout_skipping_var_folders
 
-@test "materialize_completed_system_scan discards a timed-out partial prefix" {
-    local slow_scan="$HOME/partial-system-scan.sh"
+@test "materialize_completed_system_scan discards every failed producer prefix" {
+    local producer="$HOME/partial-system-scan.sh"
     local trace="$HOME/partial-system-scan.trace"
-    cat > "$slow_scan" <<'SCRIPT'
+    cat > "$producer" <<'SCRIPT'
 #!/bin/bash
-printf 'started\n' >> "$SYSTEM_SCAN_TRACE"
+printf 'started:%s\n' "$PRODUCER_RC" >> "$SYSTEM_SCAN_TRACE"
 printf 'partial\0'
-exec sleep 4
+exit "$PRODUCER_RC"
 SCRIPT
-    chmod +x "$slow_scan"
+    chmod +x "$producer"
 
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" SLOW_SCAN="$slow_scan" \
-        SYSTEM_SCAN_TRACE="$trace" \
-        /bin/bash --noprofile --norc <<'SCRIPT'
+    local code
+    for code in 124 1 130; do
+        : > "$trace"
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PRODUCER="$producer" \
+            SYSTEM_SCAN_TRACE="$trace" PRODUCER_RC="$code" \
+            /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/system.sh"
+# The timeout backend has its own real-clock tests. This case exercises the
+# materializer's command boundary and complete-output contract deterministically.
+run_with_timeout() {
+    [[ $# -eq 2 && "$1" == 5 && "$2" == "$PRODUCER" ]] || return 99
+    shift
+    "$@"
+}
 scan_file=$(create_temp_file)
 rc=0
-materialize_completed_system_scan "$scan_file" 1 "$SLOW_SCAN" || rc=$?
+materialize_completed_system_scan "$scan_file" 5 "$PRODUCER" || rc=$?
 printf 'RC=%s\n' "$rc"
 printf 'BYTES=%s\n' "$(wc -c < "$scan_file" | tr -d ' ')"
 rm -f -- "$scan_file"
 SCRIPT
 
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"RC=124"* ]] || return 1
-    [[ "$(< "$trace")" == "started" ]] || return 1
-    [[ "$output" == *"BYTES=0"* ]]
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        [[ "$output" == *"RC=$code"* ]] || return 1
+        [[ "$(< "$trace")" == "started:$code" ]] || return 1
+        [[ "$output" == *"BYTES=0"* ]] || return 1
+    done
 }
 
 @test "materialize_completed_system_scan preserves NUL-delimited paths with newlines" {
@@ -89,16 +95,22 @@ SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/system.sh"
+run_with_timeout() {
+    [[ $# -eq 2 && "$1" == 5 && "$2" == "$PRODUCER" ]] || return 99
+    shift
+    "$@"
+}
 scan_file=$(create_temp_file)
-materialize_completed_system_scan "$scan_file" 1 "$PRODUCER"
+materialize_completed_system_scan "$scan_file" 5 "$PRODUCER"
 record=""
-IFS= read -r -d '' record < "$scan_file" || true
+IFS= read -r -d '' record < "$scan_file" || exit 1
 [[ "$record" == $'/Volumes/Backup/line\nbreak.inProgress' ]] || exit 1
+[[ "$(wc -c < "$scan_file" | tr -d ' ')" == 38 ]] || exit 1
 printf 'PRESERVED\n'
 rm -f -- "$scan_file"
 SCRIPT
 
-    [ "$status" -eq 0 ] || return 1
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [[ "$output" == "PRESERVED" ]]
 }
 
@@ -475,6 +487,7 @@ stop_section_spinner() { :; }
 get_file_mtime() { echo 0; }
 get_path_size_kb() { echo 0; }
 find() { return 0; }
+clean_browser_code_sign_clones() { :; }
 run_with_timeout() {
     local _timeout="$1"
     shift
@@ -536,6 +549,7 @@ stop_section_spinner() { :; }
 get_file_mtime() { echo 0; }
 get_path_size_kb() { echo 0; }
 find() { return 0; }
+clean_browser_code_sign_clones() { :; }
 run_with_timeout() {
     local _timeout="$1"
     shift
@@ -605,8 +619,8 @@ clean_local_snapshots
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Time Machine local snapshots ·"* ]] || return 1
-    [[ "$output" == *"tmutil listlocalsnapshots /"* ]]
+    [[ "$output" == *"Time Machine local snapshots · "*"2"*"macOS removes them when space runs low"* ]] || return 1
+    [[ "$output" != *"tmutil"* ]]
 }
 
 @test "clean_local_snapshots is quiet when no snapshots" {
@@ -694,6 +708,137 @@ EOF
     [[ "$output" == *"Homebrew cleanup"* ]]
 }
 
+@test "clean_homebrew runs cleanup even when the download cache is small" {
+    # Old formula versions live in the Cellar, not in ~/Library/Caches/Homebrew,
+    # so a nearly empty cache said nothing about what cleanup would free. On
+    # the maintainer's Mac 881MB of 930MB was old Cellar versions.
+    run /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/brew.sh"
+
+mkdir -p "$HOME/.cache/mole" "$HOME/Library/Caches/Homebrew"
+rm -f "$HOME/.cache/mole/brew_last_cleanup"
+
+    start_inline_spinner(){ :; }
+    stop_inline_spinner(){ :; }
+    note_activity(){ :; }
+    run_with_timeout() {
+        shift
+        if [[ "$1" == "du" ]]; then
+            echo "1024 $3"
+            return 0
+        fi
+        "$@"
+    }
+    brew() {
+        case "$1" in
+            cleanup)
+                echo "Removing: /opt/homebrew/Cellar/node/24.1.0... (2,011 files, 88.5MB)"
+                echo "==> This operation has freed approximately 88.5MB of disk space."
+                return 0
+                ;;
+            *) return 0 ;;
+        esac
+    }
+
+    clean_homebrew
+    [[ -s "$HOME/.cache/mole/brew_last_cleanup" ]] || { echo "no timestamp after success"; exit 1; }
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Homebrew cleanup"* ]] || { echo "$output"; return 1; }
+}
+
+@test "clean_homebrew leaves no timestamp when cleanup times out" {
+    run /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/brew.sh"
+
+mkdir -p "$HOME/.cache/mole"
+rm -f "$HOME/.cache/mole/brew_last_cleanup"
+
+    start_inline_spinner(){ :; }
+    stop_inline_spinner(){ :; }
+    note_activity(){ :; }
+    run_with_timeout() {
+        shift
+        if [[ "$1" == "brew" && "$2" == "cleanup" ]]; then
+            return 124
+        fi
+        "$@"
+    }
+    brew() { return 0; }
+
+    clean_homebrew
+    [[ ! -e "$HOME/.cache/mole/brew_last_cleanup" ]] || { echo "a timed-out cleanup was stamped"; exit 1; }
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"timed out"* ]] || { echo "$output"; return 1; }
+}
+
+@test "clean_homebrew stops on an interrupted cleanup after restoring active links" {
+    # Ctrl-C while `brew cleanup` holds the terminal reaches only the child.
+    # A signal stops the run once the active links are back; a plain failure
+    # or a timeout leaves the stamp unset and carries on to the autoremove
+    # preview.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_CURRENT_COMMAND=clean \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/brew.sh"
+
+TEST_BREW_PREFIX="$HOME/homebrew-interrupt"
+TEST_BREW_CELLAR="$TEST_BREW_PREFIX/Cellar"
+TEST_TRACE="$HOME/homebrew-interrupt.trace"
+mkdir -p "$TEST_BREW_PREFIX/bin" "$TEST_BREW_CELLAR/node/26.4.0/bin" "$HOME/Library/Caches/Homebrew" "$HOME/.cache/mole"
+printf '#!/bin/sh\n' > "$TEST_BREW_CELLAR/node/26.4.0/bin/node"
+
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+ensure_user_file() { mkdir -p "$(dirname "$1")"; : > "$1"; }
+run_with_timeout() { shift; "$@"; }
+brew() {
+    case "$*" in
+        --prefix) printf '%s\n' "$TEST_BREW_PREFIX" ;;
+        --cellar) printf '%s\n' "$TEST_BREW_CELLAR" ;;
+        "cleanup --prune=30")
+            rm -f "$TEST_BREW_PREFIX/bin/node"
+            return "$BREW_CLEANUP_RC"
+            ;;
+        "autoremove --dry-run") echo autoremove >> "$TEST_TRACE" ;;
+        *) return 0 ;;
+    esac
+}
+
+for BREW_CLEANUP_RC in 130 143 1 124; do
+    rm -f "$HOME/.cache/mole/brew_last_cleanup" "$TEST_TRACE" "$TEST_BREW_PREFIX/bin/node"
+    : > "$TEST_TRACE"
+    ln -s ../Cellar/node/26.4.0/bin/node "$TEST_BREW_PREFIX/bin/node"
+    MOLE_CLEAN_CANCEL_STATUS=0
+    rc=0
+    clean_homebrew > /dev/null || rc=$?
+    restored=no
+    [[ -L "$TEST_BREW_PREFIX/bin/node" ]] && restored=yes
+    stamped=no
+    [[ -e "$HOME/.cache/mole/brew_last_cleanup" ]] && stamped=yes
+    printf 'BREW=%s RC=%s CANCEL=%s RESTORED=%s STAMPED=%s AUTOREMOVE=%s\n' \
+        "$BREW_CLEANUP_RC" "$rc" "$MOLE_CLEAN_CANCEL_STATUS" "$restored" "$stamped" \
+        "$(grep -c '^autoremove$' "$TEST_TRACE" || true)"
+done
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"BREW=130 RC=130 CANCEL=130 RESTORED=yes STAMPED=no AUTOREMOVE=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"BREW=143 RC=143 CANCEL=143 RESTORED=yes STAMPED=no AUTOREMOVE=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"BREW=1 RC=0 CANCEL=0 RESTORED=yes STAMPED=no AUTOREMOVE=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"BREW=124 RC=0 CANCEL=0 RESTORED=yes STAMPED=no AUTOREMOVE=1"* ]] || { echo "$output"; return 1; }
+}
+
 @test "clean_homebrew prevents cleanup from implicitly autoremoving formulae" {
     run /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -746,9 +891,9 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"CALL:brew cleanup --prune=30 env_no_autoremove=1"* ]] || return 1
-    [[ "$output" == *"Homebrew autoremove would remove"* ]] || return 1
-    [[ "$output" == *"python@3.14"* ]] || return 1
-    [[ "$output" == *"Homebrew autoremove · skipped"* ]] || return 1
+    [[ "$output" == *"Homebrew unused dependencies · python@3.14 · remove with"*"brew autoremove"* ]] || return 1
+    [[ "$output" != *"==>"* ]] || return 1
+    [[ "$output" != *"skipped"* ]] || return 1
     [[ "$output" == *"CALL:brew autoremove --dry-run"* ]] || return 1
     [[ "$output" != *"REAL_AUTOREMOVE"* ]]
 }
@@ -894,7 +1039,7 @@ brew() {
 }
 
 clean_homebrew
-[[ ! -e "$TEST_BREW_PREFIX/bin/node" && ! -L "$TEST_BREW_PREFIX/bin/node" ]]
+[[ ! -e "$TEST_BREW_PREFIX/bin/node" && ! -L "$TEST_BREW_PREFIX/bin/node" ]] || exit 1
 [[ -f "$external_target" ]]
 EOF
 
@@ -992,7 +1137,7 @@ EOF
     [[ "$output" == *"Homebrew links · restored 1 active executable(s)"* ]]
 }
 
-@test "clean_homebrew dry-run shows brew autoremove preview without removing formulae" {
+@test "clean_homebrew dry-run previews cleanup and autoremove without removing anything" {
     run /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -1000,6 +1145,7 @@ source "$PROJECT_ROOT/lib/clean/brew.sh"
 
 calls="$HOME/brew_dry_run_calls.log"
 : > "$calls"
+rm -f "$HOME/.cache/mole/brew_last_cleanup"
 
 DRY_RUN=true
 run_with_timeout() {
@@ -1010,13 +1156,22 @@ run_with_timeout() {
 }
 brew() {
     case "$*" in
+        "cleanup --prune=30 --dry-run")
+            echo "Warning: Skipping aom: most recent version 3.15.1 not installed"
+            echo "Would remove: /opt/homebrew/Cellar/openjdk/26.0.2.1 (549 files, 397.6MB)"
+            echo "Would remove: $HOME/Library/Caches/Homebrew/wimlib--1.14.5_1 (0B)"
+            echo "Would remove: $HOME/Library/Caches/Homebrew/bootsnap/d2fe (1,587 files, 14MB)"
+            echo "Would remove (empty directory): /opt/homebrew/share/man/man4"
+            echo "==> This operation would free approximately 411.6MB of disk space."
+            return 0
+            ;;
         "autoremove --dry-run")
             echo "==> Would autoremove 1 unneeded formula:"
             echo "python@3.14"
             return 0
             ;;
-        "autoremove")
-            echo "REAL_AUTOREMOVE"
+        "cleanup --prune=30" | "autoremove")
+            echo "REAL_BREW_WRITE:$*"
             return 0
             ;;
         *)
@@ -1029,13 +1184,95 @@ clean_homebrew
 cat "$calls"
 EOF
 
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"Homebrew · would cleanup"* ]] || return 1
-    [[ "$output" == *"Homebrew autoremove would remove"* ]] || return 1
-    [[ "$output" == *"python@3.14"* ]] || return 1
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Homebrew cleanup · would free 411.6MB"* ]] || return 1
+    [[ "$output" == *"    openjdk 26.0.2.1 · 397.6MB"* ]] || return 1
+    [[ "$output" == *"    ~/Library/Caches/Homebrew/bootsnap/d2fe · 14MB"* ]] || return 1
+    [[ "$output" != *"wimlib"* ]] || return 1
+    [[ "$output" != *"Skipping"* ]] || return 1
+    [[ "$output" != *"man4"* ]] || return 1
+    [[ "$output" != *"Homebrew · would cleanup"* ]] || return 1
+    [[ "$output" == *"Homebrew unused dependencies · python@3.14 · remove with"*"brew autoremove"* ]] || return 1
+    [[ "$output" != *"Would autoremove"* ]] || return 1
+    [[ "$output" == *"CALL:brew cleanup --prune=30 --dry-run"* ]] || return 1
     [[ "$output" == *"CALL:brew autoremove --dry-run"* ]] || return 1
-    [[ "$output" != *"CALL:brew cleanup --prune=30"* ]] || return 1
-    [[ "$output" != *"REAL_AUTOREMOVE"* ]]
+    [[ "$output" != *$'CALL:brew cleanup --prune=30\n'* ]] || return 1
+    [[ "$output" != *"REAL_BREW_WRITE"* ]]
+}
+
+@test "clean_homebrew dry-run previews nothing when the real run would skip" {
+    # The real run skips within 7 days of a finished cleanup, so the preview
+    # must not promise one.
+    run /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/brew.sh"
+
+mkdir -p "$HOME/.cache/mole"
+date +%s > "$HOME/.cache/mole/brew_last_cleanup"
+
+DRY_RUN=true
+calls="$HOME/brew-calls.log"
+: > "$calls"
+# Pass through so the brew() stub below is what the previews reach.
+run_with_timeout() {
+    shift
+    "$@"
+}
+brew() {
+    echo "CALL:brew $*" >> "$calls"
+    case "$*" in
+        "cleanup --prune=30 --dry-run")
+            echo "UNEXPECTED_CLEANUP_PREVIEW"
+            return 0
+            ;;
+        "autoremove --dry-run")
+            echo "==> Would autoremove 1 unneeded formula:"
+            echo "UNEXPECTED_AUTOREMOVE_PREVIEW"
+            return 0
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+clean_homebrew
+cat "$calls"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"UNEXPECTED_CLEANUP_PREVIEW"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_AUTOREMOVE_PREVIEW"* ]] || return 1
+    [[ "$output" != *"CALL:brew"* ]] || return 1
+    [[ "$output" != *"Homebrew cleanup"* ]] || return 1
+    [[ "$output" != *"would cleanup"* ]]
+}
+
+@test "clean_homebrew dry-run names the manual command when the cleanup preview times out" {
+    run /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/brew.sh"
+
+rm -f "$HOME/.cache/mole/brew_last_cleanup"
+DRY_RUN=true
+run_with_timeout() {
+    local duration="$1"
+    shift
+    if [[ "$*" == "brew cleanup --prune=30 --dry-run" ]]; then
+        return 124
+    fi
+    "$@"
+}
+brew() { return 0; }
+
+clean_homebrew
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Homebrew cleanup preview timed out · run "* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"brew cleanup --dry-run"*" manually"* ]]
 }
 
 @test "run_with_timeout succeeds without GNU timeout" {
@@ -1247,7 +1484,8 @@ EOF
 }
 
 @test "clean_deep_system memory exception respects DRY_RUN flag" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
+    # bin/clean.sh --dry-run sets both; safe_remove honours only MOLE_DRY_RUN.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true MOLE_DRY_RUN=1 /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 CALL_LOG="$HOME/memory_exception_dryrun_calls.log"
 > "$CALL_LOG"
@@ -1452,143 +1690,45 @@ EOF
     [ -z "$output" ]
 }
 
-@test "clean_deep_system cleans code_sign_clone caches via safe_sudo_remove" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+@test "clean_deep_system routes signing clones through current-user guarded cleanup" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
-CALL_LOG="$HOME/code_sign_clone_calls.log"
-> "$CALL_LOG"
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/system.sh"
-
-sudo() {
-    if [[ "$1" == "test" ]]; then
-        return 1
-    fi
-    if [[ "$1" == "find" ]]; then
-        return 0
-    fi
-    return 0
-}
+sudo() { return 1; }
 safe_sudo_find_delete() { return 0; }
-safe_sudo_remove() {
-    echo "safe_sudo_remove:$1" >> "$CALL_LOG"
-    return 0
-}
-log_success() { echo "SUCCESS:$1" >> "$CALL_LOG"; }
 start_section_spinner() { :; }
 stop_section_spinner() { :; }
 find() { return 0; }
-run_with_timeout() {
-    local _timeout="$1"
-    shift
-    if [[ "${1:-}" == "/usr/bin/find" && "${2:-}" == "/private/var/folders" ]]; then
-        printf '%s\0' "/private/var/folders/test/a/X/demo.code_sign_clone"
-        return 0
-    fi
-    "$@"
-}
-
+run_with_timeout() { return 0; }
+safe_sudo_remove() { echo "UNEXPECTED_PARENT_REMOVAL:$1"; return 1; }
+clean_browser_code_sign_clones() { echo "GUARDED_CLONE_CLEANUP"; code_sign_cleaned=1; }
+log_success() { echo "SUCCESS:$1"; }
 clean_deep_system
-cat "$CALL_LOG"
-EOF
-
+SCRIPT
     [ "$status" -eq 0 ]
-    [[ "$output" == *"safe_sudo_remove:/private/var/folders/test/a/X/demo.code_sign_clone"* ]] || return 1
-    [[ "$output" == *"SUCCESS:Browser code signature caches"* ]]
+    [[ "$output" == *"GUARDED_CLONE_CLEANUP"* ]] || return 1
+    [[ "$output" == *"SUCCESS:Browser code signature caches"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_PARENT_REMOVAL"* ]]
 }
 
-@test "clean_deep_system skips code_sign_clone success when removal fails" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+@test "clean_deep_system does not report retained clones as cleaned" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
-CALL_LOG="$HOME/code_sign_clone_fail_calls.log"
-> "$CALL_LOG"
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/system.sh"
-
-sudo() {
-    if [[ "$1" == "test" ]]; then
-        return 1
-    fi
-    if [[ "$1" == "find" ]]; then
-        return 0
-    fi
-    return 0
-}
+sudo() { return 1; }
 safe_sudo_find_delete() { return 0; }
-safe_sudo_remove() {
-    echo "safe_sudo_remove:$1" >> "$CALL_LOG"
-    return 1
-}
-log_success() { echo "SUCCESS:$1" >> "$CALL_LOG"; }
 start_section_spinner() { :; }
 stop_section_spinner() { :; }
 find() { return 0; }
-run_with_timeout() {
-    local _timeout="$1"
-    shift
-    if [[ "${1:-}" == "/usr/bin/find" && "${2:-}" == "/private/var/folders" ]]; then
-        printf '%s\0' "/private/var/folders/test/a/X/demo.code_sign_clone"
-        return 0
-    fi
-    "$@"
-}
-
+run_with_timeout() { return 0; }
+clean_browser_code_sign_clones() { return 0; }
+log_success() { echo "SUCCESS:$1"; }
 clean_deep_system
-cat "$CALL_LOG"
-EOF
-
+SCRIPT
     [ "$status" -eq 0 ]
-    [[ "$output" == *"safe_sudo_remove:/private/var/folders/test/a/X/demo.code_sign_clone"* ]] || return 1
     [[ "$output" != *"SUCCESS:Browser code signature caches"* ]]
-}
-
-@test "clean_deep_system skips EDR code_sign clones (CrowdStrike Falcon tamper)" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
-set -euo pipefail
-CALL_LOG="$HOME/edr_code_sign_calls.log"
-> "$CALL_LOG"
-source "$PROJECT_ROOT/lib/core/common.sh"
-source "$PROJECT_ROOT/lib/clean/system.sh"
-
-sudo() {
-    if [[ "$1" == "test" ]]; then
-        return 1
-    fi
-    if [[ "$1" == "find" ]]; then
-        return 0
-    fi
-    return 0
-}
-safe_sudo_find_delete() { return 0; }
-safe_sudo_remove() {
-    echo "safe_sudo_remove:$1" >> "$CALL_LOG"
-    return 0
-}
-log_success() { echo "SUCCESS:$1" >> "$CALL_LOG"; }
-start_section_spinner() { :; }
-stop_section_spinner() { :; }
-find() { return 0; }
-run_with_timeout() {
-    local _timeout="$1"
-    shift
-    if [[ "${1:-}" == "/usr/bin/find" && "${2:-}" == "/private/var/folders" ]]; then
-        printf '%s\0' \
-            "/private/var/folders/test/a/X/com.crowdstrike.falcon.App.code_sign_clone" \
-            "/private/var/folders/test/a/X/demo.code_sign_clone"
-        return 0
-    fi
-    "$@"
-}
-
-clean_deep_system
-cat "$CALL_LOG"
-EOF
-
-    [ "$status" -eq 0 ]
-    # A normal (browser-style) code-sign clone is still reclaimed.
-    [[ "$output" == *"safe_sudo_remove:/private/var/folders/test/a/X/demo.code_sign_clone"* ]] || return 1
-    # The EDR agent's code-sign clone must never be deleted.
-    [[ "$output" != *"com.crowdstrike"* ]] || return 1
 }
 
 @test "clean_deep_system cleans CleanMyMac-observed rebuildable system caches" {
@@ -1673,8 +1813,8 @@ source "$PROJECT_ROOT/lib/clean/system.sh"
 is_rebuildable_gpu_cache_dir "/private/var/folders/test/a/C/com.example.App/com.apple.metal"
 is_rebuildable_gpu_cache_dir "/private/var/folders/test/a/C/com.example.App/com.apple.metalfe"
 is_rebuildable_gpu_cache_dir "/private/var/folders/test/a/C/com.example.App/com.apple.gpuarchiver"
-! is_rebuildable_gpu_cache_dir "/private/var/folders/test/a/T/com.example.App/com.apple.metal"
-! is_rebuildable_gpu_cache_dir "/private/var/folders/test/a/C/com.example.App/not-a-gpu-cache"
+! is_rebuildable_gpu_cache_dir "/private/var/folders/test/a/T/com.example.App/com.apple.metal" || exit 1
+! is_rebuildable_gpu_cache_dir "/private/var/folders/test/a/C/com.example.App/not-a-gpu-cache" || exit 1
 ! is_rebuildable_gpu_cache_dir "/Library/Extensions/com.example.driver/com.apple.metal"
 EOF
 
@@ -1727,13 +1867,12 @@ start_section_spinner() { :; }
 stop_section_spinner() { :; }
 find() { return 0; }
 gpu_cache_dir_is_stale() { return 0; }
+clean_browser_code_sign_clones() { :; }
 run_with_timeout() {
     local _timeout="$1"
     shift
-    # Answer only the GPU-cache scan. Matching on the bare "find /private/var/folders"
-    # prefix also swallowed the code_sign_clone sweep, which then received this GPU
-    # list and removed every entry in it, including the /T/ path this test asserts is
-    # never touched.
+    # Answer only the GPU-cache scan, which is the one carrying the com.apple.metal
+    # pattern; any other /private/var/folders find must not receive this list.
     if [[ "${1:-}" == "/usr/bin/find" && "${2:-}" == "/private/var/folders" && "$*" == *"com.apple.metal"* ]]; then
         printf 'find_args:%s\n' "$*" >> "$CALL_LOG"
         printf '%s\0' \
@@ -1785,6 +1924,7 @@ start_section_spinner() { :; }
 stop_section_spinner() { :; }
 find() { return 0; }
 gpu_cache_dir_is_stale() { return 0; }
+clean_browser_code_sign_clones() { :; }
 run_with_timeout() {
     local _timeout="$1"
     shift
@@ -2013,7 +2153,7 @@ execute_optimization spotlight_index_optimize
 [[ "$(optimize_outcome_count unchanged)" == 1 ]] || exit 1
 EOF
 
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [[ "$output" == *"Spotlight index already optimal"* ]]
 }
 
@@ -2230,13 +2370,305 @@ EOF
     # find's -path is a test, not a prune: without a container-level prune the
     # GPU scan walks the entire T/ temp tree to depth 8 (measured 217k dirs /
     # 19s on a dev machine, against an 8s budget) even though only C/ can
-    # match, so the step times out on every run. Same shape for the X/-only
-    # code-sign scan. Pin both prunes.
+    # match, so the step times out on every run. Signing clones now use
+    # the current user root directly and need no global X/ sweep.
     run grep -cF -- '\( -depth 3 ! -name C \) -prune' "$PROJECT_ROOT/lib/clean/system.sh"
     [ "$status" -eq 0 ] || return 1
     [ "$output" -ge 1 ] || return 1
 
-    run grep -cF -- '\( -depth 3 ! -name X \) -prune' "$PROJECT_ROOT/lib/clean/system.sh"
-    [ "$status" -eq 0 ] || return 1
-    [ "$output" -ge 1 ]
+    run grep -F -- '-name "*.code_sign_clone"' "$PROJECT_ROOT/lib/clean/system.sh"
+    [ "$status" -eq 1 ]
+}
+
+@test "autoremove preview is one review line naming up to three formulae" {
+    run /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/brew.sh"
+preview="$HOME/autoremove-preview"
+printf '==> Would autoremove 1 unneeded formula:\nllvm@22\n' > "$preview"
+show_brew_autoremove_preview "$preview"
+printf '==> Would autoremove 3 unneeded formulae:\nllvm@22\npython@3.13\nz\033]2;x\007std\n' > "$preview"
+show_brew_autoremove_preview "$preview"
+printf '==> Would autoremove 5 unneeded formulae:\na\nb\nc\nd\ne\n' > "$preview"
+show_brew_autoremove_preview "$preview"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$(printf '%s\n' "$output" | grep -c 'Homebrew unused dependencies')" -eq 3 ] || return 1
+    [[ "$output" == *"Homebrew unused dependencies · llvm@22 · remove with"* ]] || return 1
+    [[ "$output" == *"· llvm@22, python@3.13, z"* ]] || return 1
+    [[ "$output" != *$'\033]2;'* ]] || return 1
+    [[ "$output" == *"Homebrew unused dependencies · 5 formulae · remove with"* ]] || return 1
+    [[ "$output" != *"==>"* ]]
+}
+
+# Homebrew service logs. A fake prefix under the test HOME stands in for
+# /opt/homebrew (or /usr/local): `brew --prefix` answers it, lsof is a shell
+# function behind a pass-through run_with_timeout, and the real /opt/homebrew
+# is never read.
+make_brew_service_log_prefix() {
+    local prefix="$HOME/brew-prefix"
+    rm -rf "$prefix" "$HOME/outside-dir"
+    rm -f "$HOME/outside-target.log" "$HOME/hard-twin.log" "$HOME/clean-list.txt"
+    mkdir -p "$prefix/var/log/nginx/old" "$prefix/var/mysql" "$HOME/outside-dir"
+    printf 'stale\n' > "$prefix/var/log/php-fpm.log"
+    printf 'stale\n' > "$prefix/var/log/nginx/access.log"
+    printf 'rotated\n' > "$prefix/var/log/redis.log.1"
+    printf 'rotated\n' > "$prefix/var/log/nginx/error.log.2.gz"
+    printf 'open\n' > "$prefix/var/log/nginx/error.log"
+    printf 'fresh\n' > "$prefix/var/log/postgresql@17.log"
+    printf 'notes\n' > "$prefix/var/log/notes.txt"
+    printf 'deep\n' > "$prefix/var/log/nginx/old/deep.log"
+    printf 'db\n' > "$prefix/var/mysql/host.err"
+    printf 'db\n' > "$prefix/var/mysql/binlog.log"
+    printf 'target\n' > "$HOME/outside-target.log"
+    ln -s "$HOME/outside-target.log" "$prefix/var/log/link.log"
+    printf 'hard\n' > "$prefix/var/log/hard.log"
+    ln "$prefix/var/log/hard.log" "$HOME/hard-twin.log"
+    printf 'linked\n' > "$HOME/outside-dir/inner.log"
+    ln -s "$HOME/outside-dir" "$prefix/var/log/linked-dir"
+    local stale
+    for stale in php-fpm.log nginx/access.log redis.log.1 nginx/error.log.2.gz \
+        nginx/error.log notes.txt nginx/old/deep.log hard.log; do
+        touch -t 202001010000 "$prefix/var/log/$stale"
+    done
+    touch -t 202001010000 "$prefix/var/mysql/host.err" "$prefix/var/mysql/binlog.log" \
+        "$HOME/outside-target.log" "$HOME/outside-dir/inner.log"
+}
+
+run_brew_service_log_cleanup() {
+    local dry_run="$1"
+    local lsof_body="$2"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN_MODE="$dry_run" \
+        LSOF_BODY="$lsof_body" BREW_PREFIX="$HOME/brew-prefix" \
+        /bin/bash --noprofile --norc << 'EOF2'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+if [[ "$DRY_RUN_MODE" == "true" ]]; then
+    DRY_RUN=true
+    export MOLE_DRY_RUN=1
+else
+    DRY_RUN=false
+    export MOLE_DRY_RUN=0
+fi
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+_MOLE_COMPLETE_LSOF_MODE=direct
+EXPORT_LIST_FILE="$HOME/clean-list.txt"
+: > "$EXPORT_LIST_FILE"
+oplog_enabled() { return 1; }
+log_operation() { :; }
+note_activity() { :; }
+run_with_timeout() { shift; "$@"; }
+brew() {
+    [[ "$1" == "--prefix" ]] || return 1
+    printf '%s\n' "$BREW_PREFIX"
+}
+eval "lsof() { $LSOF_BODY; }"
+clean_homebrew_service_logs
+cat "$EXPORT_LIST_FILE"
+EOF2
+}
+
+@test "clean_homebrew_service_logs dry run lists only stale idle user logs" {
+    make_brew_service_log_prefix
+    local log_root="$HOME/brew-prefix/var/log"
+    # nginx holds error.log open, as a running service does.
+    run_brew_service_log_cleanup true \
+        "printf 'p611\nf5\nn%s\n' \"\$HOME/brew-prefix/var/log/nginx/error.log\"; return 1"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Homebrew service logs"*"4 items"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"$log_root/php-fpm.log  #"* ]] || return 1
+    [[ "$output" == *"$log_root/nginx/access.log  #"* ]] || return 1
+    [[ "$output" == *"$log_root/redis.log.1  #"* ]] || return 1
+    [[ "$output" == *"$log_root/nginx/error.log.2.gz  #"* ]] || return 1
+    [[ "$output" != *"$log_root/nginx/error.log  #"* ]] || return 1
+    [[ "$output" != *"postgresql@17.log"* ]] || return 1
+    [[ "$output" != *"notes.txt"* ]] || return 1
+    [[ "$output" != *"deep.log"* ]] || return 1
+    [[ "$output" != *"link.log"* ]] || return 1
+    [[ "$output" != *"hard.log"* ]] || return 1
+    [[ "$output" != *"inner.log"* ]] || return 1
+    [[ "$output" != *"mysql"* ]] || return 1
+    # Dry run removes nothing.
+    [[ -f "$log_root/php-fpm.log" && -f "$log_root/nginx/access.log" ]]
+}
+
+@test "clean_homebrew_service_logs removes stale logs and keeps open, fresh, linked and var state" {
+    make_brew_service_log_prefix
+    local log_root="$HOME/brew-prefix/var/log"
+    run_brew_service_log_cleanup false \
+        "local a; for a in \"\$@\"; do [[ \"\$a\" == */nginx/error.log ]] && { printf 'p611\nf5\nn%s\n' \"\$a\"; return 0; }; done; return 1"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ ! -e "$log_root/php-fpm.log" ]] || return 1
+    [[ ! -e "$log_root/nginx/access.log" ]] || return 1
+    [[ ! -e "$log_root/redis.log.1" ]] || return 1
+    [[ ! -e "$log_root/nginx/error.log.2.gz" ]] || return 1
+    [[ -f "$log_root/nginx/error.log" ]] || return 1
+    [[ -f "$log_root/postgresql@17.log" ]] || return 1
+    [[ -f "$log_root/notes.txt" ]] || return 1
+    [[ -f "$log_root/nginx/old/deep.log" ]] || return 1
+    [[ -L "$log_root/link.log" && -f "$HOME/outside-target.log" ]] || return 1
+    [[ -f "$log_root/hard.log" && -f "$HOME/hard-twin.log" ]] || return 1
+    [[ -L "$log_root/linked-dir" && -f "$HOME/outside-dir/inner.log" ]] || return 1
+    [[ -f "$HOME/brew-prefix/var/mysql/host.err" ]] || return 1
+    [[ -f "$HOME/brew-prefix/var/mysql/binlog.log" ]]
+}
+
+@test "clean_homebrew_service_logs keeps everything when the open state is unknown" {
+    make_brew_service_log_prefix
+    local log_root="$HOME/brew-prefix/var/log"
+    # lsof diagnostics are not a reliable "nothing open". Dry run has no sink
+    # probe, so this isolates the batch decision.
+    run_brew_service_log_cleanup true \
+        "printf 'lsof: WARNING: can not stat\n'; return 1"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ -f "$log_root/php-fpm.log" && -f "$log_root/nginx/access.log" ]] || return 1
+    [[ "$output" != *"Homebrew service logs"* ]] || return 1
+
+    # A name lsof reports under another spelling matches no candidate, so
+    # nothing can be ruled idle.
+    run_brew_service_log_cleanup true \
+        "printf 'p611\nf5\nn/OPT/HOMEBREW/var/log/nginx/error.log\n'; return 1"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"Homebrew service logs"* ]] || return 1
+
+    # No complete process view at all.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF2'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+_MOLE_COMPLETE_LSOF_MODE=unknown
+note_activity() { :; }
+run_with_timeout() { shift; "$@"; }
+brew() { printf '%s\n' "$HOME/brew-prefix"; }
+lsof() { return 1; }
+clean_homebrew_service_logs
+EOF2
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ -f "$log_root/php-fpm.log" && -f "$log_root/redis.log.1" ]]
+}
+
+@test "clean_homebrew_service_logs re-checks the open state at the sink" {
+    make_brew_service_log_prefix
+    local log_root="$HOME/brew-prefix/var/log"
+    # The batch probe (several names) reports nothing open; the per-file sink
+    # probe (one name) finds php-fpm writing again.
+    run_brew_service_log_cleanup false \
+        "if [[ \$# -le 4 && \"\${*: -1}\" == */php-fpm.log ]]; then printf 'p9\nf3\nn%s\n' \"\${*: -1}\"; return 0; fi; return 1"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ -f "$log_root/php-fpm.log" ]] || return 1
+    [[ ! -e "$log_root/nginx/access.log" ]]
+}
+
+@test "clean_homebrew_service_logs honors the whitelist" {
+    make_brew_service_log_prefix
+    local log_root="$HOME/brew-prefix/var/log"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF2'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+_MOLE_COMPLETE_LSOF_MODE=direct
+WHITELIST_PATTERNS=("$HOME/brew-prefix/var/log/nginx")
+oplog_enabled() { return 1; }
+log_operation() { :; }
+note_activity() { :; }
+run_with_timeout() { shift; "$@"; }
+brew() { printf '%s\n' "$HOME/brew-prefix"; }
+lsof() { return 1; }
+clean_homebrew_service_logs
+EOF2
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ -f "$log_root/nginx/access.log" ]] || return 1
+    [[ ! -e "$log_root/php-fpm.log" ]]
+}
+
+@test "brew_service_log_is_eligible rechecks shape, depth, links, owner and age at the sink" {
+    make_brew_service_log_prefix
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF2'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/brew.sh"
+_BREW_SERVICE_LOG_ROOT="$HOME/brew-prefix/var/log"
+_BREW_SERVICE_LOG_UID=$(id -u)
+r="$_BREW_SERVICE_LOG_ROOT"
+check() { if brew_service_log_is_eligible "$1"; then echo "yes:${1#"$r"/}"; else echo "no:${1#"$r"/}"; fi; }
+check "$r/php-fpm.log"
+check "$r/nginx/error.log.2.gz"
+check "$r/postgresql@17.log"
+check "$r/notes.txt"
+check "$r/nginx/old/deep.log"
+check "$r/link.log"
+check "$r/hard.log"
+check "$r/linked-dir/inner.log"
+check "$HOME/brew-prefix/var/mysql/binlog.log"
+_BREW_SERVICE_LOG_UID=$(( $(id -u) + 1 ))
+check "$r/php-fpm.log"
+EOF2
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local expected
+    expected=$'yes:php-fpm.log\nyes:nginx/error.log.2.gz\nno:postgresql@17.log\nno:notes.txt\nno:nginx/old/deep.log\nno:link.log\nno:hard.log\nno:linked-dir/inner.log\nno:'"$HOME"$'/brew-prefix/var/mysql/binlog.log\nno:php-fpm.log'
+    [[ "$output" == "$expected" ]] || { echo "$output"; return 1; }
+}
+
+@test "brew_service_log_is_eligible rejects names carrying a control character" {
+    make_brew_service_log_prefix
+    local log_root="$HOME/brew-prefix/var/log"
+    local newline_name=$'php-fpm.log\nnginx.log'
+    local tab_name=$'redis\t.log'
+    printf 'stale\n' > "$log_root/$newline_name"
+    printf 'stale\n' > "$log_root/nginx/$tab_name"
+    touch -t 202001010000 "$log_root/$newline_name" "$log_root/nginx/$tab_name"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF2'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/brew.sh"
+_BREW_SERVICE_LOG_ROOT="$HOME/brew-prefix/var/log"
+_BREW_SERVICE_LOG_UID=$(id -u)
+r="$_BREW_SERVICE_LOG_ROOT"
+check() { if brew_service_log_is_eligible "$1"; then echo yes; else echo no; fi; }
+check "$r/php-fpm.log"
+check "$r/"$'php-fpm.log\nnginx.log'
+check "$r/nginx/"$'redis\t.log'
+EOF2
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == $'yes\nno\nno' ]] || { echo "$output"; return 1; }
+}
+
+@test "_brew_service_log_delete_guard refuses a parent swapped for a link before binding" {
+    make_brew_service_log_prefix
+    local log_root="$HOME/brew-prefix/var/log"
+    mkdir -p "$HOME/swap-target"
+    printf 'keep\n' > "$HOME/swap-target/access.log"
+    touch -t 202001010000 "$HOME/swap-target/access.log"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF2'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/brew.sh"
+DRY_RUN=false
+_BREW_SERVICE_LOG_ROOT="$HOME/brew-prefix/var/log"
+_BREW_SERVICE_LOG_UID=$(id -u)
+r="$_BREW_SERVICE_LOG_ROOT"
+_mole_paths_have_open_handle() { return 1; }
+# Swap nginx for a link between the eligibility check and the snapshot.
+eval "_orig$(declare -f _mole_snapshot_path_identity)"
+_mole_snapshot_path_identity() {
+    if [[ ! -L "$r/nginx" ]]; then
+        mv "$r/nginx" "$r/nginx.real"
+        ln -s "$HOME/swap-target" "$r/nginx"
+    fi
+    _orig_mole_snapshot_path_identity "$@"
+}
+rc=0
+_brew_service_log_delete_guard "$r/nginx/access.log" || rc=$?
+echo "rc=$rc bound=${_MOLE_SAFE_CLEAN_BOUND_PATH:-}"
+EOF2
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "rc=1 bound=" ]] || { echo "$output"; return 1; }
+    [[ -f "$HOME/swap-target/access.log" ]]
 }

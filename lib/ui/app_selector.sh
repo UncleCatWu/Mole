@@ -9,6 +9,11 @@ set -euo pipefail
 format_app_display() {
     local display_name="$1" size="$2" last_used="$3"
 
+    # Display names come from app bundles and can carry terminal control bytes.
+    # This row is a rendering site only: apps_data keeps the stored name, and
+    # matching, sizes and removal plans are untouched.
+    display_name=$(mole_terminal_safe_text "$display_name")
+
     # Use common function from ui.sh to format last used time
     local compact_last_used
     compact_last_used=$(format_last_used_summary "$last_used")
@@ -103,7 +108,9 @@ select_apps_for_uninstall() {
     # Show loading for large lists (formatting can be slow due to width calculations)
     local app_count=${#apps_data[@]}
     local terminal_width=$(tput cols 2> /dev/null || echo 80)
-    if [[ $app_count -gt 100 ]]; then
+    # The uninstall scan already left a "Preparing app list..." line on its
+    # alternate screen.
+    if [[ $app_count -gt 100 && "${MOLE_ALT_SCREEN_ACTIVE:-}" != "1" ]]; then
         if [[ -t 2 ]]; then
             printf "\rPreparing %d applications...    " "$app_count" >&2
         fi
@@ -166,14 +173,15 @@ select_apps_for_uninstall() {
     local names_newline
     names_newline=$(printf '%s\n' "${names_arr[@]}")
 
-    # Clear loading message
-    if [[ $app_count -gt 100 ]]; then
+    # Clear loading message. On the uninstall alternate screen the menu header
+    # clears this line itself, so erasing it here would only blank the screen.
+    if [[ $app_count -gt 100 && "${MOLE_ALT_SCREEN_ACTIVE:-}" != "1" ]]; then
         if [[ -t 2 ]]; then
             printf "\r\033[K" >&2
         fi
     fi
 
-    drain_pending_input 0.2
+    drain_pending_input
 
     # Expose metadata for the paginated menu (optional inputs)
     # - MOLE_MENU_META_EPOCHS: numeric last_used_epoch per item
@@ -192,6 +200,12 @@ select_apps_for_uninstall() {
     export MOLE_MENU_FILTER_NAMES="$names_newline"
     export MOLE_MENU_IGNORE_INITIAL_ENTER=1
 
+    # The uninstall scan hands its "Preparing app list..." line to an inline
+    # spinner; stop it just before the menu draws over that line.
+    if declare -f stop_inline_spinner > /dev/null 2>&1; then
+        stop_inline_spinner
+    fi
+
     # Use paginated menu - result will be stored in MOLE_SELECTION_RESULT
     # Note: paginated_multi_select enters alternate screen and handles clearing
     MOLE_SELECTION_RESULT=""
@@ -200,7 +214,6 @@ select_apps_for_uninstall() {
 
     # Clean env leakage for safety
     unset MOLE_MENU_META_EPOCHS MOLE_MENU_META_SIZEKB MOLE_MENU_FILTER_NAMES MOLE_MENU_IGNORE_INITIAL_ENTER
-    # leave MOLE_MENU_SORT_DEFAULT untouched if user set it globally
 
     if [[ $exit_code -ne 0 ]]; then
         return 1

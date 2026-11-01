@@ -43,6 +43,18 @@ while IFS= read -r -d '' relative; do
         tests/tmp-* | .git/*) continue ;;
     esac
     [[ -e "$PROJECT_ROOT/$relative" || -L "$PROJECT_ROOT/$relative" ]] || continue
+    # A dirty index may still list children of a directory upstream converted
+    # to a symlink. Copy the lexical link once; never descend through it.
+    snapshot_parent="$relative"
+    snapshot_skip=false
+    while [[ "$snapshot_parent" == */* ]]; do
+        snapshot_parent="${snapshot_parent%/*}"
+        if [[ -L "$PROJECT_ROOT/$snapshot_parent" ]]; then
+            snapshot_skip=true
+            break
+        fi
+    done
+    [[ "$snapshot_skip" == false ]] || continue
     mkdir -p "$run_root/repo/$(dirname "$relative")"
     /bin/cp -P "$PROJECT_ROOT/$relative" "$run_root/repo/$relative"
 done < "$run_root/source-files"

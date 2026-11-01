@@ -103,7 +103,7 @@ func statusFixtureCommand(ctx context.Context, name string, args ...string) (str
         return "101 1 S 12.5 3.125 32768 FixtureWorker\n", nil
     case "ps aux":
         return "USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND\nfixture 101 12.5 3.125 65536 32768 ?? S 12:00 0:00 FixtureWorker\n", nil
-    case "sysctl -n hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu":
+    case "sysctl -n hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu", "/usr/sbin/sysctl -n hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu":
         return "2\n0\n", nil
     case "memory_pressure ":
         return "System-wide memory free percentage: normal\n", nil
@@ -131,6 +131,8 @@ func statusFixtureCommand(ctx context.Context, name string, args ...string) (str
         return "Internal: Yes\nSMART Status: Verified\n", nil
     case "diskutil info -plist /fixture":
         return `<?xml version="1.0"?><plist version="1.0"><dict><key>TotalSize</key><integer>8589934592</integer></dict></plist>`, nil
+    case "route -n get default":
+        return "interface: fixture0\n", nil
     case "scutil --proxy":
         return "<dictionary> {}\n", nil
     default:

@@ -2,13 +2,19 @@
 # Application Data Cleanup Module
 set -euo pipefail
 
-readonly ORPHAN_AGE_THRESHOLD=${ORPHAN_AGE_THRESHOLD:-${MOLE_ORPHAN_AGE_DAYS:-30}}
-readonly CLAUDE_VM_ORPHAN_AGE_THRESHOLD=${MOLE_CLAUDE_VM_ORPHAN_AGE_DAYS:-7}
+readonly ORPHAN_AGE_THRESHOLD=${MOLE_ORPHAN_AGE_DAYS:-30}
+readonly CLAUDE_VM_ORPHAN_AGE_THRESHOLD=7
 readonly INSTALLED_APPS_CACHE_COMPLETE_MARKER="# mole-installed-apps-cache:v3:complete"
-# Args: $1=target_dir, $2=label
+# Args: $1=target_dir, $2=label, optional $3=scan stderr file, $4...=find exclusions
 clean_ds_store_tree() {
     local target="$1"
     local label="$2"
+    local scan_errors="${3:-/dev/null}"
+    if [[ $# -ge 3 ]]; then
+        shift 3
+    else
+        shift 2
+    fi
     [[ -d "$target" ]] || return 0
     local file_count=0
     local total_bytes=0
@@ -26,20 +32,20 @@ clean_ds_store_tree() {
         -path "*/.git" -prune -o
         -path "*/Library/Caches" -prune -o
     )
-    local -a find_cmd=("find" "$target")
+    local -a find_cmd=("find" "-P" "$target")
     if [[ "$target" == "$HOME" ]]; then
         find_cmd+=("-maxdepth" "5")
     fi
-    find_cmd+=("${exclude_paths[@]}" "-type" "f" "-name" ".DS_Store" "-print0")
+    find_cmd+=("$@" "${exclude_paths[@]}" "-type" "f" "-name" ".DS_Store" "-print0")
     local scan_file=""
     scan_file=$(create_temp_file) || return 1
     local scan_rc=0
     run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" "${find_cmd[@]}" \
-        > "$scan_file" 2> /dev/null || scan_rc=$?
+        > "$scan_file" 2> "$scan_errors" || scan_rc=$?
     if [[ $scan_rc -ne 0 ]]; then
         rm -f -- "$scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
         [[ "$spinner_active" == "true" ]] && stop_section_spinner
-        [[ $scan_rc -eq 124 || $scan_rc -ge 128 ]] && return "$scan_rc"
+        mole_rc_timeout_or_signal "$scan_rc" && return "$scan_rc"
         return 1
     fi
 
@@ -61,7 +67,7 @@ clean_ds_store_tree() {
             local preview_size_kb=$(((size + 1023) / 1024))
             local preview_rc=0
             record_dry_run_cleanup_target "$ds_file" "$preview_size_kb" 1 true || preview_rc=$?
-            if [[ $preview_rc -eq 124 || $preview_rc -ge 128 ]]; then
+            if mole_rc_timeout_or_signal "$preview_rc"; then
                 delete_rc=$preview_rc
                 break
             elif [[ $preview_rc -ne 0 ]]; then
@@ -73,7 +79,7 @@ clean_ds_store_tree() {
             safe_remove "$ds_file" true "" "" \
                 "$ds_parent" "$ds_parent_id" "$ds_target_id" \
                 2> /dev/null || remove_rc=$?
-            if [[ $remove_rc -eq 124 || $remove_rc -ge 128 ]]; then
+            if mole_rc_timeout_or_signal "$remove_rc"; then
                 delete_rc=$remove_rc
                 break
             elif [[ $remove_rc -ne 0 ]]; then
@@ -99,11 +105,9 @@ clean_ds_store_tree() {
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$size_kb")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} $label${NC} · ${line_color}$file_count files, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} $label${NC} · ${line_color}$file_count files, $(colorize_human_size "${size_human}")"
         fi
-        files_cleaned=$((files_cleaned + file_count))
-        total_size_cleaned=$((total_size_cleaned + size_kb))
-        total_items=$((total_items + 1))
+        mole_add_cleaned_row "$file_count" "$size_kb"
         note_activity
     fi
     if [[ $delete_rc -ne 0 ]]; then
@@ -141,7 +145,7 @@ publish_installed_apps_cache() {
     return 0
 }
 
-# Orphaned app data (30+ days inactive). Env: ORPHAN_AGE_THRESHOLD, DRY_RUN
+# Orphaned app data (30+ days inactive). Env: DRY_RUN
 # Usage: scan_installed_apps "output_file"
 scan_installed_apps() {
     local installed_bundles="$1"
@@ -249,6 +253,14 @@ scan_installed_apps() {
                             break
                         fi
                     done
+                fi
+                # A PlayCover launcher alias has no Contents/ either; the strict
+                # alias check names the installed bundle that owns its id.
+                if [[ ! -f "$plist_path" ]]; then
+                    local playcover_bundle=""
+                    if playcover_bundle=$(mole_playcover_alias_target "$app_path" 2> /dev/null); then
+                        plist_path="$playcover_bundle/Info.plist"
+                    fi
                 fi
                 local bundle_id=""
                 if [[ ! -f "$plist_path" || ! -r "$plist_path" ]] ||
@@ -371,12 +383,20 @@ scan_installed_apps() {
     fi
     if [[ $app_scan_failed -ne 0 ]]; then
         # Surface the first unreadable bundle so the skip message is actionable
-        # without --debug. Workers append before exiting nonzero.
+        # without --debug. Workers append before exiting nonzero. The full
+        # path is what makes it actionable: a Caskroom staging copy or a
+        # bundle under another scan root cannot be found from its name alone,
+        # and /Applications is where a bare basename sends the user.
         MOLE_APP_SCAN_FAILURE_DETAIL=""
         if [[ -s "$scan_tmp_dir/scan_failures.list" ]]; then
             local raw_failure_detail=""
             raw_failure_detail=$(head -1 "$scan_tmp_dir/scan_failures.list")
-            MOLE_APP_SCAN_FAILURE_DETAIL=$(mole_terminal_safe_text "${raw_failure_detail##*/}")
+            MOLE_APP_SCAN_FAILURE_DETAIL=$(mole_terminal_safe_text "${raw_failure_detail/#$HOME/~}")
+            local failed_bundle_path=""
+            while IFS= read -r failed_bundle_path; do
+                [[ -n "$failed_bundle_path" ]] || continue
+                debug_log "Unreadable application bundle: $(mole_terminal_safe_text "$failed_bundle_path")"
+            done < "$scan_tmp_dir/scan_failures.list"
         fi
         debug_log "Failed to scan one or more installed application directories"
         return 1
@@ -453,7 +473,7 @@ is_bundle_orphaned() {
 
     # 2. Fast path: check sensitive data patterns (in-memory, instant)
     local bundle_lower
-    bundle_lower=$(echo "$bundle_id" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    mole_ascii_lowercase bundle_lower "$bundle_id"
     for pattern in "${ORPHAN_NEVER_DELETE_PATTERNS[@]}"; do
         # shellcheck disable=SC2053
         if [[ "$bundle_lower" == $pattern ]]; then
@@ -479,7 +499,7 @@ is_bundle_orphaned() {
         local current_epoch
         current_epoch=$(get_epoch_seconds)
         local days_since_modified=$(((current_epoch - last_modified_epoch) / 86400))
-        if [[ $days_since_modified -lt ${ORPHAN_AGE_THRESHOLD:-30} ]]; then
+        if [[ $days_since_modified -lt $ORPHAN_AGE_THRESHOLD ]]; then
             return 1
         fi
     fi
@@ -524,10 +544,11 @@ is_claude_vm_bundle_orphaned() {
 
     [[ -d "$vm_bundle_path" ]] || return 1
 
-    # Extra guard in case the running-app scan missed Claude Desktop.
-    if pgrep -x "Claude" > /dev/null 2>&1; then
-        return 1
-    fi
+    # Extra guard in case the running-app scan missed Claude Desktop. A probe
+    # that cannot tell keeps the bundle here too, not only at the final sink.
+    local claude_state=0
+    mole_pgrep_any -x "Claude" || claude_state=$?
+    [[ $claude_state -eq 1 ]] || return 1
 
     if grep -Fxq "$claude_bundle_id" "$installed_bundles" 2> /dev/null; then
         return 1
@@ -539,7 +560,7 @@ is_claude_vm_bundle_orphaned() {
         local current_epoch
         current_epoch=$(get_epoch_seconds)
         local days_since_modified=$(((current_epoch - last_modified_epoch) / 86400))
-        if [[ $days_since_modified -lt ${CLAUDE_VM_ORPHAN_AGE_THRESHOLD:-7} ]]; then
+        if [[ $days_since_modified -lt $CLAUDE_VM_ORPHAN_AGE_THRESHOLD ]]; then
             return 1
         fi
     fi
@@ -590,7 +611,7 @@ orphan_cleanup_candidate_snapshot() {
     local identity=""
     local identity_rc=0
     identity=$(orphan_cleanup_candidate_identity "$path") || identity_rc=$?
-    [[ $identity_rc -eq 124 || $identity_rc -ge 128 ]] && return "$identity_rc"
+    mole_rc_timeout_or_signal "$identity_rc" && return "$identity_rc"
     [[ $identity_rc -eq 0 && "${identity%:*}" == "$snapshot_target_id" ]] || return 1
 
     _ORPHAN_CANDIDATE_IDENTITY="$identity"
@@ -608,14 +629,14 @@ orphan_cleanup_candidate_still_eligible() {
     if [[ "${_ORPHAN_CLEANUP_KIND:-bundle}" == "claude" ]]; then
         local process_rc=0
         pgrep -x "Claude" > /dev/null 2>&1 || process_rc=$?
-        [[ $process_rc -eq 124 || $process_rc -ge 128 ]] && return "$process_rc"
+        mole_rc_timeout_or_signal "$process_rc" && return "$process_rc"
         [[ $process_rc -eq 1 ]] || return 1
     fi
 
     local resolver_rc=0
     bundle_has_installed_app "${_ORPHAN_CLEANUP_BUNDLE_ID:-}" \
         "$((SECONDS + MOLE_TIMEOUT_MEDIUM_PROBE_SEC))" || resolver_rc=$?
-    [[ $resolver_rc -eq 124 || $resolver_rc -ge 128 ]] && return "$resolver_rc"
+    mole_rc_timeout_or_signal "$resolver_rc" && return "$resolver_rc"
     # Resolver 0 means installed or unknown; only an exact 1 authorizes cleanup.
     [[ $resolver_rc -eq 1 ]] || return 1
 
@@ -625,7 +646,7 @@ orphan_cleanup_candidate_still_eligible() {
     local _ORPHAN_CANDIDATE_TARGET_ID=""
     local snapshot_rc=0
     orphan_cleanup_candidate_snapshot "$path" || snapshot_rc=$?
-    [[ $snapshot_rc -eq 124 || $snapshot_rc -ge 128 ]] && return "$snapshot_rc"
+    mole_rc_timeout_or_signal "$snapshot_rc" && return "$snapshot_rc"
     [[ $snapshot_rc -eq 0 ]] || return 1
     [[ "$_ORPHAN_CANDIDATE_IDENTITY" == "${_ORPHAN_CLEANUP_EXPECTED_IDENTITY:-}" ]] || return 1
     [[ "$_ORPHAN_CANDIDATE_PARENT" == "${_ORPHAN_CLEANUP_EXPECTED_PARENT:-}" ]] || return 1
@@ -746,7 +767,7 @@ clean_orphaned_app_data() {
                         safe_clean_guarded orphan_cleanup_candidate_still_eligible \
                             "$claude_vm_bundle" \
                             "Orphaned Claude workspace VM" || claude_clean_rc=$?
-                        if [[ $claude_clean_rc -eq 124 || $claude_clean_rc -ge 128 ]]; then
+                        if mole_rc_timeout_or_signal "$claude_clean_rc"; then
                             claude_result_rc=$claude_clean_rc
                             break
                         elif [[ $claude_clean_rc -eq 0 ]]; then
@@ -807,7 +828,7 @@ clean_orphaned_app_data() {
                     if [[ $iteration_count -gt $MOLE_MAX_ORPHAN_ITERATIONS ]]; then
                         break
                     fi
-                    local bundle_id=$(basename "$match")
+                    local bundle_id="${match##*/}"
                     bundle_id="${bundle_id%.savedState}"
                     bundle_id="${bundle_id%.binarycookies}"
                     bundle_id="${bundle_id%.plist}"
@@ -857,7 +878,7 @@ clean_orphaned_app_data() {
                         local clean_rc=0
                         safe_clean_guarded orphan_cleanup_candidate_still_eligible \
                             "$match" "Orphaned $label: $bundle_id" || clean_rc=$?
-                        if [[ $clean_rc -eq 124 || $clean_rc -ge 128 ]]; then
+                        if mole_rc_timeout_or_signal "$clean_rc"; then
                             rm -f -- "$installed_bundles" 2> /dev/null || true # SAFE: exact tracked temp file created above
                             return "$clean_rc"
                         elif [[ $clean_rc -eq 0 ]]; then
@@ -875,9 +896,9 @@ clean_orphaned_app_data() {
     if [[ $orphaned_count -gt 0 ]]; then
         local orphaned_mb=$(echo "$total_orphaned_kb" | awk '{printf "%.1f", $1/1024}')
         if [[ "${DRY_RUN:-false}" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Would clean $orphaned_count items, about ${orphaned_mb}MB"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Would clean $(mole_count_label "$orphaned_count" item), about ${orphaned_mb}MB"
         else
-            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $orphaned_count items, about ${orphaned_mb}MB"
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $(mole_count_label "$orphaned_count" item), about ${orphaned_mb}MB"
         fi
         note_activity
     fi
@@ -909,7 +930,7 @@ _privileged_helper_bundle_id_from_binary() {
                         -extract CFBundleIdentifier raw "$info_plist" 2> /dev/null) || plist_rc=$?
                 fi
             fi
-            [[ $plist_rc -eq 124 || $plist_rc -ge 128 ]] && return "$plist_rc"
+            mole_rc_timeout_or_signal "$plist_rc" && return "$plist_rc"
             [[ -n "$helper_bundle_id" ]] || helper_bundle_id=$(basename "$helper_bundle_dir" .bundle)
             ;;
         *)
@@ -921,9 +942,26 @@ _privileged_helper_bundle_id_from_binary() {
     printf '%s\n' "$helper_bundle_id"
 }
 
+# Device-management, endpoint-security and VPN services keep running when their
+# app looks gone (an MDM profile, a half-removed agent, a VPN daemon), and only
+# the vendor's own tool may remove them. Never an orphan, matching Mole Mac.
+_orphan_service_vendor_protected() {
+    local identity token
+    for identity in "$@"; do
+        [[ -n "$identity" ]] || continue
+        mole_ascii_lowercase identity "$identity"
+        for token in mdm jamf crowdstrike sentinelone carbonblack defender eset sophos \
+            littlesnitch tailscale wireguard protonvpn nordvpn mullvad surge clash mihomo; do
+            [[ "$identity" == *"$token"* ]] && return 0
+        done
+    done
+    return 1
+}
+
 # Clean orphaned system-level services (LaunchDaemons, LaunchAgents, PrivilegedHelperTools)
 # These are left behind when apps are uninstalled but their system services remain
 clean_orphaned_system_services() {
+    [[ "${SYSTEM_CLEAN:-true}" == "true" ]] || return 0
     # Requires sudo
     if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
         return 0
@@ -937,7 +975,7 @@ clean_orphaned_system_services() {
         _mole_bounded_sudo "$service_auth_timeout" \
             -n true < /dev/null 2> /dev/null || service_auth_rc=$?
     fi
-    if [[ $service_auth_rc -eq 124 ]]; then
+    if mole_rc_timeout "$service_auth_rc"; then
         echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}authorization check timed out, skipped cleanup${NC}"
         note_activity
         return 0
@@ -986,6 +1024,14 @@ clean_orphaned_system_services() {
         # /Library/Intego tree is root-only readable; never treat its services
         # as orphans while any Intego install evidence exists. See #1188.
         "com.intego.*:/Library/Intego|/Applications/Intego|/Library/Application Support/Intego"
+        # Symantec and Broadcom endpoint agents: a half-removed install leaves plists
+        # whose program is gone beside daemons that still run, and only the vendor's
+        # own uninstaller finishes that. Empty evidence = never an orphan.
+        "com.symantec.*:"
+        "com.broadcom.*:"
+        # Microsoft AutoUpdate serves Edge, Teams, OneDrive and Defender too,
+        # and lives outside every app root, so no installed app proves it.
+        "com.microsoft.autoupdate.helper:"
         # Homebrew-managed services (managed by brew services, not .app bundles)
         "homebrew.mxcl.*:"
     )
@@ -1077,7 +1123,7 @@ clean_orphaned_system_services() {
                 -n /usr/libexec/PlistBuddy -c "Print :$key" "$plist" < /dev/null 2> /dev/null) || plist_probe_rc=$?
         fi
 
-        if [[ $plist_probe_rc -eq 124 || $plist_probe_rc -ge 128 ]]; then
+        if mole_rc_timeout_or_signal "$plist_probe_rc"; then
             return "$plist_probe_rc"
         fi
         [[ $plist_probe_rc -eq 0 ]] || return 1
@@ -1095,13 +1141,13 @@ clean_orphaned_system_services() {
         local binary=""
         local binary_probe_rc=0
         binary=$(_plist_program_value "$plist" "ProgramArguments:0") || binary_probe_rc=$?
-        if [[ $binary_probe_rc -eq 124 || $binary_probe_rc -ge 128 ]]; then
+        if mole_rc_timeout_or_signal "$binary_probe_rc"; then
             return "$binary_probe_rc"
         fi
         if [[ -z "$binary" ]]; then
             binary_probe_rc=0
             binary=$(_plist_program_value "$plist" "Program") || binary_probe_rc=$?
-            if [[ $binary_probe_rc -eq 124 || $binary_probe_rc -ge 128 ]]; then
+            if mole_rc_timeout_or_signal "$binary_probe_rc"; then
                 return "$binary_probe_rc"
             fi
         fi
@@ -1155,7 +1201,7 @@ clean_orphaned_system_services() {
         local binary=""
         local binary_path_rc=0
         binary=$(_plist_binary_path "$plist") || binary_path_rc=$?
-        if [[ $binary_path_rc -eq 124 || $binary_path_rc -ge 128 ]]; then
+        if mole_rc_timeout_or_signal "$binary_path_rc"; then
             return "$binary_path_rc"
         fi
         [[ $binary_path_rc -eq 0 ]] || return 1 # no Program key → skip
@@ -1171,6 +1217,28 @@ clean_orphaned_system_services() {
                 return 1
                 ;;
         esac
+
+        # Check protect patterns before the binary probes: an installed helper
+        # whose app cannot be resolved (Microsoft AutoUpdate serves products
+        # outside every app root) would otherwise be called orphaned below.
+        # A matching pattern declares the app as installed.
+        local pattern_entry
+        _orphan_service_vendor_protected "$bundle_id" "${binary##*/}" && return 1
+        for pattern_entry in "${known_protect_patterns[@]}"; do
+            local file_pattern="${pattern_entry%%:*}"
+            local app_path="${pattern_entry#*:}"
+            # shellcheck disable=SC2053
+            [[ "$bundle_id" == $file_pattern ]] || continue
+            local protect_rc=0
+            _system_service_app_exists "$bundle_id" "$app_path" || protect_rc=$?
+            if [[ $protect_rc -eq 0 ]]; then
+                return 1
+            elif [[ $protect_rc -ge 128 ]]; then
+                return "$protect_rc"
+            fi
+            # Pattern matched and app is gone → don't protect (fall through).
+            break
+        done
 
         # Self-protecting software (Intego and similar antivirus / endpoint
         # agents) makes its install directories root-only readable, so an
@@ -1202,14 +1270,14 @@ clean_orphaned_system_services() {
                     _mole_bounded_sudo "$binary_auth_timeout" \
                         -n true < /dev/null 2> /dev/null || binary_auth_rc=$?
                 fi
-                if [[ $binary_auth_rc -eq 124 || $binary_auth_rc -ge 128 ]]; then
+                if mole_rc_timeout_or_signal "$binary_auth_rc"; then
                     return "$binary_auth_rc"
                 elif [[ $binary_auth_rc -ne 0 ]]; then
                     return 1
                 fi
             else
                 # Timeout/exec failure is unknown, never evidence of absence.
-                if [[ $binary_probe_rc -eq 124 || $binary_probe_rc -ge 128 ]]; then
+                if mole_rc_timeout_or_signal "$binary_probe_rc"; then
                     return "$binary_probe_rc"
                 fi
                 return 1
@@ -1225,9 +1293,14 @@ clean_orphaned_system_services() {
                 local helper_id_rc=0
                 helper_bundle_id=$(_privileged_helper_bundle_id_from_binary \
                     "$binary" "$service_cleanup_deadline") || helper_id_rc=$?
-                if [[ $helper_id_rc -eq 124 || $helper_id_rc -ge 128 ]]; then
+                if mole_rc_timeout_or_signal "$helper_id_rc"; then
                     return "$helper_id_rc"
                 fi
+                # Only a reverse-DNS helper id can be asked about its parent
+                # app, the rule the bare-helper pass uses. A plain file name
+                # (VendorCloudPrintUpdater) is no bundle id, so it always read
+                # as "parent app gone" and a live KeepAlive daemon was offered.
+                [[ "$helper_bundle_id" =~ ^(com|org|net|io)\. ]] || return 1
                 local helper_resolver_rc=0
                 bundle_has_installed_app "$helper_bundle_id" \
                     "$service_cleanup_deadline" || helper_resolver_rc=$?
@@ -1244,25 +1317,6 @@ clean_orphaned_system_services() {
 
         # If the binary is in a package-manager / system path, skip.
         _is_package_managed_binary "$binary" && return 1
-
-        # Check protect patterns: if any matching pattern declares the app as
-        # installed, this plist is protected.
-        local pattern_entry
-        for pattern_entry in "${known_protect_patterns[@]}"; do
-            local file_pattern="${pattern_entry%%:*}"
-            local app_path="${pattern_entry#*:}"
-            # shellcheck disable=SC2053
-            [[ "$bundle_id" == $file_pattern ]] || continue
-            local protect_rc=0
-            _system_service_app_exists "$bundle_id" "$app_path" || protect_rc=$?
-            if [[ $protect_rc -eq 0 ]]; then
-                return 1
-            elif [[ $protect_rc -ge 128 ]]; then
-                return "$protect_rc"
-            fi
-            # Pattern matched and app is gone → don't protect (fall through).
-            break
-        done
 
         return 0 # orphaned
     }
@@ -1370,7 +1424,7 @@ clean_orphaned_system_services() {
                 local referenced_binary=""
                 local binary_rc=0
                 referenced_binary=$(_plist_binary_path "$plist") || binary_rc=$?
-                if [[ $binary_rc -eq 124 || $binary_rc -ge 128 ]]; then
+                if mole_rc_timeout_or_signal "$binary_rc"; then
                     reference_scan_rc=$binary_rc
                     break
                 fi
@@ -1381,7 +1435,7 @@ clean_orphaned_system_services() {
                     # evidence. Any still-inconclusive document keeps helpers.
                     local readable_rc=0
                     _plist_document_is_readable "$plist" || readable_rc=$?
-                    if [[ $readable_rc -eq 124 || $readable_rc -ge 128 ]]; then
+                    if mole_rc_timeout_or_signal "$readable_rc"; then
                         reference_scan_rc=$readable_rc
                         break
                     elif [[ $readable_rc -ne 0 ]]; then
@@ -1391,7 +1445,7 @@ clean_orphaned_system_services() {
 
                     binary_rc=0
                     referenced_binary=$(_plist_binary_path "$plist") || binary_rc=$?
-                    if [[ $binary_rc -eq 124 || $binary_rc -ge 128 ]]; then
+                    if mole_rc_timeout_or_signal "$binary_rc"; then
                         reference_scan_rc=$binary_rc
                         break
                     elif [[ $binary_rc -ne 0 && $binary_rc -ne 1 ]]; then
@@ -1432,6 +1486,7 @@ clean_orphaned_system_services() {
             _plist_is_orphaned "$candidate" "$bundle_id" || return $?
         else
             local pattern_entry
+            _orphan_service_vendor_protected "$bundle_id" "$filename" && return 1
             for pattern_entry in "${known_protect_patterns[@]}"; do
                 local file_pattern="${pattern_entry%%:*}"
                 local app_path="${pattern_entry#*:}"
@@ -1460,7 +1515,7 @@ clean_orphaned_system_services() {
                 local reference_rc=0
                 _orphan_service_helper_is_unreferenced "$candidate" \
                     "$service_cleanup_deadline" || reference_rc=$?
-                if [[ $reference_rc -eq 124 || $reference_rc -ge 128 ]]; then
+                if mole_rc_timeout_or_signal "$reference_rc"; then
                     return "$reference_rc"
                 elif [[ $reference_rc -ne 0 ]]; then
                     return 1
@@ -1516,11 +1571,11 @@ clean_orphaned_system_services() {
                 if [[ $daemon_orphan_rc -eq 0 ]]; then
                     local daemon_record_rc=0
                     _record_orphan_service_candidate "$plist" || daemon_record_rc=$?
-                    if [[ $daemon_record_rc -eq 124 || $daemon_record_rc -ge 128 ]]; then
+                    if mole_rc_timeout_or_signal "$daemon_record_rc"; then
                         service_scan_status=$daemon_record_rc
                         break
                     fi
-                elif [[ $daemon_orphan_rc -eq 124 || $daemon_orphan_rc -ge 128 ]]; then
+                elif mole_rc_timeout_or_signal "$daemon_orphan_rc"; then
                     service_scan_status=$daemon_orphan_rc
                     break
                 fi
@@ -1561,11 +1616,11 @@ clean_orphaned_system_services() {
                 if [[ $agent_orphan_rc -eq 0 ]]; then
                     local agent_record_rc=0
                     _record_orphan_service_candidate "$plist" || agent_record_rc=$?
-                    if [[ $agent_record_rc -eq 124 || $agent_record_rc -ge 128 ]]; then
+                    if mole_rc_timeout_or_signal "$agent_record_rc"; then
                         service_scan_status=$agent_record_rc
                         break
                     fi
-                elif [[ $agent_orphan_rc -eq 124 || $agent_orphan_rc -ge 128 ]]; then
+                elif mole_rc_timeout_or_signal "$agent_orphan_rc"; then
                     service_scan_status=$agent_orphan_rc
                     break
                 fi
@@ -1614,6 +1669,7 @@ clean_orphaned_system_services() {
                 local is_protected=false
                 local protect_interrupt_rc=0
                 local pattern_entry
+                _orphan_service_vendor_protected "$bundle_id" "$filename" && is_protected=true
                 for pattern_entry in "${known_protect_patterns[@]}"; do
                     local file_pattern="${pattern_entry%%:*}"
                     local app_path="${pattern_entry#*:}"
@@ -1652,7 +1708,7 @@ clean_orphaned_system_services() {
                     elif [[ $helper_resolver_rc -eq 1 ]]; then
                         local helper_record_rc=0
                         _record_orphan_service_candidate "$helper" || helper_record_rc=$?
-                        if [[ $helper_record_rc -eq 124 || $helper_record_rc -ge 128 ]]; then
+                        if mole_rc_timeout_or_signal "$helper_record_rc"; then
                             service_scan_status=$helper_record_rc
                             break
                         fi
@@ -1669,9 +1725,8 @@ clean_orphaned_system_services() {
     fi
     rm -f -- "$service_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
 
-    stop_section_spinner
-
     if [[ $service_scan_status -ne 0 ]]; then
+        stop_section_spinner
         debug_log "Skipping orphaned system services: privileged scan incomplete (status $service_scan_status)"
         if [[ $service_scan_status -ge 128 ]]; then
             return "$service_scan_status"
@@ -1721,8 +1776,12 @@ clean_orphaned_system_services() {
         fi
     fi
 
-    # Report and clean
-    if [[ $orphaned_count -gt 0 ]]; then
+    # Report and clean. Each candidate is resolved again before it is listed
+    # or removed, about a second apiece, so keep the spinner up until output.
+    if [[ $orphaned_count -eq 0 ]]; then
+        stop_section_spinner
+    else
+        start_section_spinner "Checking orphaned system services..."
         debug_log "Found $orphaned_count orphaned system services"
 
         local removed_count=0
@@ -1739,12 +1798,14 @@ clean_orphaned_system_services() {
             local expected_target_id="${orphaned_target_ids[$orphan_index]}"
             local eligibility_rc=0
             _orphan_service_candidate_still_eligible "$orphan_file" "$expected_identity" || eligibility_rc=$?
-            if [[ $eligibility_rc -eq 124 ]]; then
+            if mole_rc_timeout "$eligibility_rc"; then
+                stop_section_spinner
                 echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}time limit reached, stopped cleanup${NC}"
                 debug_log "Orphaned services stopped by deadline at stage: eligibility recheck"
                 note_activity
                 return 0
             elif [[ $eligibility_rc -ge 128 ]]; then
+                stop_section_spinner
                 return "$eligibility_rc"
             elif [[ $eligibility_rc -ne 0 ]]; then
                 debug_log "Keeping changed or no-longer-orphaned service: $orphan_file"
@@ -1771,13 +1832,15 @@ clean_orphaned_system_services() {
                     orphan_size_kb=$(_mole_bounded_sudo "$orphan_size_timeout" \
                         -n du -skP "$orphan_file" < /dev/null 2> /dev/null | awk '{print $1}') || orphan_size_rc=$?
                 fi
-                if [[ $orphan_size_rc -eq 124 ]]; then
+                if mole_rc_timeout "$orphan_size_rc"; then
+                    stop_section_spinner
                     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}time limit reached, stopped cleanup${NC}"
                     debug_log "Orphaned services stopped by deadline at stage: dry-run sizing"
                     note_activity
                     return 0
                 fi
                 if [[ $orphan_size_rc -ge 128 ]]; then
+                    stop_section_spinner
                     return "$orphan_size_rc"
                 fi
                 [[ $orphan_size_rc -eq 0 && "$orphan_size_kb" =~ ^[0-9]+$ ]] || orphan_size_kb=0
@@ -1797,13 +1860,15 @@ clean_orphaned_system_services() {
                     file_size_kb=$(_mole_bounded_sudo "$file_size_timeout" \
                         -n du -skP "$orphan_file" < /dev/null 2> /dev/null | awk '{print $1}') || file_size_rc=$?
                 fi
-                if [[ $file_size_rc -eq 124 ]]; then
+                if mole_rc_timeout "$file_size_rc"; then
+                    stop_section_spinner
                     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}time limit reached, stopped cleanup${NC}"
                     debug_log "Orphaned services stopped by deadline at stage: plist removal"
                     note_activity
                     return 0
                 fi
                 if [[ $file_size_rc -ge 128 ]]; then
+                    stop_section_spinner
                     return "$file_size_rc"
                 fi
                 [[ $file_size_rc -eq 0 && "$file_size_kb" =~ ^[0-9]+$ ]] || file_size_kb=0
@@ -1817,12 +1882,14 @@ clean_orphaned_system_services() {
                 local final_eligibility_rc=0
                 _orphan_service_candidate_still_eligible "$orphan_file" \
                     "$expected_identity" || final_eligibility_rc=$?
-                if [[ $final_eligibility_rc -eq 124 ]]; then
+                if mole_rc_timeout "$final_eligibility_rc"; then
+                    stop_section_spinner
                     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}time limit reached, stopped cleanup${NC}"
                     debug_log "Orphaned services stopped by deadline at stage: helper binary removal"
                     note_activity
                     return 0
                 elif [[ $final_eligibility_rc -ge 128 ]]; then
+                    stop_section_spinner
                     return "$final_eligibility_rc"
                 elif [[ $final_eligibility_rc -ne 0 ]]; then
                     debug_log "Keeping changed or no-longer-orphaned service before removal: $orphan_file"
@@ -1838,11 +1905,13 @@ clean_orphaned_system_services() {
                 elif [[ $remove_rc -eq $MOLE_ERR_PROTECTED_PATH ]]; then
                     debug_log "Skipping protected orphaned service: $orphan_file"
                     skipped_protected_count=$((skipped_protected_count + 1))
-                elif [[ $remove_rc -eq 124 ]]; then
+                elif mole_rc_timeout "$remove_rc"; then
+                    stop_section_spinner
                     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}removal timed out, stopped cleanup${NC}"
                     note_activity
                     return 0
                 elif [[ $remove_rc -ge 128 ]]; then
+                    stop_section_spinner
                     return "$remove_rc"
                 else
                     debug_log "Failed to remove orphaned service: $orphan_file"
@@ -1850,6 +1919,7 @@ clean_orphaned_system_services() {
                 fi
             fi
         done
+        stop_section_spinner
 
         if [[ "${DRY_RUN:-false}" == "true" ]]; then
             echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Orphaned services · ${YELLOW}${orphaned_count} found dry${NC}"
@@ -2005,7 +2075,7 @@ clean_orphaned_container_stubs() {
                 "$container_dir" -mindepth 1 -maxdepth 1 \
                 ! -name ".com.apple.containermanagerd.metadata.plist" \
                 -print -quit 2> /dev/null) || sibling_scan_rc=$?
-            if [[ $sibling_scan_rc -eq 124 || $sibling_scan_rc -ge 128 ]]; then
+            if mole_rc_timeout_or_signal "$sibling_scan_rc"; then
                 eval "$_ng_state"
                 stop_section_spinner
                 return "$sibling_scan_rc"
@@ -2021,7 +2091,7 @@ clean_orphaned_container_stubs() {
             _container_stub_app_exists "$bundle_id" "$app_path" || stub_app_rc=$?
             if [[ $stub_app_rc -eq 0 ]]; then
                 continue
-            elif [[ $stub_app_rc -eq 124 || $stub_app_rc -ge 128 ]]; then
+            elif mole_rc_timeout_or_signal "$stub_app_rc"; then
                 eval "$_ng_state"
                 stop_section_spinner
                 return "$stub_app_rc"
@@ -2039,7 +2109,7 @@ clean_orphaned_container_stubs() {
                 local stub_remove_rc=0
                 _remove_verified_container_stub \
                     "$container_dir" "$metadata_plist" > /dev/null 2>&1 || stub_remove_rc=$?
-                if [[ $stub_remove_rc -eq 124 || $stub_remove_rc -ge 128 ]]; then
+                if mole_rc_timeout_or_signal "$stub_remove_rc"; then
                     eval "$_ng_state"
                     stop_section_spinner
                     return "$stub_remove_rc"
@@ -2056,7 +2126,7 @@ clean_orphaned_container_stubs() {
                     local stub_size_kb
                     local stub_size_rc=0
                     stub_size_kb=$(get_path_size_kb "$container_dir" 2> /dev/null) || stub_size_rc=$?
-                    [[ $stub_size_rc -eq 124 || $stub_size_rc -ge 128 ]] && {
+                    mole_rc_timeout_or_signal "$stub_size_rc" && {
                         eval "$_ng_state"
                         stop_section_spinner
                         return "$stub_size_rc"
@@ -2065,7 +2135,7 @@ clean_orphaned_container_stubs() {
                     local stub_record_rc=0
                     record_dry_run_cleanup_target \
                         "$container_dir" "$stub_size_kb" 1 true || stub_record_rc=$?
-                    if [[ $stub_record_rc -eq 124 || $stub_record_rc -ge 128 ]]; then
+                    if mole_rc_timeout_or_signal "$stub_record_rc"; then
                         eval "$_ng_state"
                         stop_section_spinner
                         return "$stub_record_rc"
@@ -2090,8 +2160,7 @@ clean_orphaned_container_stubs() {
             echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Orphaned app container stubs, ${GREEN}${removed_count} removed${NC}"
             note_activity
         fi
-        files_cleaned=$((files_cleaned + removed_count))
-        total_items=$((total_items + 1))
+        mole_add_cleaned_row "$removed_count" 0
     fi
     if [[ $failed_count -gt 0 ]]; then
         echo -e "  ${GRAY}${ICON_WARNING}${NC} Orphaned container stubs: $failed_count could not be removed"

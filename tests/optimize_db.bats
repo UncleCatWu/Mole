@@ -1,23 +1,13 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-	export PROJECT_ROOT
-
-	ORIGINAL_HOME="${HOME:-}"
-	export ORIGINAL_HOME
-
-	HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-optimize-db.XXXXXX")"
-	export HOME
+	mole_test_setup_home optimize-db
 }
 
 teardown_file() {
-	if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-		rm -rf "$HOME"
-	fi
-	if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-		export HOME="$ORIGINAL_HOME"
-	fi
+	mole_test_teardown_home
 }
 
 create_logical_file() {
@@ -120,6 +110,61 @@ EOF
 	rm -rf "$tmp_dir"
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"busy or locked"* ]]
+}
+
+@test "notification refresh targets only its current-user launchd service" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+resolve_notification_center_db() { printf '%s\n' "$HOME/nc.db"; }
+opt_existing_file_size_kb_strict() { echo 60000; }
+sqlite3() { :; }
+trace="$HOME/notification-refresh.trace"
+run_with_timeout() { printf '%s\n' "$*" > "$trace"; }
+# A name-based kill would also reach an unrelated program named NotificationCenter.
+killall() { echo "UNSAFE_NAME_KILL" > "$trace"; }
+execute_optimization notification_cleanup
+[[ "$(cat "$trace")" == "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC /bin/launchctl kill SIGTERM gui/$UID/com.apple.notificationcenterui.agent" ]] || exit 1
+[[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "notification refresh never falls back to name killing after launchd refusal" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+resolve_notification_center_db() { printf '%s\n' "$HOME/nc.db"; }
+opt_existing_file_size_kb_strict() { echo 60000; }
+sqlite3() { :; }
+trace="$HOME/notification-refused.trace"
+run_with_timeout() { printf '%s\n' "$*" >> "$trace"; return 3; }
+killall() { echo "UNSAFE_NAME_KILL" >> "$trace"; }
+execute_optimization notification_cleanup
+[[ "$(cat "$trace")" == "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC /bin/launchctl kill SIGTERM gui/$UID/com.apple.notificationcenterui.agent" ]] || exit 1
+# SQL succeeded: a missing/not-running service does not undo database maintenance.
+[[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "notification cleanup dry run never refreshes the service" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+resolve_notification_center_db() { printf '%s\n' "$HOME/nc.db"; }
+opt_existing_file_size_kb_strict() { echo 60000; }
+trace="$HOME/notification-dry.trace"
+sqlite3() { echo SQL >> "$trace"; }
+run_with_timeout() { echo LAUNCHCTL >> "$trace"; }
+killall() { echo KILL >> "$trace"; }
+execute_optimization notification_cleanup
+[[ ! -e "$trace" ]] || exit 1
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
 @test "opt_coreduet_cleanup reports healthy when db is small" {
@@ -281,4 +326,45 @@ EOF
 	[[ "$output" == *"Messages/chat.db"* ]] || return 1
 	[[ "$output" != *"All databases already optimized"* ]] || return 1
 	[[ "$output" != *"UNEXPECTED_SQLITE"* ]] || return 1
+}
+
+@test "CoreDuet cleanup recovers committed WAL before pruning old records" {
+	local case_home="$BATS_TEST_TMPDIR/knowledge-recovery"
+	local db="$case_home/Library/Application Support/Knowledge/knowledgeC.db"
+	mkdir -p "$(dirname "$db")"
+	# Leave committed transactions in WAL as an abruptly stopped owner does.
+	python3 - "$db" <<'PYSQL'
+import os
+import sqlite3
+import sys
+import time
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("PRAGMA wal_autocheckpoint=0")
+connection.execute("CREATE TABLE ZOBJECT (ZCREATIONDATE REAL, value TEXT)")
+connection.commit()
+connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+now = time.time() - 978307200
+connection.executemany("INSERT INTO ZOBJECT VALUES (?, ?)", [
+    (now, "recent-committed"), (now - 120 * 86400, "expired")
+])
+connection.commit()
+os._exit(0)
+PYSQL
+	[[ -s "$db-wal" ]] || return 1
+	# Cross only the size threshold; all database operations remain real.
+	mole_test_fake_command du "printf '112640 total\n'"
+	run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+# The fixture writer exited. Supply its known idle state without host lsof/sudo.
+_mole_paths_have_open_handle() { return 1; }
+execute_optimization coreduet_cleanup
+[[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
+rows=$(sqlite3 "$HOME/Library/Application Support/Knowledge/knowledgeC.db" 'SELECT value FROM ZOBJECT ORDER BY value;')
+[[ "$rows" == "recent-committed" ]] || { printf 'unexpected surviving rows: %s\n' "$rows"; exit 1; }
+EOF
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
 }

@@ -125,7 +125,7 @@ completion_check_config() {
     [[ ! -e "$config_file" || -f "$config_file" ]] || return 2
     if [[ -f "$config_file" ]]; then
         local owner
-        owner=$(stat -f%u "$config_file" 2> /dev/null) || return 2
+        owner=$("$STAT_BSD" -f%u "$config_file" 2> /dev/null) || return 2
         [[ "$owner" == "$(id -u)" ]] || {
             log_error "Shell config is owned by another user: $config_file"
             return 2
@@ -143,7 +143,7 @@ completion_config_fingerprint() {
         printf 'missing\n'
         return 0
     fi
-    stat -f%d:%i:%Lp "$config_file" || return 1
+    "$STAT_BSD" -f%d:%i:%Lp "$config_file" || return 1
     cksum "$config_file" || return 1
 }
 
@@ -162,7 +162,7 @@ completion_write_block() {
     fi
     local expected_fingerprint current_fingerprint original_mode=""
     expected_fingerprint=$(completion_config_fingerprint "$config_file") || return 2
-    if [[ -f "$config_file" ]]; then original_mode=$(stat -f%Lp "$config_file") || return 2; fi
+    if [[ -f "$config_file" ]]; then original_mode=$("$STAT_BSD" -f%Lp "$config_file") || return 2; fi
     local temp_file
     temp_file=$(mktemp "$(dirname "$config_file")/.mole-completion.XXXXXX") || return 2
     if [[ -f "$config_file" ]]; then
@@ -273,7 +273,10 @@ if [[ $# -eq 0 ]]; then
         fi
         if [[ ! -f "$mole_file" ]]; then
             printf 'Enable completion for fish? Enter confirm / Q cancel: '
-            IFS= read -r -s -n1 key || key=""
+            if ! IFS= read -r -s -n1 key; then
+                echo "Cancelled"
+                exit 1
+            fi
             case "$key" in "" | $'\n' | $'\r' | [Yy]) ;; *)
                 echo "Cancelled"
                 exit 0
@@ -302,7 +305,7 @@ if [[ $# -eq 0 ]]; then
             exit 1
         fi
         if [[ -f "$mole_file" ]]; then
-            fish_mode=$(stat -f%Lp "$mole_file") || exit 1
+            fish_mode=$("$STAT_BSD" -f%Lp "$mole_file") || exit 1
             chmod "$fish_mode" "$fish_stage" || exit 1
         fi
         mo_stage=$(mktemp "$fish_dir/.mole-mo.XXXXXX") || exit 1
@@ -312,7 +315,7 @@ if [[ $# -eq 0 ]]; then
         printf '# Mole completions for mo (alias) -- auto-generated, do not edit\nsource "%s"\n' "$fish_source_path" > "$mo_stage" || exit 1
         completion_check_syntax fish "$mo_stage" || exit 1
         if [[ -f "$mo_file" ]]; then
-            fish_mode=$(stat -f%Lp "$mo_file") || exit 1
+            fish_mode=$("$STAT_BSD" -f%Lp "$mo_file") || exit 1
             chmod "$fish_mode" "$mo_stage" || exit 1
         fi
         # Finish both stages before publishing, then bind them to the exact
@@ -341,7 +344,10 @@ if [[ $# -eq 0 ]]; then
     }
     if [[ "$tail_start" -eq 0 && "${MOLE_DRY_RUN:-0}" != 1 ]]; then
         printf 'Will add to %s:\n  %s\nEnable completion? Enter confirm / Q cancel: ' "$config_file" "$completion_line"
-        IFS= read -r -s -n1 key || key=""
+        if ! IFS= read -r -s -n1 key; then
+            echo "Cancelled"
+            exit 1
+        fi
         drain_pending_input
         case "$key" in "" | $'\n' | $'\r' | [Yy]) ;; *)
             echo "Cancelled"
@@ -507,6 +513,7 @@ Examples:
   # Manual install - Fish
   mole completion fish | source
 EOF
+        [[ "$1" == "--help" || "$1" == "-h" ]] && exit 0
         exit 1
         ;;
 esac

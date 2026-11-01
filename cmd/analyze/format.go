@@ -3,6 +3,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -268,4 +270,52 @@ func formatUnusedTime(lastAccess time.Time) string {
 	}
 
 	return ""
+}
+
+func measurementErrorReason(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timed out"
+	case errors.Is(err, context.Canceled):
+		return "cancelled"
+	case isPermissionFailure(err):
+		return "access denied"
+	}
+	var duFailure *duError
+	if errors.As(err, &duFailure) && duFailure.reason != "" {
+		return duFailure.reason
+	}
+	if pathFailure, ok := errors.AsType[*os.PathError](err); ok {
+		return pathFailure.Err.Error()
+	}
+	return "read error"
+}
+
+// Partial sizes are measured bytes, so '+' marks that additional bytes may be
+// missing. An unavailable measurement must never look like a measured zero.
+func measuredSizeLabel(size int64, state scanState) string {
+	if state == scanUnavailable || (state == scanPartial && size == 0) {
+		return "unknown"
+	}
+	label := humanizeBytes(size)
+	if state == scanPartial {
+		label += "+"
+	}
+	return label
+}
+
+// sizeColumn fills the 10-column size field with the partial marker in its
+// own last column, so units line up whether or not a row is partial.
+func sizeColumn(label string) string {
+	if trimmed, partial := strings.CutSuffix(label, "+"); partial {
+		return fmt.Sprintf("%9s+", trimmed)
+	}
+	return fmt.Sprintf("%9s ", label)
+}
+
+func scanSummary(size int64, state scanState) string {
+	if state != scanComplete {
+		return "Partial scan · " + measuredSizeLabel(size, state)
+	}
+	return "Scanned " + humanizeBytes(size)
 }

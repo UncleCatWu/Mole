@@ -1,14 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-browser-cleanup.XXXXXX")"
-    export HOME
+    mole_test_setup_home browser-cleanup
 
     # Prevent AppleScript permission dialogs during tests
     MOLE_TEST_MODE=1
@@ -18,12 +13,7 @@ setup_file() {
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 @test "clean_chrome_old_versions skips when Chrome is running" {
@@ -195,7 +185,7 @@ EOF
     }
     [[ "$output" == *"ALL_FAILED:0:0"* ]] || return 1
     [[ "$output" == *"PARTIAL:1:10"* ]] || return 1
-    [[ "$output" == *"Chrome old versions"*"1 dirs"* ]]
+    [[ "$output" == *"Chrome old versions"*"1 dir,"* ]]
 }
 
 @test "clean_chrome_old_versions removes old versions but keeps current" {
@@ -544,7 +534,7 @@ EOF
     }
     [[ "$output" == *"ALL_FAILED:0:0"* ]] || return 1
     [[ "$output" == *"PARTIAL:1:10"* ]] || return 1
-    [[ "$output" == *"Edge updater old versions"*"1 dirs"* ]]
+    [[ "$output" == *"Edge updater old versions"*"1 dir,"* ]]
 }
 
 # Issue #1216: after Edge updates itself, the updater staging dir can hold a
@@ -833,7 +823,7 @@ EOF
     [[ "$output" != *"Edge old versions"* ]]
 }
 
-@test "browser cleanup stops after an old-version size timeout" {
+@test "browser cleanup stops after an updater-payload size timeout" {
     local isolated_home="$HOME/browser-aggregate-timeout"
     mkdir -p "$isolated_home"
 
@@ -845,11 +835,11 @@ source "$PROJECT_ROOT/lib/clean/user.sh"
 safe_clean() { :; }
 clean_service_worker_cache() { :; }
 pgrep() { return 1; }
-clean_chrome_old_versions() {
+clean_edge_updater_old_versions() {
     _mole_record_clean_cancellation 124
     return 124
 }
-clean_edge_old_versions() { echo "UNEXPECTED_EDGE_CLEAN"; }
+clean_brave_old_versions() { echo "UNEXPECTED_BUNDLE_CLEAN"; }
 set +e
 clean_browsers
 rc=$?
@@ -860,5 +850,28 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"BROWSER_RC:124 CANCEL:124"* ]] || return 1
-    [[ "$output" != *"UNEXPECTED_EDGE_CLEAN"* ]]
+    [[ "$output" != *"UNEXPECTED_BUNDLE_CLEAN"* ]]
+}
+
+@test "browser cleanup preserves application bundles and still checks updater payloads" {
+    local mode
+    for mode in true false; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN="$mode" \
+            /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+safe_clean() { :; }
+clean_service_worker_cache() { :; }
+pgrep() { return 1; }
+clean_chrome_old_versions() { echo "UNEXPECTED_CHROME_INTERIOR"; return 77; }
+clean_edge_old_versions() { echo "UNEXPECTED_EDGE_INTERIOR"; return 77; }
+clean_brave_old_versions() { echo "UNEXPECTED_BRAVE_INTERIOR"; return 77; }
+clean_edge_updater_old_versions() { echo "EXTERNAL_UPDATER_CHECKED"; }
+clean_browsers
+EOF
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        [[ "$output" == *"EXTERNAL_UPDATER_CHECKED"* ]] || return 1
+        [[ "$output" != *"_INTERIOR"* ]] || return 1
+    done
 }

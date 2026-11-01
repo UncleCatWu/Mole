@@ -1,12 +1,13 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 # Tests for remove_file_list batching in lib/uninstall/batch.sh.
 # Exercises the batched Trash path (single _mole_move_to_trash_batch call for
 # eligible files) and the fallback when the batch helper fails.
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_project_root
 }
 
 setup() {
@@ -36,6 +37,8 @@ export MOLE_DELETE_MODE=trash
 export HOME="$HOME"
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 EOF
 }
 
@@ -51,11 +54,381 @@ remove_file_list "$list" "false"
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"0"* ]]
-    [[ -f "$HOME/.Local/bin/unrelated-cli" ]]
-    [[ -f "$HOME/.Config/unrelated-config" ]]
-    [[ -f "$HOME/.Cache/unrelated-cache" ]]
+    [[ "$output" == *"0"* ]] || return 1
+    [[ -f "$HOME/.Local/bin/unrelated-cli" ]] || return 1
+    [[ -f "$HOME/.Config/unrelated-config" ]] || return 1
+    [[ -f "$HOME/.Cache/unrelated-cache" ]] || return 1
     [[ ! -d "$MOLE_TEST_TRASH_DIR" ]]
+}
+
+@test "remove_file_list refuses the Steam library root and its contents" {
+    local steam="$HOME/Library/Application Support/Steam"
+    mkdir -p "$steam/steamapps/common/Game" "$steam/userdata/42"
+    touch "$steam/steamapps/common/Game/game.bin" "$steam/userdata/42/save.vdf"
+    local list
+    printf -v list '%s\n%s\n%s' "$steam" "$steam/steamapps/common/Game" "$steam/userdata/42"
+
+    run /bin/bash --noprofile --norc <<EOF
+$(prelude)
+export MOLE_UNINSTALL_MODE=1
+remove_file_list "$list" "false"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ -f "$steam/steamapps/common/Game/game.bin" ]] || return 1
+    [[ -f "$steam/userdata/42/save.vdf" ]] || return 1
+    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]]
+}
+
+@test "uninstall keeps a LaunchAgent whose program changed after preview" {
+    local app="$HOME/Applications/Target.app"
+    local agents="$HOME/Library/LaunchAgents"
+    mkdir -p "$app/Contents/MacOS" "$agents"
+    touch "$app/Contents/MacOS/Target"
+    cat > "$agents/com.example.Target.helper.plist" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$app/Contents/MacOS/Target</string></dict></plist>
+PLIST
+    cat > "$agents/org.vendor.helper.plist" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>ProgramArguments</key><array><string>$app/Contents/MacOS/Target</string></array></dict></plist>
+PLIST
+    : > "$agents/com.example.Target.plist"
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+agents="$HOME/Library/LaunchAgents"
+plan=$(find_app_files com.example.Target Target "$app")
+[[ "$plan" == *"$agents/com.example.Target.helper.plist"* ]] || exit 1
+[[ "$plan" == *"$agents/org.vendor.helper.plist"* ]] || exit 1
+
+# The reviewed helper now launches an unrelated program. The selected app has
+# already moved, as it has when batch removal reaches its leftover list.
+cat > "$agents/com.example.Target.helper.plist" <<'PLIST'
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>/bin/true</string></dict></plist>
+PLIST
+mv "$app" "$HOME/moved-Target.app"
+remove_file_list "$plan" false com.example.Target "$app" > /dev/null
+[[ -f "$agents/com.example.Target.helper.plist" ]] || exit 1
+[[ ! -e "$agents/org.vendor.helper.plist" ]] || exit 1
+[[ ! -e "$agents/com.example.Target.plist" ]] || exit 1
+[[ -d "$HOME/moved-Target.app" ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "uninstall keeps a LaunchAgent replaced while deletion is being sized" {
+    local app="$HOME/Applications/Target.app"
+    local agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+    mkdir -p "$app/Contents/MacOS" "${agent%/*}"
+    touch "$app/Contents/MacOS/Target"
+    cat > "$agent" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$app/Contents/MacOS/Target</string></dict></plist>
+PLIST
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+mv "$app" "$HOME/moved-Target.app"
+get_path_size_kb() {
+    cat > "$agent" <<'PLIST'
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>/bin/true</string></dict></plist>
+PLIST
+    printf '1\n'
+}
+count=$(remove_file_list "$agent" false com.example.Target "$app")
+[[ "$count" == 0 ]] || exit 1
+[[ -f "$agent" ]] || exit 1
+grep -Fq '<string>/bin/true</string>' "$agent"
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "uninstall keeps LaunchAgents if another app takes the selected path" {
+    local app="$HOME/Applications/Target.app"
+    local agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+    mkdir -p "$app/Contents/MacOS" "${agent%/*}"
+    touch "$app/Contents/MacOS/Target"
+    cat > "$agent" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$app/Contents/MacOS/Target</string></dict></plist>
+PLIST
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+plan=$(find_app_files com.example.Target Target "$app")
+[[ "$plan" == *"$agent"* ]] || exit 1
+mv "$app" "$HOME/moved-Target.app"
+mkdir -p "$app/Contents/MacOS"
+touch "$app/Contents/MacOS/Target"
+rc=0
+count=$(remove_file_list "$plan" false com.example.Target "$app") || rc=$?
+[[ $rc -eq 16 && "$count" == 0 ]] || exit 1
+[[ -f "$agent" ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"selected app path exists again"* ]] || return 1
+}
+
+@test "uninstall keeps an agent if the app path reappears during sizing" {
+    local app="$HOME/Applications/Target.app"
+    local agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+    mkdir -p "$app/Contents/MacOS" "${agent%/*}"
+    touch "$app/Contents/MacOS/Target"
+    cat > "$agent" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$app/Contents/MacOS/Target</string></dict></plist>
+PLIST
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+mv "$app" "$HOME/moved-Target.app"
+get_path_size_kb() {
+    mkdir -p "$app/Contents/MacOS"
+    touch "$app/Contents/MacOS/Target"
+    printf '1\n'
+}
+count=$(remove_file_list "$agent" false com.example.Target "$app")
+[[ "$count" == 0 ]] || exit 1
+[[ -f "$agent" ]] || exit 1
+[[ -f "$app/Contents/MacOS/Target" ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "uninstall rechecks app absence at the Trash move" {
+    local app="$HOME/Applications/Target.app"
+    local agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+    mkdir -p "$app/Contents/MacOS" "${agent%/*}"
+    touch "$app/Contents/MacOS/Target"
+    cat > "$agent" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$app/Contents/MacOS/Target</string></dict></plist>
+PLIST
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+mv "$app" "$HOME/moved-Target.app"
+_mole_trash_target_still_safe() {
+    mkdir -p "$app/Contents/MacOS"
+    touch "$app/Contents/MacOS/Target"
+    return 0
+}
+count=$(remove_file_list "$agent" false com.example.Target "$app")
+[[ "$count" == 0 ]] || exit 1
+[[ -f "$agent" ]] || exit 1
+[[ -f "$app/Contents/MacOS/Target" ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "uninstall rechecks agent content at the Trash move" {
+    local app="$HOME/Applications/Target.app"
+    local agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+    mkdir -p "$app/Contents/MacOS" "${agent%/*}"
+    touch "$app/Contents/MacOS/Target"
+    cat > "$agent" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$app/Contents/MacOS/Target</string></dict></plist>
+PLIST
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+mv "$app" "$HOME/moved-Target.app"
+_mole_trash_target_still_safe() {
+    cat > "$agent" <<'PLIST'
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>/bin/true</string></dict></plist>
+PLIST
+    return 0
+}
+count=$(remove_file_list "$agent" false com.example.Target "$app")
+[[ "$count" == 0 ]] || exit 1
+[[ -f "$agent" ]] || exit 1
+grep -Fq '<string>/bin/true</string>' "$agent"
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "uninstall keeps a replacement installed during the final content check" {
+    local app="$HOME/Applications/Target.app"
+    local agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+    mkdir -p "$app/Contents/MacOS" "${agent%/*}"
+    touch "$app/Contents/MacOS/Target"
+    cat > "$agent" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$app/Contents/MacOS/Target</string></dict></plist>
+PLIST
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+mv "$app" "$HOME/moved-Target.app"
+mole_file_sha256() {
+    local digest calls=0
+    digest=$(shasum -a 256 -- "$1") || return $?
+    [[ -f "$HOME/hash-calls" ]] && read -r calls < "$HOME/hash-calls"
+    calls=$((calls + 1))
+    printf '%s\n' "$calls" > "$HOME/hash-calls"
+    if [[ $calls -eq 3 ]]; then
+        mv "$1" "$HOME/old-agent.plist"
+        cat > "$1" <<'PLIST'
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>/bin/true</string></dict></plist>
+PLIST
+    fi
+    printf '%s\n' "${digest:0:64}"
+}
+count=$(remove_file_list "$agent" false com.example.Target "$app")
+[[ "$(cat "$HOME/hash-calls")" -eq 3 ]] || exit 1
+[[ "$count" == 0 && -f "$agent" && -f "$HOME/old-agent.plist" ]] || exit 1
+grep -Fq '<string>/bin/true</string>' "$agent" || exit 1
+[[ ! -d "$MOLE_TEST_TRASH_DIR" || -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "uninstall rechecks app absence at permanent removal" {
+    local app="$HOME/Applications/Target.app"
+    local agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+    mkdir -p "$app/Contents/MacOS" "${agent%/*}"
+    touch "$app/Contents/MacOS/Target"
+    cat > "$agent" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$app/Contents/MacOS/Target</string></dict></plist>
+PLIST
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+mv "$app" "$HOME/moved-Target.app"
+MOLE_DELETE_MODE=permanent
+_MOLE_SAFE_REMOVE_FINAL_GUARD=create_replacement_app
+create_replacement_app() {
+    mkdir -p "$app/Contents/MacOS"
+    touch "$app/Contents/MacOS/Target"
+}
+count=$(remove_file_list "$agent" false com.example.Target "$app")
+[[ "$count" == 0 ]] || exit 1
+[[ -f "$agent" ]] || exit 1
+[[ -f "$app/Contents/MacOS/Target" ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "permanent removal rebinds ownership after calculating its timeout" {
+    local app="$HOME/Applications/Target.app"
+    local agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+    mkdir -p "$app/Contents/MacOS" "${agent%/*}"
+    touch "$app/Contents/MacOS/Target"
+    cat > "$agent" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$app/Contents/MacOS/Target</string></dict></plist>
+PLIST
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
+mv "$app" "$HOME/moved-Target.app"
+MOLE_DELETE_MODE=permanent
+_mole_timeout_with_deadline() {
+    local calls=0
+    if [[ "$1" == "$MOLE_TIMEOUT_DISK_VERIFY_SEC" ]]; then
+        [[ -f "$HOME/timeout-calls" ]] && read -r calls < "$HOME/timeout-calls"
+        calls=$((calls + 1))
+        printf '%s\n' "$calls" > "$HOME/timeout-calls"
+        if [[ $calls -eq 2 ]]; then
+            mv "$agent" "$HOME/original-agent.plist"
+            cat > "$agent" <<'PLIST'
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>/bin/true</string></dict></plist>
+PLIST
+        fi
+    fi
+    printf '%s\n' "$1"
+}
+count=$(remove_file_list "$agent" false com.example.Target "$app")
+[[ "$(cat "$HOME/timeout-calls")" -eq 2 ]] || { echo 'timeout boundary not reached twice'; exit 1; }
+[[ "$count" == 0 && -f "$agent" && -f "$HOME/original-agent.plist" ]] || {
+    printf 'count=%s agent=%s original=%s\n' "$count" "$(test -e "$agent" && echo yes || echo no)" "$(test -e "$HOME/original-agent.plist" && echo yes || echo no)"
+    exit 1
+}
+grep -Fq '<string>/bin/true</string>' "$agent" || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
 }
 
 @test "remove_file_list batches eligible Trash moves into a single helper call" {
@@ -129,6 +502,9 @@ EOF
 	run env PROJECT_ROOT="$PROJECT_ROOT" PS_COUNT="$ps_count" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 ps() {
+	# One snapshot is a table read plus an executable-path read; count and
+	# answer only the table read.
+	[[ "$*" == *comm=* ]] && return 0
 	printf 'x' >> "$PS_COUNT"
 	local calls
 	calls=$(wc -c < "$PS_COUNT" | tr -d ' ')
@@ -139,6 +515,8 @@ ps() {
 }
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 remove_file_list "$(printf '%s\n%s\n' \
 	"$HOME/Library/Caches/com.example.One" \
 	"$HOME/Library/Caches/com.example.Two")" false
@@ -348,4 +726,225 @@ EOF
     grep -qxF "$ordinary" "$batch_trace"
     [[ "$output" != *"trash CLI must not be called"* ]] || return 1
     [[ "$output" != *"Finder must not be called"* ]]
+}
+
+@test "uninstall refusal evidence survives protection and live-cache gates" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+export MOLE_UNINSTALL_MODE=1
+protected="$HOME/Library/Logs/com.openai.codex"
+active="$HOME/Library/Caches/com.example.Active"
+ordinary="$HOME/ordinary"
+mkdir -p "$protected" "$active" "$ordinary"
+_mole_should_refuse_live_user_cache_path() { [[ "$1" == "$active" ]]; }
+collect() {
+    local _MOLE_UNINSTALL_REFUSALS_ACTIVE=1
+    local -a _MOLE_UNINSTALL_REFUSAL_PATHS=() _MOLE_UNINSTALL_REFUSAL_REASONS=()
+    remove_file_list "$(printf '%s\n' "$protected" "$active" "$ordinary")" false
+    [[ ${#_MOLE_UNINSTALL_REFUSAL_PATHS[@]} -eq 2 ]] || exit 1
+    [[ "${_MOLE_UNINSTALL_REFUSAL_PATHS[0]}" == "$protected" && "${_MOLE_UNINSTALL_REFUSAL_REASONS[0]}" == protected ]] || exit 1
+    [[ "${_MOLE_UNINSTALL_REFUSAL_PATHS[1]}" == "$active" && "${_MOLE_UNINSTALL_REFUSAL_REASONS[1]}" == live-cache ]] || exit 1
+}
+collect
+[[ -d "$protected" && -d "$active" && ! -e "$ordinary" ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "uninstall records a live cache appearing at the final Trash guard" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+export MOLE_UNINSTALL_MODE=1
+active="$HOME/Library/Caches/com.example.Active"
+mkdir -p "$active"
+probes=0
+_mole_should_refuse_live_user_cache_path() {
+    probes=$((probes + 1))
+    [[ $probes -gt 1 ]]
+}
+collect() {
+    local _MOLE_UNINSTALL_REFUSALS_ACTIVE=1
+    local -a _MOLE_UNINSTALL_REFUSAL_PATHS=() _MOLE_UNINSTALL_REFUSAL_REASONS=()
+    remove_file_list "$active" false
+    [[ $probes -eq 2 ]] || exit 1
+    [[ ${#_MOLE_UNINSTALL_REFUSAL_PATHS[@]} -eq 1 ]] || exit 1
+    [[ "${_MOLE_UNINSTALL_REFUSAL_PATHS[0]}" == "$active" && "${_MOLE_UNINSTALL_REFUSAL_REASONS[0]}" == live-cache ]] || exit 1
+}
+collect
+[[ -d "$active" ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "uninstall records access denial from the actual direct Trash mover" {
+    mole_test_fake_command mv 'printf "mv: Permission denied\n" >&2; exit 1'
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+unset MOLE_TEST_TRASH_DIR MOLE_TEST_NO_AUTH
+export MOLE_UNINSTALL_MODE=1
+victim="$HOME/Library/Group Containers/com.example.Privacy"
+mkdir -p "$victim"
+_mole_should_refuse_live_user_cache_path() { return 1; }
+osascript() { echo unexpected-Finder >> "$HOME/unexpected"; return 99; }
+safe_remove() { echo unexpected-delete >> "$HOME/unexpected"; return 99; }
+collect() {
+    local _MOLE_UNINSTALL_REFUSALS_ACTIVE=1
+    local -a _MOLE_UNINSTALL_REFUSAL_PATHS=() _MOLE_UNINSTALL_REFUSAL_REASONS=()
+    remove_file_list "$victim" false
+    [[ ${#_MOLE_UNINSTALL_REFUSAL_PATHS[@]} -gt 0 ]] || exit 1
+    local i
+    for ((i = 0; i < ${#_MOLE_UNINSTALL_REFUSAL_PATHS[@]}; i++)); do
+        [[ "${_MOLE_UNINSTALL_REFUSAL_PATHS[$i]}" == "$victim" && "${_MOLE_UNINSTALL_REFUSAL_REASONS[$i]}" == access-denied ]] || exit 1
+    done
+}
+collect
+[[ -d "$victim" && ! -e "$HOME/unexpected" ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+
+@test "remove_file_list propagates validation cancellation before later candidates" {
+    local probe_rc failures=0
+    for probe_rc in 1 124 130; do
+        run env PROJECT_ROOT="$PROJECT_ROOT" PROBE_RC="$probe_rc" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+export MOLE_CURRENT_COMMAND=uninstall
+first="$HOME/first"
+second="$HOME/second"
+mkdir -p "$first" "$second"
+validate_path_for_deletion() {
+    printf '%s\n' "$1" >> "$HOME/probed-$PROBE_RC"
+    [[ "$1" == "$first" ]] && return "$PROBE_RC"
+    return 0
+}
+_mole_move_to_trash_batch() { printf '%s\n' "$@" > "$HOME/moved-$PROBE_RC"; }
+rc=0
+remove_file_list "$first"$'\n'"$second" false || rc=$?
+grep -Fxq "$first" "$HOME/probed-$PROBE_RC" || exit 1
+if [[ $PROBE_RC -eq 1 ]]; then
+    [[ $rc -eq 0 ]] || exit 1
+    grep -Fxq "$second" "$HOME/moved-$PROBE_RC" || exit 1
+else
+    [[ $rc -eq $PROBE_RC ]] || exit 1
+    ! grep -Fxq "$second" "$HOME/probed-$PROBE_RC" || exit 1
+    [[ ! -e "$HOME/moved-$PROBE_RC" ]] || exit 1
+fi
+EOF
+        [ "$status" -eq 0 ] || { echo "probe=$probe_rc: $output"; failures=$((failures + 1)); }
+    done
+    [ "$failures" -eq 0 ]
+}
+
+@test "remove_file_list keeps leftovers when the app returns, whatever the plan's bundle id" {
+    # The replacement test needs no inventory, so a plan narrowed to an
+    # unknown id, or an id that is not reverse-DNS, must keep name-keyed data
+    # exactly like an ordinary plan does.
+    local id
+    for id in unknown com.example.Target_Beta com.example.Target; do
+        rm -rf "$HOME/Applications" "$HOME/Library" "$HOME/moved-Target.app"
+        mkdir -p "$HOME/Applications/Target.app/Contents" "$HOME/Library/Application Support/Target"
+        printf 'notes\n' > "$HOME/Library/Application Support/Target/notes"
+        run env PROJECT_ROOT="$PROJECT_ROOT" BUNDLE_ID="$id" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+data="$HOME/Library/Application Support/Target"
+mv "$app" "$HOME/moved-Target.app"
+mkdir -p "$app/Contents"
+rc=0
+count=$(remove_file_list "$data" false "$BUNDLE_ID" "$app") || rc=$?
+[[ $rc -eq 16 && "$count" == 0 ]] || { echo "reappeared rc=$rc count=$count"; exit 1; }
+[[ -f "$data/notes" ]] || { echo "data removed while the app path was occupied"; exit 1; }
+# Positive control: with the path free, the same call reaches the sink.
+rm -rf "$app"
+rc=0
+count=$(remove_file_list "$data" false "$BUNDLE_ID" "$app") || rc=$?
+[[ $rc -eq 0 && "$count" == 1 && ! -e "$data" ]] || { echo "control rc=$rc count=$count"; exit 1; }
+EOF
+        [ "$status" -eq 0 ] || { echo "bundle id $id: $output"; return 1; }
+    done
+}
+
+@test "UUID container owner is checked after sizing and at the final Trash sink" {
+    run bash -c "$(prelude)"'
+container="$HOME/Library/Containers/ABCDEFAB-1234-1234-1234-123456789ABC"
+mkdir -p "$container"
+printf "%s\n" '\''{"MCMMetadataIdentifier":"com.example.Gizmo"}'\'' > "$container/.com.apple.containermanagerd.metadata.plist"
+get_path_size_kb() {
+    printf "%s\n" '\''{"MCMMetadataIdentifier":"com.other.Gizmo"}'\'' > "$container/.com.apple.containermanagerd.metadata.plist"
+    printf "1\n"
+}
+remove_file_list "$container" false com.example.Gizmo
+[[ -d "$container" ]] || exit 1
+grep -F ownership-unverified "$MOLE_DELETE_LOG"
+'
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "native manifest replacement during sizing retains the new owner" {
+    run bash -c "$(prelude)"'
+hosts="$HOME/Library/Application Support/Browser/NativeMessagingHosts"
+mkdir -p "$hosts"
+manifest="$hosts/gizmo.json"
+printf '\''{"path":"%s/Applications/Gizmo.app/Contents/MacOS/host"}\n'\'' "$HOME" > "$manifest"
+get_path_size_kb() {
+    printf "%s\n" '\''{"path":"/Applications/Other.app/host"}'\'' > "$manifest"
+    printf "1\n"
+}
+remove_file_list "$manifest" false com.example.Gizmo "$HOME/Applications/Gizmo.app"
+[[ -f "$manifest" ]] || exit 1
+grep -F ownership-unverified "$MOLE_DELETE_LOG"
+'
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "UUID container final guard retains changed metadata after the Trash identity check" {
+    run bash -c "$(prelude)"'
+container="$HOME/Library/Containers/ABCDEFAB-1234-1234-1234-123456789ABC"
+mkdir -p "$container"
+printf "%s\n" '\''{"MCMMetadataIdentifier":"com.example.Gizmo"}'\'' > "$container/.com.apple.containermanagerd.metadata.plist"
+eval "$(declare -f _mole_trash_target_still_safe | sed '\''1s/_mole_trash_target_still_safe/_original_trash_safe/'\'')"
+_mole_trash_target_still_safe() {
+    _original_trash_safe "$@" || return $?
+    printf "%s\n" '\''{"MCMMetadataIdentifier":"com.other.Gizmo"}'\'' > "$container/.com.apple.containermanagerd.metadata.plist"
+}
+remove_file_list "$container" false com.example.Gizmo
+[[ -d "$container" ]] || exit 1
+grep -F ownership-unverified "$MOLE_DELETE_LOG"
+'
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "UUID exact owner uses normal Trash and permanent sinks" {
+    run bash -c "$(prelude)"'
+for mode in trash permanent; do
+    export MOLE_DELETE_MODE="$mode"
+    container="$HOME/Library/Containers/ABCDEFAB-1234-1234-1234-123456789ABC"
+    mkdir -p "$container"
+    printf "%s\n" '\''{"MCMMetadataIdentifier":"com.example.Gizmo"}'\'' > "$container/.com.apple.containermanagerd.metadata.plist"
+    remove_file_list "$container" false com.example.Gizmo
+    [[ ! -d "$container" ]] || exit 1
+done
+'
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }

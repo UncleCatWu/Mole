@@ -111,36 +111,27 @@ func resolveScanTarget(envPath string, args []string) (string, bool, error) {
 
 func runTUIMode(path string, isOverview bool) error {
 	m := newModel(path, isOverview)
-	// A single parent survives model copies and navigation generations. The
-	// program's quit/interrupt messages bypass Update, so cleanup belongs here.
-	defer m.lifecycle.stop()
-	var prefetchDone chan struct{}
+	defer m.stopForExit()
 	if !isOverview {
-		prefetchCtx, prefetchCancel := context.WithTimeout(m.scanRequestContext, 30*time.Second)
-		prefetchDone = make(chan struct{})
-		defer func() { prefetchCancel(); <-prefetchDone }()
-		if !startAnalyzerWork(prefetchCtx, func() { defer close(prefetchDone); prefetchOverviewCache(prefetchCtx) }) {
-			close(prefetchDone)
-		}
+		prefetchCtx, prefetchCancel := context.WithTimeout(m.lifetimeContext(), 30*time.Second)
+		defer prefetchCancel()
+		m.startOverviewPrefetch(prefetchCtx)
 	}
 	return runAnalyzerProgram(m, tea.WithAltScreen())
 }
 
 func runAnalyzerProgram(m model, options ...tea.ProgramOption) error {
-	defer m.lifecycle.stop()
+	defer m.stopForExit()
 	options = append(options, tea.WithFilter(analyzerExitFilter))
 	final, err := tea.NewProgram(m, options...).Run()
-	// Also handles renderer/input errors and killed programs, which need not
-	// deliver a quit message. Do this before returning to main's os.Exit.
-	if final, ok := final.(model); ok {
-		final.stopForExit()
+	if stopped, ok := final.(interface{ stopForExit() }); ok {
+		stopped.stopForExit()
 	}
 	return err
 }
 
 func newModel(path string, isOverview bool) model {
 	lifecycle := newAnalyzerLifecycle()
-	scanContext, scanCancel, scanPublication := newScanRequestContext(lifecycle.ctx)
 	var filesScanned, dirsScanned, bytesScanned int64
 	currentPath := &atomic.Value{}
 	currentPath.Store("")
@@ -151,30 +142,26 @@ func newModel(path string, isOverview bool) model {
 	}
 
 	m := model{
-		lifecycle:              lifecycle,
-		path:                   path,
-		selected:               0,
-		status:                 "Preparing scan...",
-		diskFree:               diskFreeBytes,
-		scanning:               !isOverview,
-		filesScanned:           &filesScanned,
-		dirsScanned:            &dirsScanned,
-		bytesScanned:           &bytesScanned,
-		currentPath:            currentPath,
-		showLargeFiles:         false,
-		isOverview:             isOverview,
-		cache:                  make(map[string]historyEntry),
-		overviewSizeCache:      make(map[string]int64),
-		overviewScanningSet:    make(map[string]bool),
-		overviewRequestIDs:     make(map[string]int64),
-		multiSelected:          make(map[string]bool),
-		largeMultiSelected:     make(map[string]bool),
-		liveSortMode:           liveScanSortModeFromEnv(),
-		scanRequestID:          1,
-		scanRequestPublication: scanPublication,
-		scanRequestContext:     scanContext,
-		scanRequestCancel:      scanCancel,
-		snapshotRunner:         runLocalSnapshotCommand,
+		lifecycle:           lifecycle,
+		path:                path,
+		selected:            0,
+		status:              "Preparing scan...",
+		diskFree:            diskFreeBytes,
+		scanning:            !isOverview,
+		filesScanned:        &filesScanned,
+		dirsScanned:         &dirsScanned,
+		bytesScanned:        &bytesScanned,
+		currentPath:         currentPath,
+		showLargeFiles:      false,
+		isOverview:          isOverview,
+		cache:               make(map[string]historyEntry),
+		overviewSizeCache:   make(map[string]int64),
+		overviewScanningSet: make(map[string]*scanPublication),
+		cachePublications:   make(map[string]*scanPublication),
+		multiSelected:       make(map[string]bool),
+		largeMultiSelected:  make(map[string]bool),
+		liveSortMode:        liveSortFreezeOnMove,
+		snapshotRunner:      runLocalSnapshotCommand,
 	}
 
 	if isOverview {
@@ -222,6 +209,7 @@ func createOverviewEntriesWithInsights(insightEntries []dirEntry) []dirEntry {
 	}
 
 	entries = append(entries, systemOverviewRoots()...)
+	entries = append(entries, mountedVolumeOverviewEntries()...)
 
 	// Hidden space insights: paths that silently accumulate disk usage.
 	entries = append(entries, insightEntries...)
@@ -255,37 +243,6 @@ func sumKnownEntrySizes(entries []dirEntry) int64 {
 		}
 	}
 	return total
-}
-
-// Overview insights overlap their containing rows. Home is the exception:
-// its measurement excludes Library, which is a separate, disjoint row.
-func overviewPathContains(parent, child string) bool {
-	if parent == "" || child == "" {
-		return false
-	}
-	if home := os.Getenv("HOME"); home != "" && filepath.Clean(parent) == filepath.Clean(home) {
-		library := filepath.Join(home, "Library")
-		if filepath.Clean(child) == library || pathIsWithin(library, child) {
-			return false
-		}
-	}
-	if home := os.Getenv("HOME"); home != "" && filepath.Clean(parent) == filepath.Join(home, "Downloads") {
-		// This insight measures old immediate children, not every descendant.
-		return false
-	}
-	rel, err := filepath.Rel(parent, child)
-	if err == nil && rel != "." {
-		if first, _, _ := strings.Cut(rel, string(filepath.Separator)); overviewDuIgnoreNames[first] {
-			return false
-		}
-	}
-	return pathIsWithin(parent, child)
-}
-
-func pathIsWithin(parent, child string) bool {
-	rel, err := filepath.Rel(parent, child)
-	return err == nil && rel != "." && rel != ".." && !filepath.IsAbs(rel) &&
-		!strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func nextPendingOverviewIndex(entries []dirEntry) int {
@@ -327,4 +284,27 @@ func safePreview(path string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), openCommandTimeout)
 	defer cancel()
 	return exec.CommandContext(ctx, "open", path).Run()
+}
+
+func overviewPathContains(parent, child string) bool {
+	if parent == "" || child == "" {
+		return false
+	}
+	if home := os.Getenv("HOME"); home != "" && filepath.Clean(parent) == filepath.Clean(home) {
+		library := filepath.Join(home, "Library")
+		if filepath.Clean(child) == library || pathIsWithin(child, library) {
+			return false
+		}
+	}
+	if home := os.Getenv("HOME"); home != "" && filepath.Clean(parent) == filepath.Join(home, "Downloads") {
+		// This insight measures old immediate children, not every descendant.
+		return false
+	}
+	rel, err := filepath.Rel(parent, child)
+	if err == nil && rel != "." {
+		if first, _, _ := strings.Cut(rel, string(filepath.Separator)); overviewDuIgnoreNames[first] {
+			return false
+		}
+	}
+	return filepath.Clean(parent) != filepath.Clean(child) && pathIsWithin(filepath.Clean(child), filepath.Clean(parent))
 }

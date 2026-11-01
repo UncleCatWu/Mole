@@ -98,7 +98,8 @@ truncate_by_display_width() {
     current_width=$(get_display_width "$str")
 
     if [[ $current_width -le $max_width ]]; then
-        echo "$str"
+        # printf, not echo: a string such as "-n" or "-e" is an echo option.
+        printf '%s\n' "$str"
         return
     fi
 
@@ -160,14 +161,21 @@ truncate_by_display_width() {
         unset LC_ALL
     fi
 
-    echo "${truncated}..."
+    printf '%s...\n' "$truncated"
 }
 
 # Read single keyboard input
 read_key() {
     local key rest read_status
-    IFS= read -r -s -n 1 key
-    read_status=$?
+    if [[ "${1:-}" == "1" ]]; then
+        # Bash 3.2 returns 1 for both EOF and timeout; elapsed shell time
+        # distinguishes an idle tick from immediate EOF. ESC reads stay below.
+        local read_started=$SECONDS
+        if IFS= read -r -s -n 1 -t 1 key; then read_status=0; else read_status=$?; fi
+        if [[ "$read_status" -ne 0 ]] && ((SECONDS > read_started)); then return 1; fi
+    else
+        if IFS= read -r -s -n 1 key; then read_status=0; else read_status=$?; fi
+    fi
     [[ $read_status -ne 0 ]] && {
         echo "QUIT"
         return 0
@@ -223,7 +231,7 @@ read_key() {
             $'\n' | $'\r') echo "ENTER" ;;
             $'\x7f' | $'\x08') echo "DELETE" ;;
             $'\x15') echo "CLEAR_LINE" ;; # Ctrl+U (often mapped from Cmd+Delete in terminals)
-            ' ') echo "SPACE" ;;          # Allow space in filter mode for selection
+            ' ') echo "SPACE" ;;          # Search input or selection, decided by the menu
             $'\x03') echo "QUIT" ;;
             [[:print:]]) echo "CHAR:$key" ;;
             *) echo "OTHER" ;;
@@ -268,13 +276,48 @@ read_key() {
     esac
 }
 
+# Absolute path on purpose: a version-manager shim earlier on PATH can fail or
+# start slowly, and this runs after every menu key.
+_mole_drain_with_perl() {
+    [[ -x /usr/bin/perl ]] || return 127
+    /usr/bin/perl -MPOSIX=tcflush,TCIFLUSH -e '
+        my $timeout = shift;
+        if (-t STDIN) {
+            select undef, undef, undef, $timeout;
+            exit(defined(tcflush(fileno(STDIN), TCIFLUSH)) ? 0 : 1);
+        }
+        my $input = "";
+        vec($input, fileno(STDIN), 1) = 1;
+        for (1..101) {
+            my $ready = $input;
+            last unless select($ready, undef, undef, $timeout) > 0;
+            last unless sysread(STDIN, my $byte, 1);
+            $timeout = 0.01;
+        }
+    ' "$1" 2> /dev/null
+}
+
 drain_pending_input() {
     local idle_timeout="${1:-0.01}"
+    local between_timeout="0.01"
+    # Bash 3.2 rejects fractional read timeouts, and read -t 0 never consumes
+    # input. Use macOS's Perl for the short idle wait without changing TTY modes.
+    if [[ "${BASH_VERSINFO[0]:-0}" -lt 4 ]]; then
+        if _mole_drain_with_perl "$idle_timeout"; then
+            return 0
+        fi
+        # An integer read would block a terminal for a full second per call,
+        # so a terminal without Perl keeps its queue rather than stalling keys.
+        [[ -t 0 ]] && return 0
+        # Pipes have no keystrokes to delay; integer reads still drain them.
+        idle_timeout="1"
+        between_timeout="1"
+    fi
     local drained=0
     while IFS= read -r -s -n 1 -t "$idle_timeout" _ 2> /dev/null; do
         drained=$((drained + 1))
         [[ $drained -gt 100 ]] && break
-        idle_timeout="0.01"
+        idle_timeout="$between_timeout"
     done
     return 0
 }
@@ -437,7 +480,7 @@ stop_inline_spinner() {
         INLINE_SPINNER_CONTROL_DIR=""
 
         # Clear the line - use \033[2K to clear entire line, not just to end
-        [[ -t 1 ]] && printf "\r\033[2K" >&2 || true
+        [[ -t 2 ]] && printf "\r\033[2K" >&2 || true
     fi
 }
 
@@ -466,9 +509,9 @@ update_inline_spinner_message() {
     return 0
 }
 
-# Get spinner characters
+# Keep the spinner in the middle two braille rows for a centered 2x2 shape.
 mo_spinner_chars() {
-    printf "%s\n" "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"
+    printf "%s\n" "⠖" "⠲" "⠴" "⠦"
 }
 
 # Fill MO_SPINNER_FRAMES, one frame per element, for every spinner loop.
@@ -552,8 +595,12 @@ has_full_disk_access() {
         # Only test when the protected path exists
         if [[ -e "$test_path" ]]; then
             tested_count=$((tested_count + 1))
-            # Try to stat the ACTUAL protected path - this requires FDA
-            if stat "$test_path" > /dev/null 2>&1; then
+            # stat succeeds without FDA; only reading the contents proves access
+            if [[ -d "$test_path" ]]; then
+                if /bin/ls "$test_path" > /dev/null 2>&1; then
+                    accessible_count=$((accessible_count + 1))
+                fi
+            elif { : < "$test_path"; } 2> /dev/null; then
                 accessible_count=$((accessible_count + 1))
             fi
         fi

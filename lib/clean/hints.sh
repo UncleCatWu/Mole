@@ -66,7 +66,7 @@ hint_collect_child_dirs_with_timeout() {
     # 1s: shallow directory listing should be near-instant on healthy local
     # paths. Slow/cloud-backed roots are skipped so `mo clean` never appears
     # stuck while rendering this non-destructive hint.
-    run_with_timeout "$timeout_seconds" find "$parent" -mindepth 1 -maxdepth 1 -type d -print0 > "$output_file" 2> /dev/null
+    run_with_timeout "$timeout_seconds" "$FIND_BSD" "$parent" -mindepth 1 -maxdepth 1 -type d -print0 > "$output_file" 2> /dev/null
 }
 
 # shellcheck disable=SC2329
@@ -296,8 +296,8 @@ probe_project_artifact_hints() {
             fi
             [[ -d "$project_dir" ]] || continue
 
-            local project_name
-            project_name=$(basename "$project_dir")
+            local project_name="${project_dir%/}"
+            project_name="${project_name##*/}"
             [[ "$project_name" == .* ]] && continue
 
             if [[ $root_projects_scanned -ge $max_projects_per_root ]]; then
@@ -350,8 +350,8 @@ probe_project_artifact_hints() {
                 fi
                 [[ -d "$nested_dir" ]] || continue
 
-                local nested_name
-                nested_name=$(basename "$nested_dir")
+                local nested_name="${nested_dir%/}"
+                nested_name="${nested_name##*/}"
                 [[ "$nested_name" == .* ]] && continue
 
                 case "$nested_name" in
@@ -411,14 +411,32 @@ show_project_artifact_hint_notice() {
         return 0
     fi
 
-    note_activity
-
     local hint_count_label="$PROJECT_ARTIFACT_HINT_COUNT"
     [[ "$PROJECT_ARTIFACT_HINT_TRUNCATED" == "true" ]] && hint_count_label="${hint_count_label}+"
 
     local review_command="mo purge"
     if [[ $PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES -gt 0 && $PROJECT_ARTIFACT_HINT_ESTIMATED_KB -eq 0 ]]; then
         review_command="mo purge --include-empty"
+    fi
+
+    # A fully measured estimate below the floor is not worth a row: four
+    # directories holding 20KB read as "you have something to clean" and cost a
+    # `mo purge` round trip to find out they do not. 200MB is where reclaiming
+    # build output moves the number the user came for. A constant, not a knob,
+    # because this repo counts a new env var as a new setting. A truncated,
+    # partial or UNKNOWN measurement still prints: a sizing timeout has to stay
+    # visible rather than be rounded down into silence. A measured ZERO is
+    # exempt too, because that row is not about size at all: it points at empty
+    # candidate directories and the `--include-empty` command that lists them
+    # (#869).
+    local min_kb=204800
+    if [[ $PROJECT_ARTIFACT_HINT_ESTIMATED_KB -gt 0 ]] &&
+        [[ $PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES -gt 0 ]] &&
+        [[ $PROJECT_ARTIFACT_HINT_ESTIMATED_KB -lt $min_kb ]] &&
+        [[ "$PROJECT_ARTIFACT_HINT_TRUNCATED" != "true" ]] &&
+        [[ "$PROJECT_ARTIFACT_HINT_ESTIMATE_PARTIAL" != "true" ]] &&
+        [[ $PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES -ge $PROJECT_ARTIFACT_HINT_COUNT ]]; then
+        return 0
     fi
 
     # One compact row: "Build artifacts · 15+ dirs, 985.6MB+ · mo purge".
@@ -444,6 +462,7 @@ show_project_artifact_hint_notice() {
         partial_note=" ${GRAY}(partial scan)${NC}"
     fi
 
+    note_activity
     echo -e "  ${YELLOW}${ICON_REVIEW}${NC} Build artifacts · ${GREEN}${detail}${NC} · ${GRAY}${review_command}${NC}${partial_note}"
 }
 

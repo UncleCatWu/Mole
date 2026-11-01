@@ -47,7 +47,7 @@ start_line_spinner() {
     (while true; do
         c="${chars:$((i % ${#chars})):1}"
         printf "\r${BLUE}%s${NC} %s" "$c" "$msg"
-        ((i++))
+        i=$((i + 1))
         sleep 0.12
     done) &
     _SPINNER_PID=$!
@@ -68,12 +68,12 @@ ICON_ADMIN="●"
 ICON_CONFIRM="◎"
 ICON_ERROR="☻"
 
-log_info() { [[ ${VERBOSE} -eq 1 ]] && echo -e "${BLUE}$1${NC}"; }
-log_success() { [[ ${VERBOSE} -eq 1 ]] && echo -e "${GREEN}${ICON_SUCCESS}${NC} $1"; }
-log_warning() { [[ ${VERBOSE} -eq 1 ]] && echo -e "${YELLOW}$1${NC}"; }
+log_info() { if [[ ${VERBOSE} -eq 1 ]]; then echo -e "${BLUE}$1${NC}"; fi; }
+log_success() { if [[ ${VERBOSE} -eq 1 ]]; then echo -e "${GREEN}${ICON_SUCCESS}${NC} $1"; fi; }
+log_warning() { if [[ ${VERBOSE} -eq 1 ]]; then echo -e "${YELLOW}$1${NC}"; fi; }
 log_error() { echo -e "${YELLOW}${ICON_ERROR}${NC} $1"; }
-log_admin() { [[ ${VERBOSE} -eq 1 ]] && echo -e "${BLUE}${ICON_ADMIN}${NC} $1"; }
-log_confirm() { [[ ${VERBOSE} -eq 1 ]] && echo -e "${BLUE}${ICON_CONFIRM}${NC} $1"; }
+log_admin() { if [[ ${VERBOSE} -eq 1 ]]; then echo -e "${BLUE}${ICON_ADMIN}${NC} $1"; fi; }
+log_confirm() { if [[ ${VERBOSE} -eq 1 ]]; then echo -e "${BLUE}${ICON_CONFIRM}${NC} $1"; fi; }
 
 curl_download_with_retry() {
     local url="$1"
@@ -177,6 +177,13 @@ INSTALL_LOCK_UNSAFE_ANCESTOR=""
 # user to run something that changes nothing and retry into the same refusal.
 INSTALL_LOCK_UNSAFE_ANCESTOR_REASON=""
 INSTALL_SOURCE_TMP=""
+# Release checksums and their attestation verdict are cached per tag for the
+# life of one installer run: analyze and status are verified against the same
+# signed SHA256SUMS, so the file is fetched and attested once. Each asset still
+# gets its own sha256 comparison in verify_release_asset_checksum.
+INSTALL_CHECKSUMS_TAG=""
+INSTALL_CHECKSUMS_FILE=""
+INSTALL_CHECKSUMS_ATTESTATION=2
 
 ACTION="install"
 
@@ -683,6 +690,10 @@ release_install_lock() {
 cleanup_installer() {
     stop_line_spinner 2> /dev/null || true
     release_install_lock
+    if [[ -n "$INSTALL_CHECKSUMS_FILE" ]]; then
+        rm -f "$INSTALL_CHECKSUMS_FILE" || true # SAFE: exact mktemp-created checksums file
+        INSTALL_CHECKSUMS_FILE=""
+    fi
     if [[ -n "$INSTALL_SOURCE_TMP" ]]; then
         # Teardown never decides the exit status. This runs from the EXIT trap
         # under `set -e`, so a refusal here used to turn a finished, verified
@@ -818,7 +829,8 @@ resolve_source_dir() {
             stop_line_spinner
             # Only exit early for version tags (not for main/dev branches)
             if [[ "$branch" != "main" && "$branch" != "dev" ]]; then
-                log_error "Failed to fetch version ${branch}. Check if tag exists."
+                log_error "Could not download Mole ${branch} from GitHub. Check that github.com is reachable from this network"
+                log_error "Retry when it is, or confirm the tag exists on the releases page if the network is fine"
                 exit 1
             fi
         fi
@@ -826,7 +838,7 @@ resolve_source_dir() {
     stop_line_spinner
 
     start_line_spinner "Cloning Mole source..."
-    if command -v git > /dev/null 2>&1; then
+    if installer_git_runs_quietly; then
         local clone_succeeded=false
         if [[ -n "$source_commit" ]]; then
             if git init -q "$tmp/mole" > /dev/null 2>&1 &&
@@ -886,19 +898,38 @@ get_latest_release_tag() {
     tag=$(curl -fsSL --connect-timeout 2 --max-time 3 \
         "https://api.github.com/repos/tw93/mole/releases/latest" 2> /dev/null |
         sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
-    if [[ -z "$tag" ]]; then
+    if [[ -z "$tag" || ! "$tag" =~ ^V[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         return 1
     fi
     printf '%s\n' "$tag"
 }
 
+# /usr/bin/git is a stub until the Command Line Tools are installed, and
+# running it opens their installer. Plain assignments so a test can point both
+# at fixtures after sourcing.
+INSTALLER_SYSTEM_GIT_STUB="/usr/bin/git"
+INSTALLER_XCODE_SELECT_BIN="/usr/bin/xcode-select"
+
+# Succeeds when git can run without popping up the Command Line Tools installer.
+installer_git_runs_quietly() {
+    local git_bin
+    git_bin=$(command -v git 2> /dev/null) || return 1
+    [[ "$git_bin" == "$INSTALLER_SYSTEM_GIT_STUB" ]] || return 0
+    "$INSTALLER_XCODE_SELECT_BIN" -p > /dev/null 2>&1
+}
+
 get_latest_release_tag_from_git() {
-    if ! command -v git > /dev/null 2>&1; then
+    if ! installer_git_runs_quietly; then
         return 1
     fi
-    git ls-remote --tags --refs https://github.com/tw93/mole.git 2> /dev/null |
+    # Only plain macOS tags: the Windows CLI publishes V<x.y.z>-windows in the
+    # same repository, and sort -V ranks V1.60.0-windows above V1.60.0.
+    # install.sh has no timeout helper, so a stalled transfer is cut off by
+    # git's own low-speed limit instead.
+    git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=10 \
+        ls-remote --tags --refs https://github.com/tw93/mole.git 2> /dev/null |
         awk -F/ '{print $NF}' |
-        grep -E '^V[0-9]' |
+        grep -E '^V[0-9]+\.[0-9]+\.[0-9]+$' |
         sort -V |
         tail -n 1
 }
@@ -987,13 +1018,10 @@ verify_release_asset_checksum() {
     local tag="$1"
     local asset_name="$2"
     local file="$3"
-    local checksums_file
-    checksums_file="$(mktemp "${TMPDIR:-/tmp}/mole-checksums.XXXXXX")" || return 1
-
     local expected=""
     local actual=""
     local result=1
-    local attestation_status=2
+    local checksums_ready=false
 
     # The checksums fetch and the attestation check are separate network round
     # trips that can take several seconds each. With nothing on screen this is
@@ -1001,29 +1029,52 @@ verify_release_asset_checksum() {
     # spinner up until the first real line prints.
     start_line_spinner "Verifying ${asset_name}..."
 
-    if download_release_checksums "$tag" "$checksums_file" > /dev/null 2>&1; then
-        # Anchor the SHA256SUMS file to its GitHub Actions build-provenance
-        # attestation before reading checksums from it. If gh is available,
-        # an attestation mismatch is fatal; without gh, fall through to
-        # checksum-only verification (matches prior behavior).
-        verify_release_attestation "$checksums_file"
-        attestation_status=$?
+    if [[ "$tag" == "$INSTALL_CHECKSUMS_TAG" && -n "$INSTALL_CHECKSUMS_FILE" &&
+        -f "$INSTALL_CHECKSUMS_FILE" ]]; then
+        checksums_ready=true
+    else
+        if [[ -n "$INSTALL_CHECKSUMS_FILE" && -f "$INSTALL_CHECKSUMS_FILE" ]]; then
+            rm -f "$INSTALL_CHECKSUMS_FILE" # SAFE: exact mktemp-created checksums file
+        fi
+        INSTALL_CHECKSUMS_TAG=""
+        INSTALL_CHECKSUMS_FILE=""
+        local checksums_file
+        checksums_file="$(mktemp "${TMPDIR:-/tmp}/mole-checksums.XXXXXX")" || {
+            stop_line_spinner
+            return 1
+        }
+        if download_release_checksums "$tag" "$checksums_file" > /dev/null 2>&1; then
+            # Anchor the SHA256SUMS file to its GitHub Actions build-provenance
+            # attestation before reading checksums from it. If gh is available,
+            # an attestation mismatch is fatal; without gh, fall through to
+            # checksum-only verification (matches prior behavior). The verdict
+            # belongs to the file, so it is reused for the run's other assets.
+            verify_release_attestation "$checksums_file"
+            INSTALL_CHECKSUMS_ATTESTATION=$?
+            INSTALL_CHECKSUMS_TAG="$tag"
+            INSTALL_CHECKSUMS_FILE="$checksums_file"
+            checksums_ready=true
+        else
+            rm -f "$checksums_file" # SAFE: exact mktemp-created checksums file
+        fi
+    fi
+
+    if [[ "$checksums_ready" == "true" ]]; then
+        local attestation_status="$INSTALL_CHECKSUMS_ATTESTATION"
 
         if [[ "$attestation_status" -eq 1 ]]; then
             stop_line_spinner
             log_error "Release attestation verification failed for ${asset_name}"
-            rm -f "$checksums_file"
             return 1
         fi
 
         if [[ "$attestation_status" -eq 2 && "${MOLE_REQUIRE_ATTESTATION:-0}" == "1" ]]; then
             stop_line_spinner
             log_error "MOLE_REQUIRE_ATTESTATION=1 set but gh CLI unavailable or unauthenticated"
-            rm -f "$checksums_file"
             return 1
         fi
 
-        expected=$(extract_release_checksum "$checksums_file" "$asset_name" 2> /dev/null || true)
+        expected=$(extract_release_checksum "$INSTALL_CHECKSUMS_FILE" "$asset_name" 2> /dev/null || true)
         actual=$(calculate_file_sha256 "$file" 2> /dev/null || true)
         if [[ -n "$expected" && -n "$actual" && "$expected" == "$actual" ]]; then
             result=0
@@ -1035,7 +1086,6 @@ verify_release_asset_checksum() {
     fi
 
     stop_line_spinner
-    rm -f "$checksums_file"
     return "$result"
 }
 
@@ -1048,7 +1098,7 @@ get_installed_version() {
         if [[ -n "$version" ]]; then
             echo "$version"
         else
-            sed -n 's/^VERSION="\(.*\)"$/\1/p' "$binary" | head -n1
+            LC_ALL=C sed -n 's/^VERSION="\(.*\)"$/\1/p' "$binary" | head -n1
         fi
     fi
 }
@@ -1276,8 +1326,17 @@ check_requirements() {
             echo ""
             exit 1
         else
-            log_warning "Cleaning up stale Homebrew installation..."
-            brew uninstall --force mole > /dev/null 2>&1 || true
+            # The Cellar holds a Homebrew Mole, but the launcher this shell
+            # resolves is not its symlink: another copy comes first in PATH, or
+            # brew's link is missing. Uninstalling the keg here would delete an
+            # install the user never asked this run to touch, and `brew` resets
+            # sudo's cached ticket, which breaks the pre-authenticated
+            # `mo update` window. Report the conflict with the exact command and
+            # keep installing; a manual copy can coexist with the keg.
+            local active_launcher="${mole_path:-no mole command on PATH}"
+            log_warning "A Homebrew Mole is also installed, but the active launcher is ${active_launcher}"
+            log_warning "Leaving the Homebrew install untouched; this run installs the manual copy beside it"
+            log_warning "To remove the Homebrew copy instead: brew uninstall --force mole"
         fi
     fi
 
@@ -1463,6 +1522,9 @@ download_binary() {
 
     local fallback_tag
     fallback_tag=$(get_latest_release_tag 2> /dev/null || true)
+    if [[ -z "$fallback_tag" ]]; then
+        fallback_tag=$(get_latest_release_tag_from_git 2> /dev/null || true)
+    fi
     if [[ -n "$fallback_tag" && "$fallback_tag" != "$release_tag" ]]; then
         local fallback_url="https://github.com/tw93/mole/releases/download/${fallback_tag}/${asset_name}"
         start_line_spinner "Retrying ${binary_name} from ${fallback_tag}..."
@@ -1494,6 +1556,7 @@ download_binary() {
     fi
     rm -f "$staged_path"
     log_error "Failed to install ${binary_name} binary"
+    log_error "Its release download from github.com did not complete, so ${binary_name} stays unavailable; run mo update again once github.com is reachable"
     return 1
 }
 
@@ -1594,7 +1657,10 @@ install_files() {
 
     if [[ "$source_dir_abs" != "$install_dir_abs" ]]; then
         local quoted_config config_replacement
-        printf -v quoted_config '%q' "$CONFIG_DIR"
+        quoted_config=$(
+            export LC_ALL=C
+            printf '%q' "$config_dir_abs"
+        )
         config_replacement="${quoted_config//\\/\\\\}"
         config_replacement="${config_replacement//&/\\&}"
         config_replacement="${config_replacement//|/\\|}"
@@ -1923,20 +1989,28 @@ perform_update() {
     echo -e "${GREEN}${ICON_SUCCESS}${NC} Updated to latest version, $updated_version"
 }
 
-parse_args "$@"
-normalize_install_dir || {
-    log_error "Could not resolve the installation directory: $INSTALL_DIR"
-    exit 1
+main() {
+    parse_args "$@"
+    normalize_install_dir || {
+        log_error "Could not resolve the installation directory: $INSTALL_DIR"
+        exit 1
+    }
+
+    trap 'cleanup_installer' EXIT
+    trap 'cleanup_installer; exit 130' INT TERM
+
+    case "$ACTION" in
+        update)
+            perform_update
+            ;;
+        *)
+            perform_install
+            ;;
+    esac
 }
 
-trap 'cleanup_installer' EXIT
-trap 'cleanup_installer; exit 130' INT TERM
-
-case "$ACTION" in
-    update)
-        perform_update
-        ;;
-    *)
-        perform_install
-        ;;
-esac
+# Dispatch when executed, directly or as `bash install.sh`, and when piped
+# (`curl ... | bash`, where BASH_SOURCE[0] is empty). Sourcing only loads
+# definitions for tests. Kept as the final line so a truncated download never
+# reaches main.
+[[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "$0" ]] || main "$@"

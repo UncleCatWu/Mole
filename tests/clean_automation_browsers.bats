@@ -1,26 +1,17 @@
 #!/usr/bin/env bats
+
+load helpers/common
+
 # Leaked automation-browser cleanup: only automation-profile processes are
 # touched, dry-run never kills, and in-use profiles are never deleted.
 
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-automation-browsers.XXXXXX")"
-    export HOME
+    mole_test_setup_home automation-browsers
     mkdir -p "$HOME"
 }
 
 teardown_file() {
-    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
-        rm -rf "$HOME"
-    fi
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 # Stub binaries: ps emits one playwright-cli session daemon (ppid 1 by design,
@@ -62,7 +53,16 @@ run_cleanup() {
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+# Registry housekeeping belongs to fixture setup; trace the cleanup probes only.
+[[ ! -f "$HOME/ps.trace" ]] || : > "$HOME/ps.trace"
 DRY_RUN="$DRY"
+# These cases exercise process identity, not timeout backend scheduling.
+# Keep the real ps fixtures and PID rebind checks behind the same call boundary.
+run_with_timeout() {
+    [[ $# -ge 2 && "$1" == "$MOLE_TIMEOUT_QUICK_DETECT_SEC" && ( "$2" == ps || "$2" == pgrep ) ]] || return 99
+    shift
+    "$@"
+}
 kill() { printf 'KILL %s\n' "$*" >> "$TRACE"; return 0; }
 sleep() { :; }
 safe_clean() {
@@ -83,8 +83,10 @@ EOF
 @test "does not signal a PID replaced between discovery and TERM" {
     make_process_stubs
     : > "$HOME/kill.trace"
+    : > "$HOME/ps.trace"
     cat > "$HOME/bin/ps" <<'SCRIPT'
 #!/bin/bash
+printf '%s\n' "$*" >> "$HOME/ps.trace"
 if [[ "$1" == "-Ao" ]]; then
     printf '%s\n' '  902     1 01-20:00:00 Tue Sep  1 02:03:04 2026 /Applications/Chrome.app/x --user-data-dir=/tmp/playwright_chromiumdev_profile-old'
 else
@@ -95,6 +97,7 @@ SCRIPT
 
     run_cleanup false
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$(cat "$HOME/ps.trace")" == $'-Ao pid=,ppid=,etime=,lstart=,command= -ww\n-p 902 -o pid=,ppid=,etime=,lstart=,command= -ww' ]] || { cat "$HOME/ps.trace"; return 1; }
     [[ "$output" == *"stopped 0 processes"* ]] || { echo "$output"; return 1; }
     [ ! -s "$HOME/kill.trace" ] || { cat "$HOME/kill.trace"; return 1; }
 }
@@ -119,6 +122,8 @@ SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
+# Registry housekeeping belongs to fixture setup; trace the cleanup probes only.
+[[ ! -f "$HOME/ps.trace" ]] || : > "$HOME/ps.trace"
 DRY_RUN="$DRY"
 kill() {
     printf 'KILL %s\n' "$*" >> "$TRACE"
@@ -182,6 +187,26 @@ EOF
     # In-use profile (pgrep hit) and fresh profile (under 2h) stay.
     [[ "$output" != *"SAFE_CLEAN"*"profile-live"* ]] || { echo "$output"; return 1; }
     [[ "$output" != *"SAFE_CLEAN"*"profile-fresh"* ]] || { echo "$output"; return 1; }
+}
+
+@test "GNU stat earlier in PATH does not break stale profile cleanup (#1752)" {
+    make_process_stubs
+    : > "$HOME/kill.trace"
+    mkdir -p "$HOME/tmproot/playwright_chromiumdev_profile-stale"
+    touch -t 202601010000 "$HOME/tmproot/playwright_chromiumdev_profile-stale"
+    # GNU coreutils reads -f as "file system status": it prints a File: block
+    # and fails on the format operand, which aborted mo clean under set -u.
+    cat > "$HOME/bin/stat" <<'SCRIPT'
+#!/bin/bash
+printf '  File: "%s"\n    ID: 0 Namelen: ? Type: apfs\n' "${@: -1}"
+exit 1
+SCRIPT
+    chmod +x "$HOME/bin/stat"
+
+    run_cleanup false
+    rm -f "$HOME/bin/stat"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SAFE_CLEAN"*"profile-stale"* ]] || { echo "$output"; return 1; }
 }
 
 @test "a profile is kept when pgrep cannot answer" {

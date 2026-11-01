@@ -5,8 +5,9 @@ setup() {
     export PROJECT_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
     export REVIEW_FIXTURE="$(mktemp -d "$BATS_TEST_TMPDIR/uninstall-hardening.XXXXXX")"
     export HOME="$REVIEW_FIXTURE/home" TMPDIR="$REVIEW_FIXTURE/tmp"
-    mkdir -p "$HOME" "$TMPDIR" "$REVIEW_FIXTURE/stubs"
+    mkdir -p "$HOME" "$TMPDIR" "$REVIEW_FIXTURE/stubs" "$HOME/receipt-db"
     export MOLE_RESOLVED_TMPDIR="$TMPDIR" MOLE_TEST_NO_AUTH=1 MOLE_TEST_MODE=1
+    export MOLE_PKG_RECEIPT_DB_DIR="$HOME/receipt-db"
     unset SUDO_USER SUDO_UID SUDO_GID MOLE_TEMP_REGISTRY_FILE
 }
 
@@ -22,7 +23,7 @@ STUB
     chmod +x "$REVIEW_FIXTURE/stubs/pkgutil"
     run env PATH="$REVIEW_FIXTURE/stubs:/usr/bin:/bin" /bin/bash <<'SCRIPT'
 set -euo pipefail
-source "$PROJECT_ROOT/lib/core/pkg_receipts.sh"
+source "$PROJECT_ROOT/lib/core/common.sh"
 run_with_timeout() { shift; "$@"; }
 get_file_mtime() { /usr/bin/stat -f%m "$1"; }
 MOLE_PKG_RECEIPT_CACHE_FILE="$HOME/receipt-cache"
@@ -50,7 +51,7 @@ STUB
     chmod +x "$REVIEW_FIXTURE/stubs/pkgutil"
     run env PATH="$REVIEW_FIXTURE/stubs:/usr/bin:/bin" /bin/bash <<'SCRIPT'
 set -euo pipefail
-source "$PROJECT_ROOT/lib/core/pkg_receipts.sh"
+source "$PROJECT_ROOT/lib/core/common.sh"
 run_with_timeout() { shift; "$@"; }
 get_file_mtime() { /usr/bin/stat -f%m "$1"; }
 MOLE_PKG_RECEIPT_CACHE_FILE="$HOME/receipt-cache"
@@ -81,7 +82,7 @@ STUB
     chmod +x "$REVIEW_FIXTURE/stubs/pkgutil"
     run env PATH="$REVIEW_FIXTURE/stubs:/usr/bin:/bin" /bin/bash <<'SCRIPT'
 set -euo pipefail
-source "$PROJECT_ROOT/lib/core/pkg_receipts.sh"
+source "$PROJECT_ROOT/lib/core/common.sh"
 run_with_timeout() { shift; "$@"; }
 get_file_mtime() { /usr/bin/stat -f%m "$1"; }
 MOLE_PKG_RECEIPT_CACHE_FILE="$HOME/receipt-cache"
@@ -179,7 +180,7 @@ STUB
     chmod +x "$REVIEW_FIXTURE/stubs/pkgutil"
     run env PATH="$REVIEW_FIXTURE/stubs:/usr/bin:/bin" /bin/bash <<'SCRIPT'
 set -euo pipefail
-source "$PROJECT_ROOT/lib/core/pkg_receipts.sh"
+source "$PROJECT_ROOT/lib/core/common.sh"
 run_with_timeout() { shift; "$@"; }
 MOLE_PKG_RECEIPT_CACHE_DISABLE=1
 MOLE_PKG_RECEIPT_SCAN_TIMEOUT=2

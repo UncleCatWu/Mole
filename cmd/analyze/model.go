@@ -4,13 +4,73 @@ package main
 
 import (
 	"context"
-	"sort"
+	"errors"
+	"fmt"
+	"io/fs"
+	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
+// scanState describes measurement coverage within Mole's scan filters, not an
+// atomic filesystem snapshot. The zero value represents a complete measurement.
+type scanState uint8
+
+const (
+	scanComplete scanState = iota
+	scanPartial
+	scanUnavailable
+)
+
+func (s scanState) String() string {
+	switch s {
+	case scanPartial:
+		return "partial"
+	case scanUnavailable:
+		return "unavailable"
+	case scanComplete:
+		return "complete"
+	default:
+		return "unknown"
+	}
+}
+
+// MarshalText gives the existing JSON boundary the same typed coverage state.
+func (s scanState) MarshalText() ([]byte, error) {
+	if s > scanUnavailable {
+		return nil, fmt.Errorf("invalid scan state: %d", s)
+	}
+	return []byte(s.String()), nil
+}
+
+// measurementState preserves the distinction between a useful partial size and
+// a failed probe that measured nothing. Callers must retain the returned bytes.
+func measurementState(size int64, err error) scanState {
+	if err == nil {
+		return scanComplete
+	}
+	if size > 0 {
+		return scanPartial
+	}
+	return scanUnavailable
+}
+
+// isPermissionFailure reports a denial macOS will repeat on every scan until
+// access changes (no Full Disk Access, chmod 000), so a partial result caused
+// only by these is as current as a complete one. Everything else (timeouts,
+// cancellation, vanished files, I/O errors) may clear on the next attempt.
+func isPermissionFailure(err error) bool {
+	return err != nil && (errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM))
+}
+
+func isTransientFailure(err error) bool {
+	return err != nil && !isPermissionFailure(err)
+}
+
 type dirEntry struct {
+	State      scanState
 	Name       string
 	Path       string
 	Size       int64
@@ -25,6 +85,7 @@ type fileEntry struct {
 }
 
 type scanResult struct {
+	State      scanState
 	Entries    []dirEntry
 	LargeFiles []fileEntry
 	TotalSize  int64
@@ -34,9 +95,20 @@ type scanResult struct {
 	// scan. Such a result is scan-order dependent and must not be written
 	// to the on-disk cache. In-memory only; never serialized to cacheEntry.
 	dedupedHardlink bool
+	// transientFailure is true when some coverage was lost to a failure that
+	// may not recur (see isPermissionFailure). Such a partial result is never
+	// persisted and is always refreshed; a partial result lost only to
+	// permission denials is kept like a complete one. In-memory only.
+	transientFailure bool
+}
+
+// persistable reports whether the result may be reused without a rescan.
+func (r scanResult) persistable() bool {
+	return r.State == scanComplete || (r.State == scanPartial && !r.transientFailure)
 }
 
 type cacheEntry struct {
+	State        scanState
 	Entries      []dirEntry
 	LargeFiles   []fileEntry
 	TotalSize    int64
@@ -51,6 +123,7 @@ type cacheEntry struct {
 }
 
 type historyEntry struct {
+	State         scanState
 	Path          string
 	Entries       []dirEntry
 	LargeFiles    []fileEntry
@@ -65,15 +138,15 @@ type historyEntry struct {
 }
 
 type scanResultMsg struct {
-	requestID int64
-	path      string
-	result    scanResult
-	err       error
-	stale     bool
+	id     int64
+	path   string
+	result scanResult
+	err    error
+	stale  bool
 }
 
 type liveScanStartMsg struct {
-	requestID     int64
+	state         scanState
 	id            int64
 	path          string
 	entries       []dirEntry
@@ -112,12 +185,14 @@ const (
 )
 
 type overviewSizeMsg struct {
-	RequestID int64
-	Path      string
-	Index     int
-	Size      int64
-	Err       error
+	publication *scanPublication
+	Path        string
+	Index       int
+	Size        int64
+	Err         error
 }
+
+type initializeMsg struct{}
 
 type tickMsg time.Time
 
@@ -129,10 +204,13 @@ type deleteProgressMsg struct {
 	count        int64
 	path         string
 	removedPaths []string
+	logWarning   string // set when the audit log could not be written
 }
 
 type model struct {
 	lifecycle           *analyzerLifecycle
+	scanState           scanState
+	scanTransient       bool // scanState != scanComplete because of a transient failure
 	path                string
 	history             []historyEntry
 	entries             []dirEntry
@@ -143,6 +221,7 @@ type model struct {
 	totalSize           int64
 	scanning            bool
 	spinner             int
+	tickRunning         bool // one tickCmd loop is already re-arming itself
 	filesScanned        *int64
 	dirsScanned         *int64
 	bytesScanned        *int64
@@ -151,19 +230,19 @@ type model struct {
 	isOverview          bool
 	deleteConfirm       bool
 	deleteTarget        *dirEntry
-	deleting            bool
-	deleteCount         *int64
 	deleteOperationID   int64
 	deleteParentPath    string
-	deleteCancel        context.CancelFunc
 	quitAfterDelete     bool
+	deleteCancel        context.CancelFunc
+	deleting            bool
+	deleteCount         *int64
 	cache               map[string]historyEntry
 	largeSelected       int
 	largeOffset         int
 	overviewSizeCache   map[string]int64
 	overviewScanning    bool
-	overviewScanningSet map[string]bool // Track which paths are currently being scanned
-	overviewRequestIDs  map[string]int64
+	overviewScanningSet map[string]*scanPublication // Track active measurements by identity
+	cachePublications   map[string]*scanPublication
 	width               int             // Terminal width
 	height              int             // Terminal height
 	multiSelected       map[string]bool // Track multi-selected items by path (safer than index)
@@ -186,24 +265,46 @@ type model struct {
 	// Directory (drill-down) view incremental filter, mirroring the Top-files
 	// one. entriesAll is the full non-empty entry list; entries is the rendered,
 	// possibly filtered view. Disabled in overview mode.
-	entriesAll             []dirEntry
-	entryFilter            string
-	entryFiltering         bool
-	liveScanID             int64
-	scanRequestID          int64
-	scanRequestPublication *scanPublication
-	scanRequestContext     context.Context
-	scanRequestCancel      context.CancelFunc
-	cacheSavePublication   *scanPublication
-	liveScanCancel         context.CancelFunc
-	liveScanEvents         <-chan liveScanEventMsg
-	liveScanningPaths      map[string]bool
-	autoSortLiveEntries    bool
-	liveSortMode           liveSortMode
+	entriesAll          []dirEntry
+	entryFilter         string
+	entryFiltering      bool
+	liveScanID          int64
+	liveScanCancel      context.CancelFunc
+	liveScanEvents      <-chan liveScanEventMsg
+	liveScanningPaths   map[string]bool
+	liveEntryIndex      map[string]int
+	liveEntriesDirty    bool
+	autoSortLiveEntries bool
+	liveSortMode        liveSortMode
 }
 
 func (m model) inOverviewMode() bool {
 	return m.isOverview && m.path == "/"
+}
+
+func entryScanState(entries []dirEntry) scanState {
+	for _, entry := range entries {
+		if entry.Size < 0 || entry.State != scanComplete {
+			return scanPartial
+		}
+	}
+	return scanComplete
+}
+
+// selectedEntryMeasurement is shared by selection feedback and confirmation.
+func (m model) selectedEntryMeasurement() (int64, scanState) {
+	var size int64
+	state := scanComplete
+	for _, entry := range m.entries {
+		if !m.multiSelected[entry.Path] {
+			continue
+		}
+		size += max(entry.Size, 0)
+		if entry.Size < 0 || entry.State != scanComplete {
+			state = scanPartial
+		}
+	}
+	return size, state
 }
 
 func (m *model) hydrateOverviewEntries() {
@@ -216,19 +317,22 @@ func (m *model) hydrateOverviewEntries() {
 			m.entries[i].Size = size
 			continue
 		}
-		if size, err := loadOverviewCachedSize(m.entries[i].Path); err == nil {
+		if size, state, err := loadOverviewCachedMeasurement(m.entries[i].Path); err == nil {
 			m.entries[i].Size = size
-			m.overviewSizeCache[m.entries[i].Path] = size
+			m.entries[i].State = state
+			// The in-memory map holds sizes only, so it keeps complete ones.
+			if state == scanComplete {
+				m.overviewSizeCache[m.entries[i].Path] = size
+			}
 		}
 	}
 	m.totalSize = sumKnownEntrySizes(m.entries)
+	m.scanState = entryScanState(m.entries)
+	m.scanTransient = false
 }
 
 func (m *model) sortOverviewEntriesBySize() {
-	// Stable sort by size.
-	sort.SliceStable(m.entries, func(i, j int) bool {
-		return m.entries[i].Size > m.entries[j].Size
-	})
+	sortDirEntriesBySize(m.entries)
 }
 
 func (m *model) getScanProgress() (files, dirs, bytes int64) {
@@ -294,6 +398,27 @@ func (m *model) clampLargeSelection() {
 	}
 }
 
+// selectedPathSizes returns the sizes the view showed for paths, which is
+// what the audit log records for each Trash move.
+func (m model) selectedPathSizes(paths []string) map[string]int64 {
+	sizes := make(map[string]int64, len(paths))
+	wanted := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		wanted[path] = true
+	}
+	for _, entry := range m.entriesAll {
+		if wanted[entry.Path] && entry.Size > 0 {
+			sizes[entry.Path] = entry.Size
+		}
+	}
+	for _, file := range m.largeFilesAll {
+		if wanted[file.Path] && file.Size > 0 {
+			sizes[file.Path] = file.Size
+		}
+	}
+	return sizes
+}
+
 func (m *model) removePathFromView(path string) {
 	if path == "" {
 		return
@@ -314,6 +439,7 @@ func (m *model) removePathFromView(path string) {
 	// shift the shared array twice and corrupt it; rebuilding via the filters
 	// keeps the view, the query, and the selection consistent.
 	m.entriesAll = removeByPath(m.entriesAll, path, dirEntryPath)
+	m.liveEntryIndex = nil
 	m.largeFilesAll = removeByPath(m.largeFilesAll, path, fileEntryPath)
 
 	if removedSize > 0 {
@@ -326,6 +452,39 @@ func (m *model) removePathFromView(path string) {
 
 	m.applyEntryFilter()
 	m.applyLargeFilter()
+}
+
+// pathIsWithin reports whether path is root or lies below it. A bare
+// root+"/" prefix never matches for the overview, whose path is "/": the
+// prefix becomes "//".
+func pathIsWithin(path, root string) bool {
+	if path == root {
+		return true
+	}
+	prefix := root
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return strings.HasPrefix(path, prefix)
+}
+
+// pathTouchesRemoved reports whether a delete changed what path measures: it
+// contains a removed path, or was itself inside one.
+func pathTouchesRemoved(path string, removedPaths []string) bool {
+	return slices.ContainsFunc(removedPaths, func(removed string) bool {
+		return pathIsWithin(removed, path) || pathIsWithin(path, removed)
+	})
+}
+
+// markRemovedOverviewRowsPending resets the overview rows a delete changed to
+// pending so they are measured again instead of restored.
+func markRemovedOverviewRowsPending(entries []dirEntry, removedPaths []string) {
+	for i := range entries {
+		if pathTouchesRemoved(entries[i].Path, removedPaths) {
+			entries[i].Size = -1
+			entries[i].State = scanComplete
+		}
+	}
 }
 
 func fileEntryName(f fileEntry) string { return f.Name }

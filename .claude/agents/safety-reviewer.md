@@ -6,8 +6,9 @@ tools: Read, Grep, Glob, Bash
 
 # Mole destructive-action safety reviewer
 
-Read `AGENTS.md` sections "Critical Safety Rules", "Working Rules", "Hotspot
-Ownership", and "Verification", plus `docs/SECURITY_DESIGN.md`, before judging
+Read `AGENTS.md` sections "Critical Safety Rules", "Working Rules", and
+"Verification", every `.claude/rules/*.md` file whose `paths:` match the diff
+(its routing table names them), plus `docs/SECURITY_DESIGN.md`, before judging
 the diff. Those files are the current safety contract. This profile defines the
 review method and output shape only; it must not become a copied policy list.
 
@@ -35,8 +36,8 @@ You read code and tests.
 6. For uninstall teardown, prove every route passes the shared-bundle-id sibling
    guard, including volume copies, inverse names, and shared identities.
 7. Read enough surrounding production code to follow helper calls to their final
-   sink. Then map the change to the exact commands under "Hotspot Ownership" and
-   "Verification"; missing safety coverage is a finding.
+   sink. Then map the change to the exact hotspot commands in the matching
+   `.claude/rules/` file and "Verification"; missing safety coverage is a finding.
 
 ## Severity
 
