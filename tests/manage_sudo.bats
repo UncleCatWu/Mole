@@ -107,8 +107,9 @@ sudo() {
     echo REFRESH > "$TRACE"
     [[ "$PHASE" == refresh ]]
 }
-# Observe the existing child assignment, keeping the native sleep, wait and
-# EXIT trap unchanged. A global process-table lookup is denied in the sandbox.
+# Observe the existing assignment and owner wait, keeping native sleep and
+# cleanup behavior unchanged. A PID may remain visible briefly or be reused;
+# only the owning worker's completed wait proves this exact child was reaped.
 declare -f _start_sudo_keepalive > "$TRACE.body"
 python3 - "$TRACE.body" <<'PY_KEEPALIVE' > "$TRACE.observed"
 from pathlib import Path
@@ -116,12 +117,17 @@ import sys
 text = Path(sys.argv[1]).read_text()
 needle = "child_pid=$!;"
 assert text.count(needle) == 2
-print(text.replace(needle, needle + ' printf "%s %s\\n" "$child_pid" "$delay" > "$TRACE.child";', 1))
+text = text.replace(needle, needle + ' printf "%s %s\\n" "$child_pid" "$delay" > "$TRACE.child";', 1)
+owner_wait = 'wait "$child_pid" 2>/dev/null || true;'
+assert text.count(owner_wait) == 1
+recorded_wait = ('test_reap_status=0; wait "$child_pid" 2>/dev/null || test_reap_status=$?; '
+                 'printf "%s %s\\n" "$child_pid" "$test_reap_status" >> "$TRACE.reaped";')
+print(text.replace(owner_wait, recorded_wait, 1))
 PY_KEEPALIVE
 eval "$(cat "$TRACE.observed")"
 pid=$(_start_sudo_keepalive)
 child=""
-trap '[[ -z "$child" ]] || kill "$child" 2>/dev/null || :; _stop_sudo_keepalive "$pid"' EXIT
+trap '[[ -z "$pid" ]] || _stop_sudo_keepalive "$pid"' EXIT
 for ((i=0; i<200; i++)); do
     expected_delay=2
     [[ "$PHASE" != refresh ]] || expected_delay=30
@@ -138,15 +144,19 @@ for ((i=0; i<200; i++)); do
 done
 [[ "$child" =~ ^[0-9]+$ ]] || exit 1
 kill -0 "$child" || exit 1
-_stop_sudo_keepalive "$pid"
-for ((i=0; i<50; i++)); do
-    if ! kill -0 "$child" 2>/dev/null; then
+stopped_pid="$pid"
+pid=""
+_stop_sudo_keepalive "$stopped_pid"
+for ((i=0; i<200; i++)); do
+    if [[ -f "$TRACE.reaped" ]] && /usr/bin/awk -v expected="$child" \
+        '$1 == expected && ($2 == 0 || $2 == 143) { reaped = 1 } END { exit !reaped }' "$TRACE.reaped"; then
         echo CHILD_REAPED
         exit 0
     fi
     /bin/sleep 0.02
 done
-echo CHILD_SURVIVED
+echo OWNER_REAP_UNCONFIRMED
+[[ ! -f "$TRACE.reaped" ]] || cat "$TRACE.reaped"
 exit 1
 EOF
         [ "$status" -eq 0 ] || { echo "$phase: $output"; return 1; }

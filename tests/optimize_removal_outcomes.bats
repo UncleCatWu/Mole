@@ -158,7 +158,8 @@ wal_file="$knowledge_dir/knowledgeC.db-wal"
 mkdir -p "$knowledge_dir"
 touch "$knowledge_dir/knowledgeC.db" "$wal_file"
 run_with_timeout() { echo "112640 total"; }
-awk() { echo "112640"; }
+# Drain the producer under pipefail even though PATH hides sqlite3 below.
+awk() { /usr/bin/awk "$@"; }
 safe_remove() {
     echo "UNEXPECTED_REMOVE:$1"
     return 0

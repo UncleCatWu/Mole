@@ -586,8 +586,11 @@ source "$PROJECT_ROOT/lib/clean/caches.sh"
 discover_project_cache_roots() { printf '%s\n' "$HOME"; }
 project_cache_root_is_walkable() { return 0; }
 scan_project_cache_root() {
+    trap 'printf "TERM\n" > "$HOME/worker.term"; exit 143' TERM
     sh -c 'echo $PPID' > "$HOME/worker.pid"
-    while :; do sleep 0.1; done
+    local fixture_deadline=$((SECONDS + 10))
+    while [[ $SECONDS -lt $fixture_deadline ]]; do sleep 0.1; done
+    return 124
 }
 rm -f "$HOME/worker.pid"
 start_project_cache_prefetch
@@ -626,8 +629,11 @@ discover_project_cache_roots() { printf '%s\n' "$HOME/root"; }
 project_cache_root_is_walkable() { return 0; }
 get_optimal_parallel_jobs() { printf '1\n'; }
 scan_project_cache_root() {
+    trap 'printf "TERM\n" > "$HOME/worker.term"; exit 143' TERM
     sh -c 'echo $PPID' > "$HOME/worker.pid"
-    while :; do sleep 0.1; done
+    local fixture_deadline=$((SECONDS + 10))
+    while [[ $SECONDS -lt $fixture_deadline ]]; do sleep 0.1; done
+    return 124
 }
 process_project_cache_matches() { touch "$HOME/sink-called"; }
 start_project_cache_prefetch
@@ -662,19 +668,24 @@ EOF
 }
 
 @test "a prefetch that ended on a signal feeds nothing to the project cache sink" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+    # Keep a broken fixture bounded independently of the CI job's deadline.
+    run gtimeout --kill-after=2 25 env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/caches.sh"
 discover_project_cache_roots() { printf '%s\n' "$HOME"; }
 project_cache_root_is_walkable() { return 0; }
 scan_project_cache_root() {
+    # Real scans are bounded and terminate on TERM; the stand-in must too.
+    trap 'printf "TERM\n" > "$HOME/worker.term"; exit 143' TERM
     printf '%s\n' "$HOME/found-cache" > "$2"
     sh -c 'echo $PPID' > "$HOME/worker.pid"
-    while :; do sleep 0.1; done
+    local fixture_deadline=$((SECONDS + 10))
+    while [[ $SECONDS -lt $fixture_deadline ]]; do sleep 0.1; done
+    return 124
 }
 process_project_cache_matches() { touch "$HOME/sink-called"; }
-rm -f "$HOME/worker.pid" "$HOME/sink-called"
+rm -f "$HOME/worker.pid" "$HOME/worker.term" "$HOME/sink-called"
 start_project_cache_prefetch
 for _ in $(seq 100); do
     [[ -s "$HOME/worker.pid" ]] && break
@@ -685,6 +696,7 @@ kill -TERM "$_MOLE_PROJECT_CACHE_PREFETCH_PID"
 rc=0
 clean_project_caches || rc=$?
 [[ "$rc" == 143 ]] || { echo "RC:$rc"; exit 1; }
+[[ -f "$HOME/worker.term" ]] || { echo WORKER_TERM_UNCONFIRMED; exit 1; }
 [[ ! -e "$HOME/sink-called" ]] || { echo "SINK_CALLED"; exit 1; }
 echo NO_SINK
 EOF

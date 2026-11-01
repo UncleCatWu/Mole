@@ -555,7 +555,7 @@ EOF
 @test "CI checks the published skill against both CLIs" {
     run grep -F 'audit_skill_commands.py' "$PROJECT_ROOT/scripts/check.sh"
     [ "$status" -eq 0 ]
-    run grep -F 'git fetch --no-tags --depth=1 origin windows' "$PROJECT_ROOT/.github/workflows/check.yml"
+    run grep -F 'git fetch --no-tags --depth=1 https://github.com/tw93/Mole.git windows' "$PROJECT_ROOT/.github/workflows/check.yml"
     [ "$status" -eq 0 ]
 }
 

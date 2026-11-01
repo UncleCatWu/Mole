@@ -110,7 +110,9 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Fetch the Windows CLI for the skill audit
-        run: git fetch --no-tags --depth=1 origin windows:refs/remotes/origin/windows
+        # Forks may retain an older Windows branch; the shared skill describes
+        # the canonical Windows CLI, so validate that public source explicitly.
+        run: git fetch --no-tags --depth=1 https://github.com/tw93/Mole.git windows:refs/remotes/origin/windows
 
       - name: Run check script
         env:

@@ -31,7 +31,7 @@ cleanup_run() {
 }
 trap cleanup_run EXIT
 
-mkdir -p "$run_root/repo" "$run_root/home" "$run_root/tmp" "$run_root/go-cache" "$run_root/stubs"
+mkdir -p "$run_root/repo" "$run_root/home" "$run_root/tmp" "$run_root/go-cache" "$run_root/go-work" "$run_root/stubs"
 token="$$.$RANDOM.$RANDOM"
 printf '%s\n' "$token" > "$run_root/.test-boundary"
 
@@ -157,7 +157,9 @@ export MOLE_TEST_KERNEL_SENTINEL="$kernel_sentinel"
 export PATH="$run_root/stubs:$PATH"
 export HOME="$run_root/home" TMPDIR="$run_root/tmp/"
 export MOLE_TEST_NO_AUTH=1
-export MOLE_GO_TEST_CACHE="$run_root/go-cache" GOCACHE="$run_root/go-cache"
+# Keep build state private even when the denied account lookup returns only a
+# numeric uid. GOMODCACHE still reads the pre-provisioned modules above.
+export GOPATH="$run_root/go-work" MOLE_GO_TEST_CACHE="$run_root/go-cache" GOCACHE="$run_root/go-cache"
 export MOLE_TEST_REPORT_DIR="$run_root/report"
 unset XDG_CACHE_HOME XDG_CONFIG_HOME MO_NO_OPLOG
 unset MOLE_RESOLVED_TMPDIR MOLE_TEMP_REGISTRY_FILE MOLE_TEST_TRASH_DIR MOLE_DELETE_LOG

@@ -6408,7 +6408,7 @@ SCRIPT
 }
 
 @test "batch uninstall explains actual refusal and clears it for the next app" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+    run env HOME="$BATS_TEST_TMPDIR/refusal-home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
@@ -6440,6 +6440,7 @@ running_at_uninstall_apps=()
 total_size_freed=0
 files_cleaned=0
 total_items=0
+trap 'batch_exit=$?; printf "BATCH_EXIT=%s SUCCESS=%s FAILED=%s STAGE=%s\n" "$batch_exit" "$success_count" "$failed_count" "${_batch_exec_stage:-unknown}"; exit "$batch_exit"' EXIT
 _batch_execute_removals
 [[ $success_count -eq 2 && $failed_count -eq 0 ]] || exit 1
 [[ ! -e "$first" && ! -e "$second" && -d "$shared" ]] || exit 1

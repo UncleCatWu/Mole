@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """Smoke-test a built Nix package without cleanup, network or authorization."""
 
-import fcntl
 import json
 import os
 from pathlib import Path
-import pty
 import re
 import select
-import signal
 import subprocess
 import sys
 import tempfile
@@ -17,30 +14,26 @@ import time
 
 
 def check_menu(launcher, env):
-    master, slave = pty.openpty()
-
-    def own_terminal():
-        os.setsid()
-        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests/support"))
+    from owned_pty import OwnedPair
 
     # Keep the controlling terminal alive while Bash restores it on exit.
     keeper = (
-        "import subprocess,time; "
-        f"p=subprocess.run([{str(launcher)!r}]); "
-        "print('MENU_EXIT='+str(p.returncode),flush=True); time.sleep(10)"
+        "import subprocess,sys,time; "
+        "p=subprocess.run(sys.argv[1:]); "
+        "print('MENU_EXIT='+str(p.returncode),flush=True); time.sleep(30)"
     )
-    process = subprocess.Popen(
-        [sys.executable, "-c", keeper], stdin=slave, stdout=slave, stderr=slave,
-        env=env, preexec_fn=own_terminal,
-    )
-    output = b""
-    try:
+    with OwnedPair() as pair:
+        master, slave = pair.master, pair.slave
+        process = pair.spawn([sys.executable, "-B", "-c", keeper, str(launcher)], env=env)
+        output = b""
         deadline = time.monotonic() + 15
         while b"Q Quit" not in output or termios.tcgetattr(slave)[3] & termios.ECHO:
             if time.monotonic() >= deadline or process.poll() is not None:
                 raise AssertionError(("menu failed to start", output))
             if select.select([master], [], [], 0.05)[0]:
                 output += os.read(master, 65536)
+                assert len(output) <= 1024 * 1024, "menu output exceeded 1 MiB"
         assert b"99.0.0" not in output, output
         previous_renders = output.count(b"Q Quit")
         os.write(master, b"u")
@@ -50,25 +43,32 @@ def check_menu(launcher, env):
                 raise AssertionError(("hidden update key dispatched", output))
             if select.select([master], [], [], 0.05)[0]:
                 output += os.read(master, 65536)
+                assert len(output) <= 1024 * 1024, "menu output exceeded 1 MiB"
         os.write(master, b"q")
         deadline = time.monotonic() + 5
         while b"MENU_EXIT=" not in output:
             assert time.monotonic() < deadline, ("menu failed to exit", output)
             if select.select([master], [], [], 0.05)[0]:
                 output += os.read(master, 65536)
+                assert len(output) <= 1024 * 1024, "menu output exceeded 1 MiB"
         assert b"MENU_EXIT=0" in output, output
-    finally:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=5)
-        os.close(master)
-        os.close(slave)
+
+
+def require_test_context(root):
+    result = subprocess.run(
+        ["/bin/bash", "-c", 'source "$1/lib/core/test_boundary.sh"; _mole_test_require_context',
+         "nix-smoke-boundary", str(root)],
+        env=dict(os.environ, MOLE_TEST_NO_AUTH="1"), stdin=subprocess.DEVNULL, timeout=5,
+    )
+    if result.returncode:
+        raise SystemExit(result.returncode)
 
 
 def main():
+    root = Path(__file__).resolve().parents[1]
+    require_test_context(root)
     package = Path(sys.argv[1]).resolve(strict=True)
     assert str(package).startswith("/nix/store/"), package
-    root = Path(__file__).resolve().parents[1]
     version = re.search(r'^VERSION="([^"]+)"$', (root / "mole").read_text(), re.M)[1]
     entry = package / "share/mole/mole"
     assert entry.read_text().splitlines()[0] == "#!/bin/bash"
